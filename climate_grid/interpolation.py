@@ -181,8 +181,8 @@ def idw_grid(
 
     return {
         "schema": _SCHEMA,
-        "lats": lats,
-        "lons": lons,
+        "lats": [_round_output(value) for value in lats],
+        "lons": [_round_output(value) for value in lons],
         "values": values,
         "counts": counts,
     }
