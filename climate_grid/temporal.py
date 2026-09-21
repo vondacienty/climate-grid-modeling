@@ -89,6 +89,8 @@ def _validate_grid(grid: Any, where: str) -> tuple[list, list, list]:
         raise ValueError(
             f"{where} must have exactly the keys schema, lats, lons, values, counts"
         )
+    if not isinstance(grid["schema"], str):
+        raise TypeError(f"{where}.schema must be a str")
     if grid["schema"] != _IDW_SCHEMA:
         raise ValueError(f"{where}.schema must be {_IDW_SCHEMA!r}")
 
@@ -115,6 +117,8 @@ def _validate_dataset(
         raise TypeError(f"{where} must be a dict")
     if set(dataset.keys()) != _DATASET_KEYS:
         raise ValueError(f"{where} must have exactly the keys schema, data")
+    if not isinstance(dataset["schema"], str):
+        raise TypeError(f"{where}.schema must be a str")
     if dataset["schema"] != _DATASET_SCHEMA:
         raise ValueError(f"{where}.schema must be {_DATASET_SCHEMA!r}")
 
@@ -134,6 +138,14 @@ def _validate_dataset(
         order.append(element)
         grids[element] = _validate_grid(grid, f"{where}.data[{element!r}]")
 
+    ref_lats, ref_lons, _ = grids[order[0]]
+    for element in order[1:]:
+        lats, lons, _ = grids[element]
+        if lats != ref_lats or lons != ref_lons:
+            raise ValueError(
+                f"lats/lons for element {element!r} must match within a frame"
+            )
+
     return order, grids
 
 
@@ -147,7 +159,7 @@ def reconstruct(frames, *, max_gap: int = 2) -> dict:
     complete :func:`climate_grid.interpolation.idw_grid` results.  Frames may
     be given out of order, but every frame must contain the same elements in
     the same order, and each element's ``lats``/``lons`` must be identical
-    across frames.
+    within and across frames.
 
     The output time axis spans the earliest through the latest frame date,
     one entry per calendar day in ascending order; days without a frame are
@@ -174,7 +186,7 @@ def reconstruct(frames, *, max_gap: int = 2) -> dict:
     Raises ``TypeError`` for wrong container/item/argument types and
     ``ValueError`` for malformed dates, duplicate times, bad schemas or
     grids, empty frames, invalid ``max_gap``, or elements/axes that are not
-    consistent across frames.
+    consistent within or across frames.
     """
     if not isinstance(frames, list):
         raise TypeError("frames must be a list of frame dicts")
