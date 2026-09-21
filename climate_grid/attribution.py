@@ -6,10 +6,12 @@ import math
 from typing import Any
 
 _SCHEMA = "climate-grid/attribution-v1"
+_BATCH_SCHEMA = "climate-grid/batch-attribution-v1"
 _TRENDS_SCHEMA = "climate-grid/trends-v1"
 _TRENDS_KEYS = frozenset({"schema", "years", "data"})
 _METRIC_KEYS = ("count", "days", "cells", "intensity", "uncertainty")
 _ENTRY_KEYS = frozenset(_METRIC_KEYS + ("slopes",))
+_JOB_KEYS = frozenset({"element", "driver"})
 
 
 def _round_output(value: float) -> float:
@@ -118,52 +120,25 @@ def _validate_trends(trends: Any) -> tuple[list, dict]:
     return years, data
 
 
-def attribute(trends, element, driver) -> dict:
-    """Attribute an element's intensity trend to an external driver.
-
-    ``trends`` must be a complete :func:`climate_grid.trends.summarize`
-    result (schema ``climate-grid/trends-v1``); ``element`` a non-empty str
-    naming one of its elements; and ``driver`` a list with one entry per
-    year in ``trends.years``, each either ``None`` or a finite non-bool
-    number.
-
-    The element's yearly ``intensity`` is the regressand y and the driver
-    the regressor x.  Years where either x or y is ``None`` are dropped,
-    preserving year order.  Fewer than two retained years, or zero
-    variance in the retained x values (``sum((x - xbar) ** 2) == 0``),
-    raise ``ValueError``.  With arithmetic means xbar and ybar of the
-    retained values, the slope is
-    ``b = sum((x - xbar) * (y - ybar)) / sum((x - xbar) ** 2)``.
-
-    The returned mapping uses the key order ``schema, years, data``;
-    ``schema`` is ``climate-grid/attribution-v1`` and ``years`` lists the
-    retained years.  ``data`` is an equally long list, one dict per
-    retained year in the key order ``contribution, uncertainty``: the
-    contribution is ``b * (x - xbar)`` and the uncertainty is the
-    element's original uncertainty for that year.  Every output float is
-    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs
-    are not modified.
-
-    Raises ``TypeError`` for wrong container/item/argument types and
-    ``ValueError`` for any other contract violation.
-    """
-    years, data = _validate_trends(trends)
-
+def _validate_element(element: Any, data: dict, where: str) -> None:
     if not isinstance(element, str):
-        raise TypeError("element must be a str")
+        raise TypeError(f"{where} must be a str")
     if element == "":
-        raise ValueError("element must be non-empty")
+        raise ValueError(f"{where} must be non-empty")
     if element not in data:
         raise ValueError(f"unknown element: {element!r}")
 
-    if not isinstance(driver, list):
-        raise TypeError("driver must be a list")
-    if len(driver) != len(years):
-        raise ValueError("driver must have one entry per year")
-    for index, value in enumerate(driver):
-        _validate_number(value, f"driver[{index}]", nullable=True)
 
-    entry = data[element]
+def _validate_driver(driver: Any, n_years: int, where: str) -> None:
+    if not isinstance(driver, list):
+        raise TypeError(f"{where} must be a list")
+    if len(driver) != n_years:
+        raise ValueError(f"{where} must have one entry per year")
+    for index, value in enumerate(driver):
+        _validate_number(value, f"{where}[{index}]", nullable=True)
+
+
+def _attribute_entry(years: list, entry: dict, driver: list) -> tuple[list, list]:
     intensity = entry["intensity"]
     uncertainty = entry["uncertainty"]
     points = [
@@ -197,5 +172,106 @@ def attribute(trends, element, driver) -> dict:
                 "uncertainty": _round_output(uncertainty[index]),
             }
         )
+    return retained_years, result_data
 
+
+def attribute(trends, element, driver) -> dict:
+    """Attribute an element's intensity trend to an external driver.
+
+    ``trends`` must be a complete :func:`climate_grid.trends.summarize`
+    result (schema ``climate-grid/trends-v1``); ``element`` a non-empty str
+    naming one of its elements; and ``driver`` a list with one entry per
+    year in ``trends.years``, each either ``None`` or a finite non-bool
+    number.
+
+    The element's yearly ``intensity`` is the regressand y and the driver
+    the regressor x.  Years where either x or y is ``None`` are dropped,
+    preserving year order.  Fewer than two retained years, or zero
+    variance in the retained x values (``sum((x - xbar) ** 2) == 0``),
+    raise ``ValueError``.  With arithmetic means xbar and ybar of the
+    retained values, the slope is
+    ``b = sum((x - xbar) * (y - ybar)) / sum((x - xbar) ** 2)``.
+
+    The returned mapping uses the key order ``schema, years, data``;
+    ``schema`` is ``climate-grid/attribution-v1`` and ``years`` lists the
+    retained years.  ``data`` is an equally long list, one dict per
+    retained year in the key order ``contribution, uncertainty``: the
+    contribution is ``b * (x - xbar)`` and the uncertainty is the
+    element's original uncertainty for that year.  Every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs
+    are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    years, data = _validate_trends(trends)
+    _validate_element(element, data, "element")
+    _validate_driver(driver, len(years), "driver")
+
+    retained_years, result_data = _attribute_entry(
+        years, data[element], driver
+    )
     return {"schema": _SCHEMA, "years": retained_years, "data": result_data}
+
+
+def batch_attribute(trends, jobs) -> dict:
+    """Attribute several element/driver pairs in one call.
+
+    ``trends`` must be a complete :func:`climate_grid.trends.summarize`
+    result (schema ``climate-grid/trends-v1``), validated exactly as for
+    :func:`attribute`.  ``jobs`` must be a non-empty list of dicts, each
+    with exactly the keys ``element`` and ``driver``, satisfying the same
+    contract as the :func:`attribute` arguments of those names:
+    ``element`` a non-empty str naming one of the trends elements and
+    ``driver`` a list with one entry per year in ``trends.years``, each
+    either ``None`` or a finite non-bool number.
+
+    Each job is processed with the same logic as :func:`attribute`:
+    years where the driver or the element's ``intensity`` is ``None``
+    are dropped, and fewer than two retained years or zero variance in
+    the retained driver values raise ``ValueError``.
+
+    The returned mapping uses the key order ``schema, results``;
+    ``schema`` is ``climate-grid/batch-attribution-v1`` and ``results``
+    has one entry per job, in job order.  Each entry uses the key order
+    ``element, years, data``: ``element`` echoes the job's element,
+    ``years`` lists the retained years and ``data`` is an equally long
+    list, one dict per retained year in the key order ``contribution,
+    uncertainty`` — the contribution is ``b * (x - xbar)`` and the
+    uncertainty is the element's original uncertainty for that year.
+    Every output float is ``round(x, 12)`` with negative zero normalized
+    to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    years, data = _validate_trends(trends)
+
+    if not isinstance(jobs, list):
+        raise TypeError("jobs must be a list")
+    if len(jobs) == 0:
+        raise ValueError("jobs must be non-empty")
+    for index, job in enumerate(jobs):
+        where = f"jobs[{index}]"
+        if not isinstance(job, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(job.keys()) != _JOB_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys element, driver"
+            )
+        _validate_element(job["element"], data, f"{where}.element")
+        _validate_driver(job["driver"], len(years), f"{where}.driver")
+
+    results: list = []
+    for job in jobs:
+        retained_years, result_data = _attribute_entry(
+            years, data[job["element"]], job["driver"]
+        )
+        results.append(
+            {
+                "element": job["element"],
+                "years": retained_years,
+                "data": result_data,
+            }
+        )
+    return {"schema": _BATCH_SCHEMA, "results": results}
