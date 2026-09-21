@@ -112,6 +112,11 @@ def idw_grid(
     _validate_axis(lats, "lats")
     _validate_axis(lons, "lons")
 
+    # Output axes are rounded copies; the computation below and the
+    # caller's lists keep using the original coordinates.
+    out_lats = [_round_output(value) for value in lats]
+    out_lons = [_round_output(value) for value in lons]
+
     _check_number_type(power, "power")
     _check_finite(power, "power")
     if power <= 0:
@@ -181,8 +186,8 @@ def idw_grid(
 
     return {
         "schema": _SCHEMA,
-        "lats": lats,
-        "lons": lons,
+        "lats": out_lats,
+        "lons": out_lons,
         "values": values,
         "counts": counts,
     }
