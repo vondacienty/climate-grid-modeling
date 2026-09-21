@@ -74,13 +74,16 @@ def _validate_event(event: Any, where: str) -> None:
     seen: set[tuple[int, int]] = set()
     for index, cell in enumerate(cells):
         target = f"{where}.cells[{index}]"
-        if not isinstance(cell, list) or len(cell) != 2:
-            raise TypeError(f"{target} must be a two-item list [i, j]")
+        if not isinstance(cell, list):
+            raise TypeError(f"{target} must be a list [i, j]")
+        if len(cell) != 2:
+            raise ValueError(f"{target} must be a two-item list [i, j]")
+        for axis, coord in enumerate(cell):
+            if not isinstance(coord, int) or isinstance(coord, bool):
+                raise TypeError(f"{target}[{axis}] must be a non-bool int")
+            if coord < 0:
+                raise ValueError(f"{target}[{axis}] must be non-negative")
         i, j = cell
-        if not isinstance(i, int) or isinstance(i, bool):
-            raise TypeError(f"{target}[0] must be a non-bool int")
-        if not isinstance(j, int) or isinstance(j, bool):
-            raise TypeError(f"{target}[1] must be a non-bool int")
         pair = (i, j)
         if pair in seen:
             raise ValueError(f"{where}.cells must be deduplicated")
