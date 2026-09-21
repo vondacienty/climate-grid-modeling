@@ -33,8 +33,9 @@ climate-grid-modeling --help     # 打印用法
 
 - 命令行程序 `climate-grid-modeling`
 - Python 包 `climate_grid`，其 `__version__` 为当前版本号
+- `climate_grid.interpolation.idw_grid(stations, lats, lons, *, power=2.0, radius_km=None, min_points=1)`：基于 Haversine 球面距离（地球半径 6371.0088km）的反距离加权网格插值，返回 schema 为 `climate-grid/idw-v1` 的结果字典（含 `lats`、`lons`、`values`、`counts`，其中 `values`/`counts` 按 `[lats][lons]` 嵌套）
 
 ## 限制
 
-- 除版本查询外没有其他功能。
-- 输入输出格式、数据来源与算法均尚未定义。
+- 命令行除版本查询外没有其他功能。
+- 数据来源与更多算法尚未定义；目前仅提供 `idw_grid` 一个插值算法。
