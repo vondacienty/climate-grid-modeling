@@ -89,7 +89,10 @@ def _validate_grid(grid: Any, where: str) -> tuple[list, list, list]:
         raise ValueError(
             f"{where} must have exactly the keys schema, lats, lons, values, counts"
         )
-    if grid["schema"] != _IDW_SCHEMA:
+    schema = grid["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _IDW_SCHEMA:
         raise ValueError(f"{where}.schema must be {_IDW_SCHEMA!r}")
 
     lats = grid["lats"]
@@ -115,7 +118,10 @@ def _validate_dataset(
         raise TypeError(f"{where} must be a dict")
     if set(dataset.keys()) != _DATASET_KEYS:
         raise ValueError(f"{where} must have exactly the keys schema, data")
-    if dataset["schema"] != _DATASET_SCHEMA:
+    schema = dataset["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _DATASET_SCHEMA:
         raise ValueError(f"{where}.schema must be {_DATASET_SCHEMA!r}")
 
     data = dataset["data"]
@@ -133,6 +139,14 @@ def _validate_dataset(
             raise ValueError(f"{where}.data element names must be non-empty")
         order.append(element)
         grids[element] = _validate_grid(grid, f"{where}.data[{element!r}]")
+
+    first_lats, first_lons, _ = grids[order[0]]
+    for element in order[1:]:
+        lats, lons, _ = grids[element]
+        if lats != first_lats or lons != first_lons:
+            raise ValueError(
+                f"all elements in {where} must share identical lats/lons"
+            )
 
     return order, grids
 
