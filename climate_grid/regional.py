@@ -20,6 +20,7 @@ _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
 _MULTI_CHANGE_SCHEMA = "climate-grid/multi-change-window-v1"
+_WEIGHTED_WINDOW_SCHEMA = "climate-grid/weighted-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -397,6 +398,111 @@ def _window_region(
             math.sqrt(sum(u ** 2 for u in window_uncertainties)) / count
         ),
     }
+
+
+def _weighted_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    cell_weights: list[float],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    window_weights: list[float] = []
+    window_values: list[float] = []
+    window_uncertainties: list[float] = []
+    for t in range(t_start, t_end + 1):
+        for (i, j), weight in zip(cells, cell_weights):
+            if status[t][i][j] != "missing":
+                window_weights.append(weight)
+                window_values.append(values[t][i][j])
+                window_uncertainties.append(uncertainty[t][i][j])
+
+    count = len(window_weights)
+    if count < min_count:
+        return {
+            "count": count,
+            "mean": None,
+            "min": None,
+            "max": None,
+            "uncertainty": None,
+        }
+
+    weight_sum = sum(window_weights)
+    return {
+        "count": count,
+        "mean": _round_output(
+            sum(w * v for w, v in zip(window_weights, window_values)) / weight_sum
+        ),
+        "min": _round_output(min(window_values)),
+        "max": _round_output(max(window_values)),
+        "uncertainty": _round_output(
+            math.sqrt(
+                sum(
+                    (w * u) ** 2
+                    for w, u in zip(window_weights, window_uncertainties)
+                )
+            )
+            / weight_sum
+        ),
+    }
+
+
+def _validate_weights(
+    weights: Any, validated_regions: list[tuple[str, list[tuple[int, int]]]]
+) -> list[list[float]]:
+    if not isinstance(weights, list):
+        raise TypeError("weights must be a list")
+    if len(weights) == 0:
+        raise ValueError("weights must be non-empty")
+    if len(weights) != len(validated_regions):
+        raise ValueError("weights must have one entry per region")
+
+    validated: list[list[float]] = []
+    for w_index, entry in enumerate(weights):
+        region_name, cells = validated_regions[w_index]
+        where = f"weights[{w_index}]"
+        if not isinstance(entry, dict):
+            raise TypeError(f"{where} must be a dict")
+        if list(entry.keys()) != ["name", "values"]:
+            raise ValueError(
+                f"{where} must have exactly the keys name, values in order"
+            )
+
+        name = entry["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name != region_name:
+            raise ValueError(
+                f"{where}.name must match regions[{w_index}].name "
+                f"({region_name!r})"
+            )
+
+        cell_weights = entry["values"]
+        if not isinstance(cell_weights, list):
+            raise TypeError(f"{where}.values must be a list")
+        if len(cell_weights) != len(cells):
+            raise ValueError(
+                f"{where}.values must have one weight per cell of regions"
+                f"[{w_index}]"
+            )
+        for c_index, weight in enumerate(cell_weights):
+            target = f"{where}.values[{c_index}]"
+            if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                raise TypeError(
+                    f"{target} must be a finite non-bool int or float"
+                )
+            if not math.isfinite(weight):
+                raise ValueError(f"{target} must be finite")
+            if weight <= 0:
+                raise ValueError(f"{target} must be positive")
+        validated.append(list(cell_weights))
+
+    return validated
 
 
 def _variance_window_region(
@@ -1013,6 +1119,98 @@ def aggregate_window(temporal, element, regions, windows, *, min_count: int = 1)
 
     return {
         "schema": _WINDOW_SCHEMA,
+        "element": element,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _t_start, _t_end in validated_windows
+        ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_window(
+    temporal, element, regions, windows, weights, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into weighted per-window stats.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions, input order, closed-interval and non-``missing`` sampling
+    rules — but each region's cells carry explicit weights.  ``weights`` is a
+    non-empty list with exactly one entry per region; each entry is a dict
+    with exactly the keys ``name`` and ``values`` in that order, where
+    ``name`` is a non-empty str equal to the corresponding
+    ``regions[i].name`` and ``values`` is a list with one finite positive
+    non-bool int or float weight per cell of that region, aligned with that
+    region's ``cells``.  Wrong container or member types raise ``TypeError``;
+    an empty list, wrong key order, wrong length, mismatched name,
+    non-finite or non-positive weight raises ``ValueError``.
+
+    For every window (in window order) and region (in region order), every
+    non-``missing`` cell of every day of the inclusive interval contributes a
+    weighted sample ``(w, v, u)``, where ``w`` is that cell's weight.
+    ``count`` is the number of samples; when it is below ``min_count``,
+    ``mean``, ``min``, ``max`` and ``uncertainty`` are all ``None``.
+    Otherwise ``mean`` is ``sum(w * v) / sum(w)`` over the samples, ``min``
+    and ``max`` are the unweighted extrema of the sample values and
+    ``uncertainty`` is ``sqrt(sum((w * u) ** 2)) / sum(w)`` over the samples'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/weighted-window-v1``,
+    ``element`` echoes the argument, ``windows`` lists three-key dicts in
+    input order and ``regions`` lists the region names in input order.
+    ``data`` follows the window order; each entry uses the key order
+    ``name, regions``, where each region entry uses the key order ``name,
+    count, mean, min, max, uncertainty``.  ``count`` is an int and every
+    output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            stats = _weighted_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                cell_weights,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _WEIGHTED_WINDOW_SCHEMA,
         "element": element,
         "windows": [
             {"name": name, "start": start, "end": end}
