@@ -5,7 +5,26 @@ from __future__ import annotations
 import datetime
 import math
 import re
+from bisect import bisect_right
 from typing import Any
+
+__all__ = [
+    "aggregate",
+    "aggregate_multi",
+    "aggregate_window",
+    "aggregate_weighted_window",
+    "aggregate_variance",
+    "aggregate_coverage",
+    "aggregate_exceedance",
+    "aggregate_quantile",
+    "aggregate_histogram",
+    "aggregate_multi_window",
+    "aggregate_trend",
+    "aggregate_correlation",
+    "aggregate_regression",
+    "aggregate_change",
+    "aggregate_change_multi",
+]
 
 _SCHEMA = "climate-grid/regional-v1"
 _MULTI_SCHEMA = "climate-grid/regional-multi-v1"
@@ -13,6 +32,7 @@ _WINDOW_SCHEMA = "climate-grid/window-v1"
 _WEIGHTED_WINDOW_SCHEMA = "climate-grid/weighted-window-v1"
 _MULTI_WINDOW_SCHEMA = "climate-grid/multi-window-v1"
 _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
+_HISTOGRAM_SCHEMA = "climate-grid/histogram-window-v1"
 _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
@@ -864,6 +884,42 @@ def _quantile_window_region(
     }
 
 
+def _histogram_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    edges: list,
+    min_count: int,
+) -> dict:
+    n_bins = len(edges) + 1
+    bin_counts = [0] * n_bins
+    uncertainty_sq_sum = 0.0
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            if status[t][i][j] != "missing":
+                bin_counts[bisect_right(edges, values[t][i][j])] += 1
+                uncertainty_sq_sum += uncertainty[t][i][j] ** 2
+
+    count = sum(bin_counts)
+    if count < min_count:
+        return {
+            "count": count,
+            "bin_counts": bin_counts,
+            "rates": [None for _ in range(n_bins)],
+            "uncertainty": None,
+        }
+
+    return {
+        "count": count,
+        "bin_counts": bin_counts,
+        "rates": [_round_output(bin_count / count) for bin_count in bin_counts],
+        "uncertainty": _round_output(math.sqrt(uncertainty_sq_sum) / count),
+    }
+
+
 def _change_window_region(
     values: list,
     status: list,
@@ -1565,6 +1621,96 @@ def aggregate_quantile(
         "schema": _QUANTILE_SCHEMA,
         "element": element,
         "quantiles": quantiles,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _t_start, _t_end in validated_windows
+        ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_histogram(
+    temporal, element, regions, windows, edges, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into per-window value histograms.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions and sampling rules — but instead of mean/min/max it reports a
+    histogram of sample values.  ``edges`` is a non-empty list of finite
+    non-bool int or float bin edges in strictly increasing order; a wrong
+    container or item type raises ``TypeError`` while an empty, non-finite or
+    non-increasing list raises ``ValueError``.
+
+    For every window (in window order) and region (in region order), every
+    non-``missing`` cell of every day of the inclusive interval contributes a
+    sample ``(v, u)`` of value and uncertainty.  With ``B = len(edges) + 1``
+    bins, a value is counted in the underflow bin when ``v < edges[0]``, in
+    the overflow bin when ``v >= edges[-1]``, and otherwise in the bin
+    ``edges[k - 1] <= v < edges[k]``; a value equal to an edge falls into the
+    bin on its right.  ``count`` is the number of samples ``n`` and
+    ``bin_counts`` lists the ``B`` int bin counts.  When ``n`` is below
+    ``min_count``, ``rates`` is a list of ``None`` of length ``B`` and
+    ``uncertainty`` is ``None``.  Otherwise ``rates[i]`` is
+    ``bin_counts[i] / n`` and ``uncertainty`` is ``sqrt(sum(u ** 2)) / n``
+    over the samples' uncertainties.
+
+    The returned mapping uses the key order ``schema, element, edges,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/histogram-window-v1``, ``element`` echoes the argument,
+    ``edges`` and ``windows`` are echoed in input order and ``regions`` lists
+    the region names in input order.  ``data`` follows the window order; each
+    entry uses the key order ``name, regions``, where each region entry uses
+    the key order ``name, count, bin_counts, rates, uncertainty``.  ``count``
+    and the members of ``bin_counts`` are ints and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    _validate_axis(edges, "edges")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _histogram_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                t_start,
+                t_end,
+                edges,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _HISTOGRAM_SCHEMA,
+        "element": element,
+        "edges": edges,
         "windows": [
             {"name": name, "start": start, "end": end}
             for name, start, end, _t_start, _t_end in validated_windows
