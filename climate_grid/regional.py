@@ -16,6 +16,7 @@ _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
 _TREND_SCHEMA = "climate-grid/trend-window-v1"
+_CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -491,6 +492,65 @@ def _trend_window_region(
         "uncertainty": _round_output(
             math.sqrt(sum(u ** 2 for u in day_uncertainties)) / count
         ),
+    }
+
+
+def _correlation_window_region(
+    values_x: list,
+    status_x: list,
+    uncertainty_x: list,
+    values_y: list,
+    status_y: list,
+    uncertainty_y: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    paired_vx: list[float] = []
+    paired_vy: list[float] = []
+    paired_ux: list[float] = []
+    paired_uy: list[float] = []
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            if status_x[t][i][j] != "missing" and status_y[t][i][j] != "missing":
+                paired_vx.append(values_x[t][i][j])
+                paired_vy.append(values_y[t][i][j])
+                paired_ux.append(uncertainty_x[t][i][j])
+                paired_uy.append(uncertainty_y[t][i][j])
+
+    count = len(paired_vx)
+    if count < min_count:
+        return {
+            "count": count,
+            "covariance": None,
+            "correlation": None,
+            "uncertainty": None,
+        }
+
+    mean_x = sum(paired_vx) / count
+    mean_y = sum(paired_vy) / count
+    covariance = (
+        sum((vx - mean_x) * (vy - mean_y) for vx, vy in zip(paired_vx, paired_vy))
+        / count
+    )
+    variance_x = sum((vx - mean_x) ** 2 for vx in paired_vx) / count
+    variance_y = sum((vy - mean_y) ** 2 for vy in paired_vy) / count
+    if variance_x == 0.0 or variance_y == 0.0:
+        correlation = None
+    else:
+        correlation = covariance / math.sqrt(variance_x * variance_y)
+    uncertainty = math.sqrt(
+        sum(ux ** 2 + uy ** 2 for ux, uy in zip(paired_ux, paired_uy))
+    ) / count
+
+    return {
+        "count": count,
+        "covariance": _round_output(covariance),
+        "correlation": (
+            None if correlation is None else _round_output(correlation)
+        ),
+        "uncertainty": _round_output(uncertainty),
     }
 
 
@@ -1362,6 +1422,99 @@ def aggregate_trend(
     return {
         "schema": _TREND_SCHEMA,
         "element": element,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_correlation(
+    temporal, element_x, element_y, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate two reconstructed grid elements into per-window correlation stats.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``regions``,
+    ``windows`` and ``min_count`` follow the same validation, exceptions and
+    closed-interval sampling rules — but it pairs two elements instead of
+    summarizing one.  ``element_x`` and ``element_y`` must each be a non-empty
+    str naming an element of ``temporal.data`` and they must name different
+    elements; wrong element types raise ``TypeError`` while an empty, unknown
+    or repeated element raises ``ValueError``.
+
+    For every window (in window order) and region (in region order), a cell of
+    a day contributes a paired sample ``(vx, vy, ux, uy)`` only when its
+    status is non-``missing`` for *both* elements.  ``count`` is the number of
+    paired samples ``n``; when ``n`` is below ``min_count``, ``covariance``,
+    ``correlation`` and ``uncertainty`` are all ``None``.  Otherwise
+    ``x_bar = sum(vx) / n`` and ``y_bar = sum(vy) / n``; ``covariance`` is
+    ``sum((vx - x_bar) * (vy - y_bar)) / n``; the variances are
+    ``sum((vx - x_bar) ** 2) / n`` and ``sum((vy - y_bar) ** 2) / n``;
+    ``correlation`` is ``covariance / sqrt(sx2 * sy2)``, or ``None`` when
+    either variance is zero; and ``uncertainty`` is
+    ``sqrt(sum(ux ** 2 + uy ** 2)) / n`` over the paired samples.
+
+    The returned mapping uses the key order ``schema, element_x, element_y,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/correlation-window-v1``, ``element_x`` and ``element_y``
+    echo the arguments, ``windows`` is passed through unchanged and
+    ``regions`` lists the region names in input order.  ``data`` follows the
+    window order; each entry uses the key order ``name, regions``, where each
+    region entry uses the key order ``name, count, covariance, correlation,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element_x, str):
+        raise TypeError("element_x must be a str")
+    if element_x == "":
+        raise ValueError("element_x must be non-empty")
+    if element_x not in data:
+        raise ValueError(f"unknown element: {element_x!r}")
+    if not isinstance(element_y, str):
+        raise TypeError("element_y must be a str")
+    if element_y == "":
+        raise ValueError("element_y must be non-empty")
+    if element_y not in data:
+        raise ValueError(f"unknown element: {element_y!r}")
+    if element_y == element_x:
+        raise ValueError("element_x and element_y must be different")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series_x = data[element_x]
+    series_y = data[element_y]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _correlation_window_region(
+                series_x["values"],
+                series_x["status"],
+                series_x["uncertainty"],
+                series_y["values"],
+                series_y["status"],
+                series_y["uncertainty"],
+                cells,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _CORRELATION_SCHEMA,
+        "element_x": element_x,
+        "element_y": element_y,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
