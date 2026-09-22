@@ -18,6 +18,7 @@ _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
 _TREND_SCHEMA = "climate-grid/trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
+_CHANGE_SCHEMA = "climate-grid/change-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -612,6 +613,57 @@ def _regression_window_region(
             None if intercept is None else _round_output(intercept)
         ),
         "uncertainty": _round_output(uncertainty),
+    }
+
+
+def _change_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    changes: list[float] = []
+    uncertainty_sq_sum = 0.0
+    for i, j in cells:
+        first_t: int | None = None
+        first_v = first_u = None
+        last_v = last_u = None
+        last_t: int | None = None
+        for t in range(t_start, t_end + 1):
+            if status[t][i][j] != "missing":
+                v = values[t][i][j]
+                u = uncertainty[t][i][j]
+                if first_t is None:
+                    first_t = t
+                    first_v = v
+                    first_u = u
+                last_t = t
+                last_v = v
+                last_u = u
+        # Cells non-missing on at least two distinct days carry a sample.
+        if last_t is not None and last_t > first_t:
+            changes.append(last_v - first_v)
+            uncertainty_sq_sum += first_u ** 2 + last_u ** 2
+
+    count = len(changes)
+    if count < min_count:
+        return {
+            "count": count,
+            "mean_change": None,
+            "min_change": None,
+            "max_change": None,
+            "uncertainty": None,
+        }
+
+    return {
+        "count": count,
+        "mean_change": _round_output(sum(changes) / count),
+        "min_change": _round_output(min(changes)),
+        "max_change": _round_output(max(changes)),
+        "uncertainty": _round_output(math.sqrt(uncertainty_sq_sum) / count),
     }
 
 
@@ -1671,6 +1723,88 @@ def aggregate_regression(
         "element_x": element_x,
         "element_y": element_y,
         "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_change(
+    temporal, element, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into per-window change statistics.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions, input order and closed-interval sampling rules — but instead
+    of pooling every cell-day it derives one change per cell.
+
+    For every window (in window order) and region (in region order), each
+    cell of the region is scanned over the inclusive interval, collecting the
+    non-``missing`` ``(v, u)`` samples of value and uncertainty.  A cell with
+    samples on at least two distinct days is retained; its earliest and
+    latest samples ``(v0, u0)`` and ``(v1, u1)`` give a change
+    ``d = v1 - v0`` with ``du = sqrt(u0 ** 2 + u1 ** 2)``.  ``count`` is the
+    number of retained cells; when it is below ``min_count``,
+    ``mean_change``, ``min_change``, ``max_change`` and ``uncertainty`` are
+    all ``None``.  Otherwise they are the arithmetic mean, minimum and
+    maximum of the cell changes, and ``sqrt(sum(du ** 2)) / count`` over the
+    retained cells.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/change-window-v1``,
+    ``element`` echoes the argument, ``windows`` lists three-key dicts in
+    input order and ``regions`` lists the region names in input order.
+    ``data`` follows the window order; each entry uses the key order
+    ``name, regions``, where each region entry uses the key order
+    ``name, count, mean_change, min_change, max_change, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _change_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _CHANGE_SCHEMA,
+        "element": element,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _t_start, _t_end in validated_windows
+        ],
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
