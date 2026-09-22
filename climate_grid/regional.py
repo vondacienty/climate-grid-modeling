@@ -14,6 +14,7 @@ _MULTI_WINDOW_SCHEMA = "climate-grid/multi-window-v1"
 _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
 _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
+_VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -393,6 +394,46 @@ def _window_region(
     }
 
 
+def _variance_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    window_values: list[float] = []
+    window_uncertainties: list[float] = []
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            if status[t][i][j] != "missing":
+                window_values.append(values[t][i][j])
+                window_uncertainties.append(uncertainty[t][i][j])
+
+    count = len(window_values)
+    if count < min_count:
+        return {
+            "count": count,
+            "mean": None,
+            "variance": None,
+            "stddev": None,
+            "uncertainty": None,
+        }
+
+    mean = sum(window_values) / count
+    variance = sum((v - mean) ** 2 for v in window_values) / count
+    return {
+        "count": count,
+        "mean": _round_output(mean),
+        "variance": _round_output(variance),
+        "stddev": _round_output(math.sqrt(variance)),
+        "uncertainty": _round_output(
+            math.sqrt(sum(u ** 2 for u in window_uncertainties)) / count
+        ),
+    }
+
+
 def _coverage_window_region(
     status: list,
     uncertainty: list,
@@ -743,6 +784,82 @@ def aggregate_window(temporal, element, regions, windows, *, min_count: int = 1)
             {"name": name, "start": start, "end": end}
             for name, start, end, _t_start, _t_end in validated_windows
         ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_variance(
+    temporal, element, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into per-window variance stats.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions, input order, closed-interval and non-``missing`` sampling
+    rules — but instead of mean/min/max it reports spread statistics.
+
+    For every window (in window order) and region (in region order), every
+    non-``missing`` cell of every day of the inclusive interval contributes a
+    sample ``(v, u)`` of value and uncertainty.  ``count`` is the number of
+    samples ``n``; when ``n`` is below ``min_count``, ``mean``, ``variance``,
+    ``stddev`` and ``uncertainty`` are all ``None``.  Otherwise, with
+    ``m = sum(v) / n``, they are ``m``, ``sum((v - m) ** 2) / n``,
+    ``sqrt(sum((v - m) ** 2) / n)`` and ``sqrt(sum(u ** 2)) / n`` over the
+    samples' uncertainties.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/variance-window-v1``,
+    ``element`` and ``windows`` echo the arguments unchanged and ``regions``
+    lists the region names in input order.  ``data`` follows the window
+    order; each entry uses the key order ``name, regions``, where each region
+    entry uses the key order ``name, count, mean, variance, stddev,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _variance_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _VARIANCE_SCHEMA,
+        "element": element,
+        "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
