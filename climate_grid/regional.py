@@ -15,6 +15,7 @@ _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
 _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
+_TREND_SCHEMA = "climate-grid/trend-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -430,6 +431,65 @@ def _variance_window_region(
         "stddev": _round_output(math.sqrt(variance)),
         "uncertainty": _round_output(
             math.sqrt(sum(u ** 2 for u in window_uncertainties)) / count
+        ),
+    }
+
+
+def _trend_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    day_means: list[float] = []
+    day_uncertainties: list[float] = []
+    day_offsets: list[int] = []
+    for offset, t in enumerate(range(t_start, t_end + 1)):
+        day_values = [
+            values[t][i][j] for i, j in cells if status[t][i][j] != "missing"
+        ]
+        count = len(day_values)
+        if count < min_count:
+            continue
+        cell_uncertainties = [
+            uncertainty[t][i][j]
+            for i, j in cells
+            if status[t][i][j] != "missing"
+        ]
+        day_means.append(sum(day_values) / count)
+        day_uncertainties.append(
+            math.sqrt(sum(u ** 2 for u in cell_uncertainties)) / count
+        )
+        day_offsets.append(offset)
+
+    k = len(day_means)
+    if k < 2:
+        return {
+            "count": k,
+            "mean": None,
+            "slope": None,
+            "intercept": None,
+            "uncertainty": None,
+        }
+
+    x_mean = sum(day_offsets) / k
+    m_mean = sum(day_means) / k
+    denominator = sum((x - x_mean) ** 2 for x in day_offsets)
+    numerator = sum(
+        (x - x_mean) * (m - m_mean)
+        for x, m in zip(day_offsets, day_means)
+    )
+    slope = numerator / denominator
+    return {
+        "count": k,
+        "mean": _round_output(m_mean),
+        "slope": _round_output(slope),
+        "intercept": _round_output(m_mean - slope * x_mean),
+        "uncertainty": _round_output(
+            math.sqrt(sum(u ** 2 for u in day_uncertainties)) / k
         ),
     }
 
@@ -858,6 +918,88 @@ def aggregate_variance(
 
     return {
         "schema": _VARIANCE_SCHEMA,
+        "element": element,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_trend(
+    temporal, element, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into per-window daily trends.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions and closed-interval sampling rules — but instead of pooling
+    every cell of the window into one sample, it first forms one daily
+    aggregate per retained day and then fits a daily linear trend.
+
+    For every window (in window order) and region (in region order), each day
+    of the inclusive interval is considered separately.  ``n`` is the number
+    of non-``missing`` cells that day; days with ``n < min_count`` are
+    dropped.  Each retained day contributes ``m = sum(v) / n`` and
+    ``u = sqrt(sum(u_i ** 2)) / n`` over its cells' values and uncertainties,
+    plus ``x``, the day's offset in days from the window start.  With ``k``
+    retained days, the fit is an ordinary least-squares regression of ``m``
+    on ``x``: ``slope = sum((x - x_mean) * (m - m_mean)) /
+    sum((x - x_mean) ** 2)`` and ``intercept = m_mean - slope * x_mean``,
+    while ``mean = m_mean`` and ``uncertainty = sqrt(sum(u ** 2)) / k`` over
+    the retained days' daily uncertainties.  When ``k < 2``, everything
+    except ``count`` (``mean``, ``slope``, ``intercept`` and
+    ``uncertainty``) is ``None``.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/trend-window-v1``,
+    ``element`` echoes the argument, ``windows`` is passed through unchanged
+    and ``regions`` lists the region names in input order.  ``data`` follows
+    the window order; each entry uses the key order ``name, regions``, where
+    each region entry uses the key order ``name, count, mean, slope,
+    intercept, uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _trend_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _TREND_SCHEMA,
         "element": element,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
