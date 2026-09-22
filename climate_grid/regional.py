@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 _SCHEMA = "climate-grid/regional-v1"
+_MULTI_SCHEMA = "climate-grid/regional-multi-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -253,6 +254,56 @@ def _validate_regions(
     return validated
 
 
+def _region_series(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    n_times: int,
+    min_count: int,
+) -> dict:
+    counts: list[int] = []
+    means: list[float | None] = []
+    mins: list[float | None] = []
+    maxs: list[float | None] = []
+    uncertainties: list[float | None] = []
+
+    for t in range(n_times):
+        day_values = [
+            values[t][i][j] for i, j in cells if status[t][i][j] != "missing"
+        ]
+        count = len(day_values)
+        counts.append(count)
+        if count < min_count:
+            means.append(None)
+            mins.append(None)
+            maxs.append(None)
+            uncertainties.append(None)
+            continue
+
+        day_uncertainties = [
+            uncertainty[t][i][j]
+            for i, j in cells
+            if status[t][i][j] != "missing"
+        ]
+        means.append(_round_output(sum(day_values) / count))
+        mins.append(_round_output(min(day_values)))
+        maxs.append(_round_output(max(day_values)))
+        uncertainties.append(
+            _round_output(
+                math.sqrt(sum(u ** 2 for u in day_uncertainties)) / count
+            )
+        )
+
+    return {
+        "count": counts,
+        "mean": means,
+        "min": mins,
+        "max": maxs,
+        "uncertainty": uncertainties,
+    }
+
+
 def aggregate(temporal, element, regions, *, min_count: int = 1) -> dict:
     """Aggregate a reconstructed grid series into per-region daily statistics.
 
@@ -307,52 +358,84 @@ def aggregate(temporal, element, regions, *, min_count: int = 1) -> dict:
 
     result_data = []
     for name, cells in validated_regions:
-        counts: list[int] = []
-        means: list[float | None] = []
-        mins: list[float | None] = []
-        maxs: list[float | None] = []
-        uncertainties: list[float | None] = []
-
-        for t in range(n_times):
-            day_values = [
-                values[t][i][j] for i, j in cells if status[t][i][j] != "missing"
-            ]
-            count = len(day_values)
-            counts.append(count)
-            if count < min_count:
-                means.append(None)
-                mins.append(None)
-                maxs.append(None)
-                uncertainties.append(None)
-                continue
-
-            day_uncertainties = [
-                uncertainty[t][i][j]
-                for i, j in cells
-                if status[t][i][j] != "missing"
-            ]
-            means.append(_round_output(sum(day_values) / count))
-            mins.append(_round_output(min(day_values)))
-            maxs.append(_round_output(max(day_values)))
-            uncertainties.append(
-                _round_output(
-                    math.sqrt(sum(u ** 2 for u in day_uncertainties)) / count
-                )
-            )
-
         result_data.append(
-            {
-                "count": counts,
-                "mean": means,
-                "min": mins,
-                "max": maxs,
-                "uncertainty": uncertainties,
-            }
+            _region_series(
+                values, status, uncertainty, cells, n_times, min_count
+            )
         )
 
     return {
         "schema": _SCHEMA,
         "element": element,
+        "times": times,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi(temporal, elements, regions, *, min_count: int = 1) -> dict:
+    """Aggregate a reconstructed grid series for several elements at once.
+
+    Behaves like :func:`aggregate` but ``elements`` is a non-empty list of
+    unique non-empty str element names that must all exist in
+    ``temporal.data``; wrong element item types raise ``TypeError`` while an
+    empty, duplicate or unknown element raises ``ValueError``.
+
+    The returned mapping uses the key order ``schema, elements, times,
+    regions, data``; ``schema`` is ``climate-grid/regional-multi-v1``,
+    ``elements`` and ``times`` are passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` follows the region
+    order; each entry uses the key order ``name, elements``, where
+    ``elements`` follows the requested element order and each entry uses the
+    key order ``element, count, mean, min, max, uncertainty``, all six
+    members being equally long day series.  Per-day statistics and float
+    rounding match :func:`aggregate`.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    n_times = len(times)
+    result_data = []
+    for name, cells in validated_regions:
+        element_series = []
+        for element in elements:
+            series = data[element]
+            stats = _region_series(
+                series["values"],
+                series["status"],
+                series["uncertainty"],
+                cells,
+                n_times,
+                min_count,
+            )
+            element_series.append({"element": element, **stats})
+        result_data.append({"name": name, "elements": element_series})
+
+    return {
+        "schema": _MULTI_SCHEMA,
+        "elements": elements,
         "times": times,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
