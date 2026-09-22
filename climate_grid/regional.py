@@ -13,6 +13,7 @@ _WINDOW_SCHEMA = "climate-grid/window-v1"
 _MULTI_WINDOW_SCHEMA = "climate-grid/multi-window-v1"
 _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
 _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
+_COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -392,6 +393,55 @@ def _window_region(
     }
 
 
+def _coverage_window_region(
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    total = (t_end - t_start + 1) * len(cells)
+    available = 0
+    observed = 0
+    interpolated = 0
+    uncertainty_sq_sum = 0.0
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            cell_status = status[t][i][j]
+            if cell_status == "missing":
+                continue
+            available += 1
+            if cell_status == "observed":
+                observed += 1
+            else:
+                interpolated += 1
+            uncertainty_sq_sum += uncertainty[t][i][j] ** 2
+
+    if available < min_count:
+        return {
+            "total": total,
+            "available": available,
+            "observed": observed,
+            "interpolated": interpolated,
+            "rate": None,
+            "observed_rate": None,
+            "interpolated_rate": None,
+            "uncertainty": None,
+        }
+
+    return {
+        "total": total,
+        "available": available,
+        "observed": observed,
+        "interpolated": interpolated,
+        "rate": _round_output(available / total),
+        "observed_rate": _round_output(observed / total),
+        "interpolated_rate": _round_output(interpolated / total),
+        "uncertainty": _round_output(math.sqrt(uncertainty_sq_sum) / available),
+    }
+
+
 def _exceedance_window_region(
     values: list,
     status: list,
@@ -688,6 +738,83 @@ def aggregate_window(temporal, element, regions, windows, *, min_count: int = 1)
 
     return {
         "schema": _WINDOW_SCHEMA,
+        "element": element,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _t_start, _t_end in validated_windows
+        ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_coverage(temporal, element, regions, windows, *, min_count: int = 1) -> dict:
+    """Aggregate a reconstructed grid series into per-window coverage stats.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions and sampling rules — but it reports data coverage rather than
+    value statistics.
+
+    For every window (in window order) and region (in region order),
+    ``total`` is the number of days in the inclusive interval times the
+    number of cells in the region.  ``available`` counts non-``missing``
+    cells, split into ``observed`` and ``interpolated``; all four counts are
+    ints.  When ``available`` is below ``min_count``, ``rate``,
+    ``observed_rate``, ``interpolated_rate`` and ``uncertainty`` are all
+    ``None``.  Otherwise they are ``available / total``, ``observed /
+    total``, ``interpolated / total`` and ``sqrt(sum(u ** 2)) / available``
+    over the available cells' uncertainties.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/coverage-window-v1``,
+    ``element`` echoes the argument, ``windows`` lists three-key dicts in
+    input order and ``regions`` lists the region names in input order.
+    ``data`` follows the window order; each entry uses the key order
+    ``name, regions``, where each region entry uses the key order ``name,
+    total, available, observed, interpolated, rate, observed_rate,
+    interpolated_rate, uncertainty``.  Every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _coverage_window_region(
+                status,
+                uncertainty,
+                cells,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _COVERAGE_SCHEMA,
         "element": element,
         "windows": [
             {"name": name, "start": start, "end": end}
