@@ -19,6 +19,7 @@ _TREND_SCHEMA = "climate-grid/trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
+_MULTI_CHANGE_SCHEMA = "climate-grid/multi-change-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -1805,6 +1806,101 @@ def aggregate_change(
             {"name": name, "start": start, "end": end}
             for name, start, end, _t_start, _t_end in validated_windows
         ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_change_multi(
+    temporal, elements, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into per-window change statistics at once.
+
+    Combines :func:`aggregate_multi` and :func:`aggregate_change`:
+    ``temporal``, ``regions`` and ``min_count`` follow :func:`aggregate`;
+    ``elements`` is a non-empty list of unique non-empty str element names
+    that must all exist in ``temporal.data`` (wrong item types raise
+    ``TypeError``; an empty, duplicate or unknown element raises
+    ``ValueError``); ``windows`` follows :func:`aggregate_change` — a
+    non-empty list of dicts with exactly the keys ``name``, ``start`` and
+    ``end`` in that order, where ``name`` is a unique non-empty str and
+    ``start``/``end`` are valid ``YYYY-MM-DD`` dates occurring in
+    ``temporal.times`` with ``start <= end``.
+
+    For every window (in window order), region (in region order) and element
+    (in element order), each cell with at least two non-``missing`` days in
+    the inclusive interval is retained.  With ``(v0, u0)`` its earliest and
+    ``(v1, u1)`` its latest value/uncertainty, the cell contributes a change
+    ``d = v1 - v0`` and a change uncertainty ``du = sqrt(u0 ** 2 + u1 **
+    2)``.  ``count`` is the number of retained cells; when it is below
+    ``min_count``, ``mean_change``, ``min_change``, ``max_change`` and
+    ``uncertainty`` are all ``None``.  Otherwise they are the arithmetic
+    mean, minimum and maximum of the cell changes, and
+    ``sqrt(sum(du ** 2)) / count`` over the cells' change uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/multi-change-window-v1``,
+    ``elements`` and ``windows`` are passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, mean_change, min_change, max_change,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _change_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MULTI_CHANGE_SCHEMA,
+        "elements": elements,
+        "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
