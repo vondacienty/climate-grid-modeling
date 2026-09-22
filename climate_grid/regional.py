@@ -9,11 +9,13 @@ from typing import Any
 
 _SCHEMA = "climate-grid/regional-v1"
 _MULTI_SCHEMA = "climate-grid/regional-multi-v1"
+_WINDOW_SCHEMA = "climate-grid/window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
 _STATUSES = frozenset({"observed", "interpolated", "missing"})
 _REGION_KEYS = frozenset({"name", "cells"})
+_WINDOW_KEYS = frozenset({"name", "start", "end"})
 _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
@@ -437,6 +439,179 @@ def aggregate_multi(temporal, elements, regions, *, min_count: int = 1) -> dict:
         "schema": _MULTI_SCHEMA,
         "elements": elements,
         "times": times,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def _validate_windows(
+    windows: Any, index_by_time: dict[str, int]
+) -> list[tuple[str, str, str]]:
+    if not isinstance(windows, list):
+        raise TypeError("windows must be a list")
+    if len(windows) == 0:
+        raise ValueError("windows must be non-empty")
+
+    validated: list[tuple[str, str, str]] = []
+    seen_names: set[str] = set()
+    for w_index, window in enumerate(windows):
+        where = f"windows[{w_index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(window.keys()) != _WINDOW_KEYS:
+            raise ValueError(f"{where} must have exactly the keys name, start, end")
+
+        name = window["name"]
+        start = window["start"]
+        end = window["end"]
+
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate window name: {name!r}")
+        seen_names.add(name)
+
+        if not isinstance(start, str):
+            raise TypeError(f"{where}.start must be a str")
+        if not isinstance(end, str):
+            raise TypeError(f"{where}.end must be a str")
+
+        # Validates the YYYY-MM-DD format and Gregorian date.
+        _parse_date(start, f"{where}.start")
+        _parse_date(end, f"{where}.end")
+        if start not in index_by_time:
+            raise ValueError(f"{where}.start must be within temporal.times")
+        if end not in index_by_time:
+            raise ValueError(f"{where}.end must be within temporal.times")
+        if index_by_time[start] > index_by_time[end]:
+            raise ValueError(f"{where}.start must be on or before end")
+
+        validated.append((name, start, end))
+
+    return validated
+
+
+def _window_region_stats(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    day_offsets: list[int],
+    min_count: int,
+) -> dict:
+    window_values: list[float] = []
+    window_uncertainties: list[float] = []
+    for t in day_offsets:
+        for i, j in cells:
+            if status[t][i][j] != "missing":
+                window_values.append(values[t][i][j])
+                window_uncertainties.append(uncertainty[t][i][j])
+
+    count = len(window_values)
+    if count < min_count:
+        return {
+            "count": count,
+            "mean": None,
+            "min": None,
+            "max": None,
+            "uncertainty": None,
+        }
+
+    return {
+        "count": count,
+        "mean": _round_output(sum(window_values) / count),
+        "min": _round_output(min(window_values)),
+        "max": _round_output(max(window_values)),
+        "uncertainty": _round_output(
+            math.sqrt(sum(u ** 2 for u in window_uncertainties)) / count
+        ),
+    }
+
+
+def aggregate_window(temporal, element, regions, windows, *, min_count: int = 1) -> dict:
+    """Aggregate a reconstructed grid series into per-window region statistics.
+
+    Behaves like :func:`aggregate` but statistics are computed over whole
+    calendar windows instead of per day.  ``windows`` is a non-empty list of
+    dicts, each with exactly the keys ``name``, ``start`` and ``end``.
+    ``name`` is a unique non-empty str; ``start`` and ``end`` are valid
+    ``YYYY-MM-DD`` dates that both occur in ``temporal.times``, with
+    ``start <= end``.  Wrong container/name/date types raise ``TypeError``;
+    every other window constraint raises ``ValueError``.
+
+    For every window (in given order) and region (in given order), each
+    non-``missing`` cell on each day of the inclusive window contributes one
+    sample.  ``count`` is the number of samples; when it is below
+    ``min_count``, ``mean``, ``min``, ``max`` and ``uncertainty`` are all
+    ``None``.  Otherwise they are the arithmetic mean, minimum and maximum of
+    the sample values, and ``sqrt(sum(u ** 2)) / count`` over the samples'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/window-v1``, ``element``
+    echoes the argument, ``windows`` lists the window dicts in input order
+    (each keeping the key order ``name, start, end``) and ``regions`` lists
+    the region names in input order.  ``data`` follows the window order; each
+    entry uses the key order ``name, regions``, where each region entry uses
+    the key order ``name, count, mean, min, max, uncertainty``.  ``count`` is
+    an int and every other number is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+
+    index_by_time = {time: index for index, time in enumerate(times)}
+    validated_windows = _validate_windows(windows, index_by_time)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for name, start, end in validated_windows:
+        day_offsets = list(
+            range(index_by_time[start], index_by_time[end] + 1)
+        )
+
+        region_entries = []
+        for region_name, cells in validated_regions:
+            stats = _window_region_stats(
+                values,
+                status,
+                uncertainty,
+                cells,
+                day_offsets,
+                min_count,
+            )
+            region_entries.append({"name": region_name, **stats})
+        result_data.append({"name": name, "regions": region_entries})
+
+    return {
+        "schema": _WINDOW_SCHEMA,
+        "element": element,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end in validated_windows
+        ],
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
