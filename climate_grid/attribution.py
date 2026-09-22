@@ -7,6 +7,7 @@ from typing import Any
 
 _SCHEMA = "climate-grid/attribution-v1"
 _BATCH_SCHEMA = "climate-grid/batch-attribution-v1"
+_MULTI_SCHEMA = "climate-grid/multi-attribution-v1"
 _TRENDS_SCHEMA = "climate-grid/trends-v1"
 _TRENDS_KEYS = frozenset({"schema", "years", "data"})
 _METRIC_KEYS = ("count", "days", "cells", "intensity", "uncertainty")
@@ -136,6 +137,19 @@ def _validate_driver(driver: Any, n_years: int, where: str) -> None:
         raise ValueError(f"{where} must have one entry per year")
     for index, value in enumerate(driver):
         _validate_number(value, f"{where}[{index}]", nullable=True)
+
+
+def _validate_drivers(drivers: Any, n_years: int) -> None:
+    if not isinstance(drivers, dict):
+        raise TypeError("drivers must be a dict")
+    if len(drivers) == 0:
+        raise ValueError("drivers must be non-empty")
+    for name, driver in drivers.items():
+        if not isinstance(name, str):
+            raise TypeError("drivers keys must be str")
+        if name == "":
+            raise ValueError("drivers keys must be non-empty")
+        _validate_driver(driver, n_years, f"drivers[{name!r}]")
 
 
 def _attribute_entry(years: list, entry: dict, driver: list) -> tuple[list, list]:
@@ -275,3 +289,112 @@ def batch_attribute(trends, jobs) -> dict:
             }
         )
     return {"schema": _BATCH_SCHEMA, "results": results}
+
+
+def multi_attribute(trends, element, drivers) -> dict:
+    """Attribute an element's intensity trend to several drivers at once.
+
+    ``trends`` must be a complete :func:`climate_grid.trends.summarize`
+    result (schema ``climate-grid/trends-v1``), validated exactly as for
+    :func:`attribute`.  ``element`` must be a non-empty str naming one of
+    its elements.  ``drivers`` must be a non-empty dict mapping non-empty
+    str driver names to per-year series; each series is a list with one
+    entry per year in ``trends.years``, each either ``None`` or a finite
+    non-bool number.
+
+    The element's yearly ``intensity`` is the regressand y and each
+    driver a regressor x.  Only years where the intensity and every
+    driver are non-``None`` are retained, preserving year order.  Fewer
+    than two retained years, or zero variance in any driver's retained
+    values (``sum((x - xbar) ** 2) == 0``), raise ``ValueError``.  With
+    arithmetic means xbar and ybar of the retained values, each driver's
+    slope is ``b = sum((x - xbar) * (y - ybar)) / sum((x - xbar) ** 2)``.
+
+    The returned mapping uses the key order ``schema, element, years,
+    drivers, total, uncertainty``; ``schema`` is
+    ``climate-grid/multi-attribution-v1``, ``element`` echoes the
+    argument and ``years`` lists the retained years.  ``drivers``
+    follows the input driver order and each entry uses the key order
+    ``slope, contribution``: the slope is ``b`` and the contribution is
+    one ``b * (x - xbar)`` value per retained year.  ``total`` and
+    ``uncertainty`` are as long as ``years``: the total is the
+    per-year sum of all drivers' contributions, and the uncertainty is
+    ``None`` where the element's own uncertainty for that year is
+    ``None``, otherwise ``sqrt(d * u ** 2)`` with ``d`` the number of
+    drivers and ``u`` that year's uncertainty.  Every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs
+    are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    years, data = _validate_trends(trends)
+    _validate_element(element, data, "element")
+    _validate_drivers(drivers, len(years))
+
+    entry = data[element]
+    intensity = entry["intensity"]
+    uncertainty = entry["uncertainty"]
+    names = list(drivers.keys())
+    series = [drivers[name] for name in names]
+
+    indices = [
+        index
+        for index in range(len(years))
+        if intensity[index] is not None
+        and all(driver[index] is not None for driver in series)
+    ]
+    if len(indices) < 2:
+        raise ValueError(
+            "at least two years with intensity and all drivers are required"
+        )
+
+    n = len(indices)
+    ys = [intensity[index] for index in indices]
+    mean_y = sum(ys) / n
+
+    contributions: list[list] = []
+    driver_entries: dict = {}
+    for name, driver in zip(names, series):
+        xs = [driver[index] for index in indices]
+        mean_x = sum(xs) / n
+        denominator = sum((x - mean_x) ** 2 for x in xs)
+        if denominator == 0:
+            raise ValueError(
+                f"retained values of driver {name!r} must not all be equal"
+            )
+        numerator = sum(
+            (x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)
+        )
+        b = numerator / denominator
+        contribution = [_round_output(b * (x - mean_x)) for x in xs]
+        contributions.append(contribution)
+        driver_entries[name] = {
+            "slope": _round_output(b),
+            "contribution": contribution,
+        }
+
+    n_drivers = len(names)
+    total: list = []
+    result_uncertainty: list = []
+    for position, index in enumerate(indices):
+        total.append(
+            _round_output(
+                sum(contribution[position] for contribution in contributions)
+            )
+        )
+        u = uncertainty[index]
+        result_uncertainty.append(
+            None
+            if u is None
+            else _round_output(math.sqrt(n_drivers * u ** 2))
+        )
+
+    return {
+        "schema": _MULTI_SCHEMA,
+        "element": element,
+        "years": [years[index] for index in indices],
+        "drivers": driver_entries,
+        "total": total,
+        "uncertainty": result_uncertainty,
+    }
