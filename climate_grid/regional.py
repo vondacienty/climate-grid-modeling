@@ -26,6 +26,7 @@ __all__ = [
     "aggregate_correlation",
     "aggregate_weighted_correlation",
     "aggregate_regression",
+    "aggregate_weighted_regression",
     "aggregate_change",
     "aggregate_change_multi",
 ]
@@ -47,6 +48,7 @@ _TREND_SCHEMA = "climate-grid/trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
+_WEIGHTED_REGRESSION_SCHEMA = "climate-grid/weighted-regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
 _MULTI_CHANGE_SCHEMA = "climate-grid/multi-change-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
@@ -931,6 +933,76 @@ def _regression_window_region(
     uncertainty = math.sqrt(
         sum(ux ** 2 + uy ** 2 for ux, uy in zip(paired_ux, paired_uy))
     ) / count
+
+    return {
+        "count": count,
+        "slope": None if slope is None else _round_output(slope),
+        "intercept": (
+            None if intercept is None else _round_output(intercept)
+        ),
+        "uncertainty": _round_output(uncertainty),
+    }
+
+
+def _weighted_regression_window_region(
+    values_x: list,
+    status_x: list,
+    uncertainty_x: list,
+    values_y: list,
+    status_y: list,
+    uncertainty_y: list,
+    cells: list[tuple[int, int]],
+    weights: list[float],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    paired_weights: list[float] = []
+    paired_vx: list[float] = []
+    paired_vy: list[float] = []
+    paired_ux: list[float] = []
+    paired_uy: list[float] = []
+    for t in range(t_start, t_end + 1):
+        for cell_index, (i, j) in enumerate(cells):
+            if status_x[t][i][j] != "missing" and status_y[t][i][j] != "missing":
+                paired_weights.append(weights[cell_index])
+                paired_vx.append(values_x[t][i][j])
+                paired_vy.append(values_y[t][i][j])
+                paired_ux.append(uncertainty_x[t][i][j])
+                paired_uy.append(uncertainty_y[t][i][j])
+
+    count = len(paired_vx)
+    if count < min_count:
+        return {
+            "count": count,
+            "slope": None,
+            "intercept": None,
+            "uncertainty": None,
+        }
+
+    weight_sum = sum(paired_weights)
+    mean_x = sum(w * v for w, v in zip(paired_weights, paired_vx)) / weight_sum
+    mean_y = sum(w * v for w, v in zip(paired_weights, paired_vy)) / weight_sum
+    sxx = sum(
+        w * (vx - mean_x) ** 2
+        for w, vx in zip(paired_weights, paired_vx)
+    )
+    sxy = sum(
+        w * (vx - mean_x) * (vy - mean_y)
+        for w, vx, vy in zip(paired_weights, paired_vx, paired_vy)
+    )
+    if sxx == 0.0:
+        slope = None
+        intercept = None
+    else:
+        slope = sxy / sxx
+        intercept = mean_y - slope * mean_x
+    uncertainty = math.sqrt(
+        sum(
+            (w * ux) ** 2 + (w * uy) ** 2
+            for w, ux, uy in zip(paired_weights, paired_ux, paired_uy)
+        )
+    ) / weight_sum
 
     return {
         "count": count,
@@ -2700,6 +2772,104 @@ def aggregate_regression(
 
     return {
         "schema": _REGRESSION_SCHEMA,
+        "element_x": element_x,
+        "element_y": element_y,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_regression(
+    temporal, element_x, element_y, regions, windows, weights, *, min_count: int = 1
+) -> dict:
+    """Aggregate two reconstructed grid elements into weighted window regression stats.
+
+    Behaves like :func:`aggregate_weighted_window` — ``temporal``,
+    ``regions``, ``windows``, ``weights`` and ``min_count`` follow the same
+    validation, exceptions, input order, closed-interval and sampling rules —
+    and like :func:`aggregate_correlation`, ``element_x`` and ``element_y``
+    must each be a non-empty str naming an element of ``temporal.data`` and
+    name different elements (wrong element types raise ``TypeError`` while an
+    empty, unknown or repeated element raises ``ValueError``).
+
+    For every window (in window order) and region (in region order), a cell
+    of a day contributes a paired weighted sample ``(x, y, ux, uy, w)`` only
+    when its status is non-``missing`` for *both* elements, where ``w`` is
+    that cell's weight.  ``count`` is the number ``n`` of paired samples;
+    when ``n`` is below ``min_count``, ``slope``, ``intercept`` and
+    ``uncertainty`` are all ``None``.  Otherwise, with ``W = sum(w)``,
+    ``x_bar = sum(w * x) / W`` and ``y_bar = sum(w * y) / W``; with
+    ``Sxx = sum(w * (x - x_bar) ** 2)`` and
+    ``Sxy = sum(w * (x - x_bar) * (y - y_bar))``, ``slope`` and ``intercept``
+    are ``None`` when ``Sxx`` is zero and otherwise ``slope = Sxy / Sxx`` and
+    ``intercept = y_bar - slope * x_bar``; ``uncertainty`` is
+    ``sqrt(sum((w * ux) ** 2 + (w * uy) ** 2)) / W`` over the paired samples.
+
+    The returned mapping uses the key order ``schema, element_x, element_y,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/weighted-regression-window-v1``, ``element_x`` and
+    ``element_y`` echo the arguments, ``windows`` is passed through unchanged
+    and ``regions`` lists the region names in input order.  ``data`` follows
+    the window order; each entry uses the key order ``name, regions``, where
+    each region entry uses the key order ``name, count, slope, intercept,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element_x, str):
+        raise TypeError("element_x must be a str")
+    if element_x == "":
+        raise ValueError("element_x must be non-empty")
+    if element_x not in data:
+        raise ValueError(f"unknown element: {element_x!r}")
+    if not isinstance(element_y, str):
+        raise TypeError("element_y must be a str")
+    if element_y == "":
+        raise ValueError("element_y must be non-empty")
+    if element_y not in data:
+        raise ValueError(f"unknown element: {element_y!r}")
+    if element_y == element_x:
+        raise ValueError("element_x and element_y must be different")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series_x = data[element_x]
+    series_y = data[element_y]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            stats = _weighted_regression_window_region(
+                series_x["values"],
+                series_x["status"],
+                series_x["uncertainty"],
+                series_y["values"],
+                series_y["status"],
+                series_y["uncertainty"],
+                cells,
+                cell_weights,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _WEIGHTED_REGRESSION_SCHEMA,
         "element_x": element_x,
         "element_y": element_y,
         "windows": windows,
