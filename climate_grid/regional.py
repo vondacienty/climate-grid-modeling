@@ -24,6 +24,7 @@ __all__ = [
     "aggregate_multi_window",
     "aggregate_trend",
     "aggregate_correlation",
+    "aggregate_weighted_correlation",
     "aggregate_regression",
     "aggregate_change",
     "aggregate_change_multi",
@@ -44,6 +45,7 @@ _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
 _TREND_SCHEMA = "climate-grid/trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
+_WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
 _MULTI_CHANGE_SCHEMA = "climate-grid/multi-change-window-v1"
@@ -788,6 +790,85 @@ def _correlation_window_region(
     uncertainty = math.sqrt(
         sum(ux ** 2 + uy ** 2 for ux, uy in zip(paired_ux, paired_uy))
     ) / count
+
+    return {
+        "count": count,
+        "covariance": _round_output(covariance),
+        "correlation": (
+            None if correlation is None else _round_output(correlation)
+        ),
+        "uncertainty": _round_output(uncertainty),
+    }
+
+
+def _weighted_correlation_window_region(
+    values_x: list,
+    status_x: list,
+    uncertainty_x: list,
+    values_y: list,
+    status_y: list,
+    uncertainty_y: list,
+    cells: list[tuple[int, int]],
+    weights: list[float],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    paired_weights: list[float] = []
+    paired_vx: list[float] = []
+    paired_vy: list[float] = []
+    paired_ux: list[float] = []
+    paired_uy: list[float] = []
+    for t in range(t_start, t_end + 1):
+        for cell_index, (i, j) in enumerate(cells):
+            if status_x[t][i][j] != "missing" and status_y[t][i][j] != "missing":
+                paired_weights.append(weights[cell_index])
+                paired_vx.append(values_x[t][i][j])
+                paired_vy.append(values_y[t][i][j])
+                paired_ux.append(uncertainty_x[t][i][j])
+                paired_uy.append(uncertainty_y[t][i][j])
+
+    count = len(paired_vx)
+    if count < min_count:
+        return {
+            "count": count,
+            "covariance": None,
+            "correlation": None,
+            "uncertainty": None,
+        }
+
+    weight_sum = sum(paired_weights)
+    mean_x = (
+        sum(w * vx for w, vx in zip(paired_weights, paired_vx)) / weight_sum
+    )
+    mean_y = (
+        sum(w * vy for w, vy in zip(paired_weights, paired_vy)) / weight_sum
+    )
+    covariance = (
+        sum(
+            w * (vx - mean_x) * (vy - mean_y)
+            for w, vx, vy in zip(paired_weights, paired_vx, paired_vy)
+        )
+        / weight_sum
+    )
+    variance_x = (
+        sum(w * (vx - mean_x) ** 2 for w, vx in zip(paired_weights, paired_vx))
+        / weight_sum
+    )
+    variance_y = (
+        sum(w * (vy - mean_y) ** 2 for w, vy in zip(paired_weights, paired_vy))
+        / weight_sum
+    )
+    if variance_x == 0.0 or variance_y == 0.0:
+        correlation = None
+    else:
+        correlation = covariance / math.sqrt(variance_x * variance_y)
+    uncertainty = math.sqrt(
+        sum(
+            (w * ux) ** 2 + (w * uy) ** 2
+            for w, ux, uy in zip(paired_weights, paired_ux, paired_uy)
+        )
+    ) / weight_sum
 
     return {
         "count": count,
@@ -2419,6 +2500,108 @@ def aggregate_correlation(
 
     return {
         "schema": _CORRELATION_SCHEMA,
+        "element_x": element_x,
+        "element_y": element_y,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_correlation(
+    temporal, element_x, element_y, regions, windows, weights, *, min_count: int = 1
+) -> dict:
+    """Aggregate two reconstructed grid elements into weighted correlation stats.
+
+    Behaves like :func:`aggregate_correlation` for ``temporal``,
+    ``element_x``, ``element_y``, ``regions``, ``windows`` and
+    ``min_count`` — same validation, exceptions, input order, closed-interval
+    and paired non-``missing`` sampling rules — and like
+    :func:`aggregate_weighted_window` for ``weights``: a non-empty list with
+    one entry per region, in region order, each a dict with exactly the keys
+    ``name`` and ``values`` in that order, where ``name`` equals the
+    corresponding region's name and ``values`` is a list with one finite
+    non-bool positive int or float per cell, aligned with that region's
+    ``cells``.
+
+    For every window (in window order) and region (in region order), a cell of
+    a day contributes a paired sample ``(vx, vy, ux, uy, w)`` only when its
+    status is non-``missing`` for *both* elements, where ``w`` is that cell's
+    weight.  ``count`` is the number of paired samples ``n``; when ``n`` is
+    below ``min_count``, ``covariance``, ``correlation`` and ``uncertainty``
+    are all ``None``.  Otherwise, with ``W = sum(w)`` over the samples,
+    ``x_bar = sum(w * vx) / W`` and ``y_bar = sum(w * vy) / W``; writing
+    ``dx = vx - x_bar`` and ``dy = vy - y_bar``, ``covariance`` is
+    ``sum(w * dx * dy) / W`` and the variances are ``sum(w * dx ** 2) / W``
+    and ``sum(w * dy ** 2) / W``; ``correlation`` is
+    ``covariance / sqrt(sx2 * sy2)``, or ``None`` when either variance is
+    zero; and ``uncertainty`` is
+    ``sqrt(sum((w * ux) ** 2 + (w * uy) ** 2)) / W`` over the paired samples.
+
+    The returned mapping uses the key order ``schema, element_x, element_y,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/weighted-correlation-window-v1``, ``element_x`` and
+    ``element_y`` echo the arguments, ``windows`` is passed through unchanged
+    and ``regions`` lists the region names in input order.  ``data`` follows
+    the window order; each entry uses the key order ``name, regions``, where
+    each region entry uses the key order ``name, count, covariance,
+    correlation, uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element_x, str):
+        raise TypeError("element_x must be a str")
+    if element_x == "":
+        raise ValueError("element_x must be non-empty")
+    if element_x not in data:
+        raise ValueError(f"unknown element: {element_x!r}")
+    if not isinstance(element_y, str):
+        raise TypeError("element_y must be a str")
+    if element_y == "":
+        raise ValueError("element_y must be non-empty")
+    if element_y not in data:
+        raise ValueError(f"unknown element: {element_y!r}")
+    if element_y == element_x:
+        raise ValueError("element_x and element_y must be different")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series_x = data[element_x]
+    series_y = data[element_y]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            stats = _weighted_correlation_window_region(
+                series_x["values"],
+                series_x["status"],
+                series_x["uncertainty"],
+                series_y["values"],
+                series_y["status"],
+                series_y["uncertainty"],
+                cells,
+                cell_weights,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _WEIGHTED_CORRELATION_SCHEMA,
         "element_x": element_x,
         "element_y": element_y,
         "windows": windows,
