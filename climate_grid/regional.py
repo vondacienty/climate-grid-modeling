@@ -25,6 +25,7 @@ __all__ = [
     "aggregate_exceedance",
     "aggregate_quantile",
     "aggregate_histogram",
+    "aggregate_entropy",
     "aggregate_weighted_histogram",
     "aggregate_multi_window",
     "aggregate_weighted_multi_window",
@@ -53,6 +54,7 @@ _MULTI_WINDOW_SCHEMA = "climate-grid/multi-window-v1"
 _WEIGHTED_MULTI_WINDOW_SCHEMA = "climate-grid/weighted-multi-window-v1"
 _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
 _HISTOGRAM_SCHEMA = "climate-grid/histogram-window-v1"
+_ENTROPY_SCHEMA = "climate-grid/entropy-window-v1"
 _WEIGHTED_HISTOGRAM_SCHEMA = "climate-grid/weighted-histogram-window-v1"
 _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
@@ -1472,6 +1474,47 @@ def _histogram_window_region(
         "count": count,
         "bin_counts": bin_counts,
         "rates": [_round_output(bin_count / count) for bin_count in bin_counts],
+        "uncertainty": _round_output(math.sqrt(uncertainty_sq_sum) / count),
+    }
+
+
+def _entropy_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    edges: list,
+    min_count: int,
+) -> dict:
+    n_bins = len(edges) + 1
+    bin_counts = [0] * n_bins
+    uncertainty_sq_sum = 0.0
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            if status[t][i][j] != "missing":
+                bin_counts[bisect_right(edges, values[t][i][j])] += 1
+                uncertainty_sq_sum += uncertainty[t][i][j] ** 2
+
+    count = sum(bin_counts)
+    if count < min_count:
+        return {
+            "count": count,
+            "bin_counts": bin_counts,
+            "entropy": None,
+            "uncertainty": None,
+        }
+
+    entropy = -sum(
+        (bin_count / count) * math.log2(bin_count / count)
+        for bin_count in bin_counts
+        if bin_count > 0
+    )
+    return {
+        "count": count,
+        "bin_counts": bin_counts,
+        "entropy": _round_output(entropy),
         "uncertainty": _round_output(math.sqrt(uncertainty_sq_sum) / count),
     }
 
@@ -2989,6 +3032,94 @@ def aggregate_histogram(
 
     return {
         "schema": _HISTOGRAM_SCHEMA,
+        "element": element,
+        "edges": edges,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _t_start, _t_end in validated_windows
+        ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_entropy(
+    temporal, element, regions, windows, edges, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into per-window value entropy.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions and sampling rules — but instead of mean/min/max it reports the
+    Shannon entropy (base 2) of a histogram of sample values.  ``edges`` is a
+    non-empty list of finite non-bool int or float bin edges in strictly
+    increasing order; a wrong container or item type raises ``TypeError``
+    while an empty, non-finite or non-increasing list raises ``ValueError``.
+
+    For every window (in window order) and region (in region order), every
+    non-``missing`` cell of every day of the inclusive interval contributes a
+    sample ``(v, u)`` of value and uncertainty.  With ``B = len(edges) + 1``
+    bins, samples are binned exactly as in :func:`aggregate_histogram`,
+    ``count`` is the number of samples ``n`` and ``bin_counts`` lists the
+    ``B`` int bin counts.  When ``n`` is below ``min_count``, ``entropy`` and
+    ``uncertainty`` are both ``None``.  Otherwise, with
+    ``p = bin_counts[i] / n``, ``entropy`` is ``-sum(p * log2(p))`` over the
+    bins with ``p > 0`` and ``uncertainty`` is ``sqrt(sum(u ** 2)) / n`` over
+    the samples' uncertainties.
+
+    The returned mapping uses the key order ``schema, element, edges,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/entropy-window-v1``, ``element`` echoes the argument,
+    ``edges`` and ``windows`` are echoed in input order and ``regions`` lists
+    the region names in input order.  ``data`` follows the window order; each
+    entry uses the key order ``name, regions``, where each region entry uses
+    the key order ``name, count, bin_counts, entropy, uncertainty``.
+    ``count`` and the members of ``bin_counts`` are ints and every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    _validate_axis(edges, "edges")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _entropy_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                t_start,
+                t_end,
+                edges,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _ENTROPY_SCHEMA,
         "element": element,
         "edges": edges,
         "windows": [
