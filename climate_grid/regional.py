@@ -35,6 +35,7 @@ __all__ = [
     "aggregate_correlation",
     "aggregate_weighted_correlation",
     "aggregate_autocorrelation",
+    "aggregate_multi_autocorr",
     "aggregate_regression",
     "aggregate_weighted_regression",
     "aggregate_change",
@@ -68,6 +69,7 @@ _WEIGHTED_TREND_SCHEMA = "climate-grid/weighted-trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _AUTOCORRELATION_SCHEMA = "climate-grid/autocorrelation-window-v1"
+_MULTI_AUTOCORR_SCHEMA = "climate-grid/multi-ac-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
 _WEIGHTED_REGRESSION_SCHEMA = "climate-grid/weighted-regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
@@ -3855,6 +3857,101 @@ def aggregate_autocorrelation(
     return {
         "schema": _AUTOCORRELATION_SCHEMA,
         "element": element,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_autocorr(
+    temporal, elements, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into per-window lag-1 autocorrelation at once.
+
+    Combines :func:`aggregate_multi` and
+    :func:`aggregate_autocorrelation`: ``temporal``, ``regions``,
+    ``windows`` and ``min_count`` follow :func:`aggregate_window` (same
+    validation, exceptions and window/region ordering), and ``elements`` is
+    a non-empty list of unique non-empty str element names that must all
+    exist in ``temporal.data``; wrong element item types raise
+    ``TypeError`` while an empty, duplicate or unknown element raises
+    ``ValueError``.
+
+    For every window (in window order), region (in region order) and element
+    (in element order), every cell of every pair of adjacent days
+    ``(t, t + 1)`` of the inclusive interval contributes a pair
+    ``(x, y, ux, uy) = (v[t], v[t + 1], u[t], u[t + 1])`` only when its
+    status is non-``missing`` on both days; a missing day breaks pairing
+    across it.  ``count`` is the number ``n`` of such pairs; when ``n`` is
+    below ``min_count``, ``correlation`` and ``uncertainty`` are both
+    ``None``.  Otherwise ``x_bar = sum(x) / n`` and ``y_bar = sum(y) / n``;
+    ``correlation`` is
+    ``sum((x - x_bar) * (y - y_bar)) / sqrt(sum((x - x_bar) ** 2) *
+    sum((y - y_bar) ** 2))``, or ``None`` when either squared-deviation sum
+    is zero; and ``uncertainty`` is
+    ``sqrt(sum(ux ** 2 + uy ** 2)) / n`` over the paired samples.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/multi-ac-v1``,
+    ``elements`` and ``windows`` are passed through unchanged and
+    ``regions`` lists the region names in input order.  ``data`` is a flat
+    list of rows in window-then-region-then-element order; each row uses the
+    key order ``window, region, element, count, correlation, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _autocorrelation_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MULTI_AUTOCORR_SCHEMA,
+        "elements": elements,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
