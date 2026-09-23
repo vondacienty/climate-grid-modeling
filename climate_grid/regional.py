@@ -25,6 +25,7 @@ __all__ = [
     "aggregate_weighted_histogram",
     "aggregate_multi_window",
     "aggregate_trend",
+    "aggregate_weighted_trend",
     "aggregate_correlation",
     "aggregate_weighted_correlation",
     "aggregate_regression",
@@ -49,6 +50,7 @@ _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
 _TREND_SCHEMA = "climate-grid/trend-window-v1"
+_WEIGHTED_TREND_SCHEMA = "climate-grid/weighted-trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
@@ -744,6 +746,77 @@ def _trend_window_region(
         "intercept": _round_output(m_mean - slope * x_mean),
         "uncertainty": _round_output(
             math.sqrt(sum(u ** 2 for u in day_uncertainties)) / count
+        ),
+    }
+
+
+def _weighted_trend_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    weights: list[float],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    day_offsets: list[int] = []
+    day_means: list[float] = []
+    day_uncertainties: list[float] = []
+    for t in range(t_start, t_end + 1):
+        kept_weights: list[float] = []
+        kept_values: list[float] = []
+        kept_uncertainties: list[float] = []
+        for cell_index, (i, j) in enumerate(cells):
+            if status[t][i][j] != "missing":
+                kept_weights.append(weights[cell_index])
+                kept_values.append(values[t][i][j])
+                kept_uncertainties.append(uncertainty[t][i][j])
+        n = len(kept_values)
+        if n < min_count:
+            continue
+        weight_sum = sum(kept_weights)
+        day_offsets.append(t - t_start)
+        day_means.append(
+            sum(w * v for w, v in zip(kept_weights, kept_values)) / weight_sum
+        )
+        day_uncertainties.append(
+            math.sqrt(
+                sum(
+                    (w * u) ** 2
+                    for w, u in zip(kept_weights, kept_uncertainties)
+                )
+            )
+            / weight_sum
+        )
+
+    count = len(day_offsets)
+    if count < 2:
+        return {
+            "count": count,
+            "mean": None,
+            "slope": None,
+            "intercept": None,
+            "uncertainty": None,
+        }
+
+    x_mean = sum(day_offsets) / count
+    m_mean = sum(day_means) / count
+    denominator = sum((x - x_mean) ** 2 for x in day_offsets)
+    slope = (
+        sum(
+            (x - x_mean) * (m - m_mean)
+            for x, m in zip(day_offsets, day_means)
+        )
+        / denominator
+    )
+    return {
+        "count": count,
+        "mean": _round_output(m_mean),
+        "slope": _round_output(slope),
+        "intercept": _round_output(m_mean - slope * x_mean),
+        "uncertainty": _round_output(
+            math.sqrt(sum(d ** 2 for d in day_uncertainties)) / count
         ),
     }
 
@@ -2784,6 +2857,98 @@ def aggregate_trend(
 
     return {
         "schema": _TREND_SCHEMA,
+        "element": element,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_trend(
+    temporal, element, regions, windows, weights, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into weighted window trend stats.
+
+    Behaves like :func:`aggregate_trend` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions, input order, closed-interval and non-``missing`` sampling
+    rules — but each region's cells carry explicit weights, validated as in
+    :func:`aggregate_weighted_window`: ``weights`` is a non-empty list with
+    one entry per region, in region order, each a dict with exactly the keys
+    ``name`` and ``values`` in that order; ``name`` equals the corresponding
+    region's name and ``values`` lists one finite non-bool positive int or
+    float per cell, aligned with that region's ``cells``.  Wrong weight
+    types raise ``TypeError``; every other weight contract violation raises
+    ``ValueError``.
+
+    For every window (in window order) and region (in region order), each day
+    of the inclusive interval contributes one weighted sample ``(w, v, u)``
+    per non-``missing`` cell.  A day whose number ``n`` of samples is at
+    least ``min_count`` is retained, with ``W = sum(w)`` over that day's
+    samples, a daily weighted mean ``m = sum(w * v) / W`` and a daily
+    uncertainty ``d = sqrt(sum((w * u) ** 2)) / W``.  With ``x`` the day
+    offset from the window start, ``k`` the number of retained days,
+    ``x_bar`` and ``m_bar`` the means of the offsets and daily means, the
+    statistics are ``slope = sum((x - x_bar) * (m - m_bar)) /
+    sum((x - x_bar) ** 2)``, ``intercept = m_bar - slope * x_bar``,
+    ``mean = m_bar`` and ``uncertainty = sqrt(sum(d ** 2)) / k`` over the
+    retained days.  ``count`` is ``k``; when ``k`` is below 2, ``mean``,
+    ``slope``, ``intercept`` and ``uncertainty`` are all ``None``.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is ``climate-grid/weighted-trend-window-v1``,
+    ``element`` echoes the argument, ``windows`` is passed through unchanged
+    and ``regions`` lists the region names in input order.  ``data`` follows
+    the window order; each entry uses the key order ``name, regions``, where
+    each region entry uses the key order ``name, count, mean, slope,
+    intercept, uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            stats = _weighted_trend_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                cell_weights,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _WEIGHTED_TREND_SCHEMA,
         "element": element,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
