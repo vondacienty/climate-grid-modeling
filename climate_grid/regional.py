@@ -33,6 +33,7 @@ __all__ = [
     "aggregate_weighted_trend",
     "aggregate_correlation",
     "aggregate_weighted_correlation",
+    "aggregate_autocorrelation",
     "aggregate_regression",
     "aggregate_weighted_regression",
     "aggregate_change",
@@ -64,6 +65,7 @@ _TREND_SCHEMA = "climate-grid/trend-window-v1"
 _WEIGHTED_TREND_SCHEMA = "climate-grid/weighted-trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
+_AUTOCORRELATION_SCHEMA = "climate-grid/autocorrelation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
 _WEIGHTED_REGRESSION_SCHEMA = "climate-grid/weighted-regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
@@ -979,6 +981,58 @@ def _correlation_window_region(
             None if correlation is None else _round_output(correlation)
         ),
         "uncertainty": _round_output(uncertainty),
+    }
+
+
+def _autocorrelation_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    paired_x: list[float] = []
+    paired_y: list[float] = []
+    uncertainty_sq_sum = 0.0
+    for t in range(t_start, t_end):
+        for i, j in cells:
+            if status[t][i][j] != "missing" and status[t + 1][i][j] != "missing":
+                paired_x.append(values[t][i][j])
+                paired_y.append(values[t + 1][i][j])
+                uncertainty_sq_sum += (
+                    uncertainty[t][i][j] ** 2 + uncertainty[t + 1][i][j] ** 2
+                )
+
+    count = len(paired_x)
+    if count < min_count:
+        return {
+            "count": count,
+            "correlation": None,
+            "uncertainty": None,
+        }
+
+    mean_x = sum(paired_x) / count
+    mean_y = sum(paired_y) / count
+    covariance = (
+        sum((x - mean_x) * (y - mean_y) for x, y in zip(paired_x, paired_y))
+        / count
+    )
+    variance_x = sum((x - mean_x) ** 2 for x in paired_x) / count
+    variance_y = sum((y - mean_y) ** 2 for y in paired_y) / count
+    if variance_x == 0.0 or variance_y == 0.0:
+        correlation = None
+    else:
+        correlation = covariance / math.sqrt(variance_x * variance_y)
+    aggregated_uncertainty = math.sqrt(uncertainty_sq_sum) / count
+
+    return {
+        "count": count,
+        "correlation": (
+            None if correlation is None else _round_output(correlation)
+        ),
+        "uncertainty": _round_output(aggregated_uncertainty),
     }
 
 
@@ -3594,6 +3648,82 @@ def aggregate_correlation(
         "schema": _CORRELATION_SCHEMA,
         "element_x": element_x,
         "element_y": element_y,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_autocorrelation(
+    temporal, element, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid element into per-window lag-1 autocorrelation.
+
+    Behaves like :func:`aggregate_window` — ``temporal``, ``element``,
+    ``regions``, ``windows`` and ``min_count`` follow the same validation,
+    exceptions and closed-interval sampling rules — but instead of
+    summarizing cell values it pairs each cell with itself on consecutive
+    days.  For every window (in window order) and region (in region order),
+    every cell of every pair of adjacent days ``(t, t + 1)`` of the inclusive
+    interval contributes a pair ``(x, y) = (v[t], v[t + 1])`` only when its
+    status is non-``missing`` on both days; a missing day breaks pairing
+    across it.  ``count`` is the number ``n`` of such pairs; when ``n`` is
+    below ``min_count``, ``correlation`` and ``uncertainty`` are both
+    ``None``.  Otherwise ``x_bar = sum(x) / n`` and ``y_bar = sum(y) / n``;
+    ``C = sum((x - x_bar) * (y - y_bar)) / n``, ``Vx = sum((x - x_bar) **
+    2) / n`` and ``Vy = sum((y - y_bar) ** 2) / n``; ``correlation`` is
+    ``C / sqrt(Vx * Vy)``, or ``None`` when ``Vx * Vy`` is zero; and
+    ``uncertainty`` is ``sqrt(sum(u[t] ** 2 + u[t + 1] ** 2)) / n`` over the
+    paired samples.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is
+    ``climate-grid/autocorrelation-window-v1``, ``element`` echoes the
+    argument, ``windows`` is passed through unchanged and ``regions`` lists
+    the region names in input order.  ``data`` follows the window order; each
+    entry uses the key order ``name, regions``, where each region entry uses
+    the key order ``name, count, correlation, uncertainty``.  ``count`` is an
+    int and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for r_name, cells in validated_regions:
+            stats = _autocorrelation_window_region(
+                series["values"],
+                series["status"],
+                series["uncertainty"],
+                cells,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _AUTOCORRELATION_SCHEMA,
+        "element": element,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
