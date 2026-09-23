@@ -24,6 +24,7 @@ __all__ = [
     "aggregate_histogram",
     "aggregate_weighted_histogram",
     "aggregate_multi_window",
+    "aggregate_weighted_multi_window",
     "aggregate_trend",
     "aggregate_weighted_trend",
     "aggregate_correlation",
@@ -44,6 +45,7 @@ _WEIGHTED_EXCEEDANCE_SCHEMA = "climate-grid/weighted-exceedance-window-v1"
 _WEIGHTED_QUANTILE_SCHEMA = "climate-grid/weighted-quantile-window-v1"
 _WEIGHTED_VARIANCE_SCHEMA = "climate-grid/weighted-variance-window-v1"
 _MULTI_WINDOW_SCHEMA = "climate-grid/multi-window-v1"
+_WEIGHTED_MULTI_WINDOW_SCHEMA = "climate-grid/weighted-multi-window-v1"
 _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
 _HISTOGRAM_SCHEMA = "climate-grid/histogram-window-v1"
 _WEIGHTED_HISTOGRAM_SCHEMA = "climate-grid/weighted-histogram-window-v1"
@@ -2778,6 +2780,105 @@ def aggregate_multi_window(
 
     return {
         "schema": _MULTI_WINDOW_SCHEMA,
+        "elements": elements,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_multi_window(
+    temporal, elements, regions, windows, weights, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into weighted per-window region statistics.
+
+    Combines :func:`aggregate_multi_window` and
+    :func:`aggregate_weighted_window`: ``temporal``, ``elements``,
+    ``regions``, ``windows`` and ``min_count`` follow
+    :func:`aggregate_multi_window` (wrong container/item/argument types
+    raise ``TypeError``; every other contract violation raises
+    ``ValueError``), and ``weights`` follows
+    :func:`aggregate_weighted_window` — a non-empty list with one entry per
+    region, in region order, each a dict with exactly the keys ``name`` and
+    ``values`` in that order, where ``name`` equals the corresponding
+    region's name and ``values`` holds one finite non-bool positive int or
+    float per cell, aligned with that region's ``cells``.
+
+    For every window (in window order), region (in region order) and element
+    (in element order), every non-``missing`` cell of every day of the
+    inclusive interval contributes a weighted sample ``(w, v, u)``, where
+    ``w`` is that cell's weight.  ``count`` is the number of samples; when
+    it is below ``min_count``, ``mean``, ``min``, ``max`` and
+    ``uncertainty`` are all ``None``.  Otherwise ``mean`` is
+    ``sum(w * v) / sum(w)`` over the samples, ``min`` and ``max`` are the
+    minimum and maximum sample values (weights ignored) and ``uncertainty``
+    is ``sqrt(sum((w * u) ** 2)) / sum(w)`` over the samples'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/weighted-multi-window-v1``,
+    ``elements`` and ``windows`` are passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, mean, min, max, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            for element in elements:
+                series = data[element]
+                stats = _weighted_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    cell_weights,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _WEIGHTED_MULTI_WINDOW_SCHEMA,
         "elements": elements,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
