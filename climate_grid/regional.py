@@ -27,6 +27,7 @@ __all__ = [
     "aggregate_histogram",
     "aggregate_entropy",
     "aggregate_weighted_histogram",
+    "aggregate_weighted_entropy",
     "aggregate_multi_window",
     "aggregate_weighted_multi_window",
     "aggregate_weighted_multi_variance",
@@ -63,6 +64,7 @@ _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
 _HISTOGRAM_SCHEMA = "climate-grid/histogram-window-v1"
 _ENTROPY_SCHEMA = "climate-grid/entropy-window-v1"
 _WEIGHTED_HISTOGRAM_SCHEMA = "climate-grid/weighted-histogram-window-v1"
+_WEIGHTED_ENTROPY_SCHEMA = "climate-grid/weighted-entropy-window-v1"
 _EXCEEDANCE_SCHEMA = "climate-grid/exceedance-window-v1"
 _COVERAGE_SCHEMA = "climate-grid/coverage-window-v1"
 _VARIANCE_SCHEMA = "climate-grid/variance-window-v1"
@@ -1652,6 +1654,58 @@ def _weighted_histogram_window_region(
         "rates": [
             _round_output(bin_weight / weight_sum) for bin_weight in bin_weights
         ],
+        "uncertainty": _round_output(
+            math.sqrt(weighted_uncertainty_sq_sum) / weight_sum
+        ),
+    }
+
+
+def _weighted_entropy_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    weights: list[float],
+    t_start: int,
+    t_end: int,
+    edges: list,
+    min_count: int,
+) -> dict:
+    n_bins = len(edges) + 1
+    bin_weights: list[float] = [0.0] * n_bins
+    weighted_uncertainty_sq_sum = 0.0
+    count = 0
+    for t in range(t_start, t_end + 1):
+        for cell_index, (i, j) in enumerate(cells):
+            if status[t][i][j] != "missing":
+                weight = weights[cell_index]
+                bin_weights[bisect_right(edges, values[t][i][j])] += weight
+                weighted_uncertainty_sq_sum += (
+                    weight * uncertainty[t][i][j]
+                ) ** 2
+                count += 1
+
+    rounded_bin_weights = [
+        _round_output(bin_weight) for bin_weight in bin_weights
+    ]
+    if count < min_count:
+        return {
+            "count": count,
+            "bin_weights": rounded_bin_weights,
+            "entropy": None,
+            "uncertainty": None,
+        }
+
+    weight_sum = sum(bin_weights)
+    entropy = -sum(
+        (bin_weight / weight_sum) * math.log2(bin_weight / weight_sum)
+        for bin_weight in bin_weights
+        if bin_weight > 0
+    )
+    return {
+        "count": count,
+        "bin_weights": rounded_bin_weights,
+        "entropy": _round_output(entropy),
         "uncertainty": _round_output(
             math.sqrt(weighted_uncertainty_sq_sum) / weight_sum
         ),
@@ -3307,6 +3361,99 @@ def aggregate_weighted_histogram(
 
     return {
         "schema": _WEIGHTED_HISTOGRAM_SCHEMA,
+        "element": element,
+        "edges": edges,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _t_start, _t_end in validated_windows
+        ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_entropy(
+    temporal, element, regions, windows, weights, edges, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid series into weighted value entropy.
+
+    Behaves like :func:`aggregate_weighted_histogram` — ``temporal``,
+    ``element``, ``regions``, ``windows``, ``weights``, ``edges`` and
+    ``min_count`` follow the same validation, exceptions, input order,
+    closed-interval and non-``missing`` weighted sampling rules — but instead
+    of weighted rates it reports the weighted Shannon entropy (base 2) of the
+    weighted histogram.
+
+    For every window (in window order) and region (in region order), every
+    non-``missing`` cell of every day of the inclusive interval contributes a
+    weighted sample ``(w, v, u)`` of cell weight, value and uncertainty.
+    With ``B = len(edges) + 1`` bins, samples are binned exactly as in
+    :func:`aggregate_weighted_histogram`, ``count`` is the number of samples
+    ``n`` and ``bin_weights[i]`` is the sum of the weights of the samples
+    counted in bin ``i``; all ``B`` entries are always present.  When ``n`` is
+    below ``min_count``, ``entropy`` and ``uncertainty`` are both ``None``.
+    Otherwise, with ``W = sum(bin_weights)`` and ``p_i = bin_weights[i] / W``,
+    ``entropy`` is ``-sum(p_i * log2(p_i))`` over the bins with ``p_i > 0``
+    and ``uncertainty`` is ``sqrt(sum((w * u) ** 2)) / W`` over the samples'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, element, edges,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/weighted-entropy-window-v1``, ``element`` echoes the
+    argument, ``edges`` and ``windows`` are echoed in input order and
+    ``regions`` lists the region names in input order.  ``data`` follows the
+    window order; each entry uses the key order ``name, regions``, where each
+    region entry uses the key order ``name, count, bin_weights, entropy,
+    uncertainty``.  ``count`` is an int and ``bin_weights`` lists ``B``
+    floats; every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+    _validate_axis(edges, "edges")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+    values = series["values"]
+    status = series["status"]
+    uncertainty = series["uncertainty"]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            stats = _weighted_entropy_window_region(
+                values,
+                status,
+                uncertainty,
+                cells,
+                cell_weights,
+                t_start,
+                t_end,
+                edges,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _WEIGHTED_ENTROPY_SCHEMA,
         "element": element,
         "edges": edges,
         "windows": [
