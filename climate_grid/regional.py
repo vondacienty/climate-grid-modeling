@@ -50,6 +50,7 @@ __all__ = [
     "aggregate_weighted_multi_quantile",
     "aggregate_multi_entropy",
     "aggregate_weighted_multi_entropy",
+    "aggregate_multi_skew",
 ]
 
 _SCHEMA = "climate-grid/regional-v1"
@@ -93,6 +94,7 @@ _MULTI_QUANTILE_SCHEMA = "climate-grid/multi-quantile-window-v1"
 _WEIGHTED_MULTI_QUANTILE_SCHEMA = "climate-grid/weighted-multi-quantile-window-v1"
 _MULTI_ENTROPY_SCHEMA = "climate-grid/multi-entropy-window-v1"
 _WEIGHTED_MULTI_ENTROPY_SCHEMA = "climate-grid/weighted-multi-entropy-window-v1"
+_MULTI_SKEW_SCHEMA = "climate-grid/multi-skew-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -708,6 +710,53 @@ def _skewness_window_region(
     else:
         stddev = math.sqrt(variance)
         skewness = sum(((v - mean) / stddev) ** 3 for v in window_values) / count
+    return {
+        "count": count,
+        "mean": _round_output(mean),
+        "variance": _round_output(variance),
+        "skewness": None if skewness is None else _round_output(skewness),
+        "uncertainty": _round_output(
+            math.sqrt(sum(u ** 2 for u in window_uncertainties)) / count
+        ),
+    }
+
+
+def _skew_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    window_values: list[float] = []
+    window_uncertainties: list[float] = []
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            if status[t][i][j] != "missing":
+                window_values.append(values[t][i][j])
+                window_uncertainties.append(uncertainty[t][i][j])
+
+    count = len(window_values)
+    if count < min_count:
+        return {
+            "count": count,
+            "mean": None,
+            "variance": None,
+            "skewness": None,
+            "uncertainty": None,
+        }
+
+    mean = sum(window_values) / count
+    variance = sum((v - mean) ** 2 for v in window_values) / count
+    if variance == 0.0:
+        skewness = None
+    else:
+        skewness = (
+            sum((v - mean) ** 3 for v in window_values)
+            / (count * variance ** 1.5)
+        )
     return {
         "count": count,
         "mean": _round_output(mean),
@@ -5579,6 +5628,101 @@ def aggregate_weighted_multi_entropy(
         "schema": _WEIGHTED_MULTI_ENTROPY_SCHEMA,
         "elements": elements,
         "edges": edges,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_skew(
+    temporal, elements, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into per-window skewness stats at once.
+
+    Combines :func:`aggregate_multi` and :func:`aggregate_skewness`:
+    ``temporal`` is a reconstructed grid series as produced by
+    ``temporal.reconstruct``; ``elements`` is a non-empty list of unique
+    non-empty str element names that must all exist in ``temporal.data``
+    (wrong item types raise ``TypeError``; an empty, duplicate or unknown
+    element raises ``ValueError``); ``regions``, ``windows`` and
+    ``min_count`` follow :func:`aggregate_window` — wrong container, name or
+    date types raise ``TypeError`` while every other contract violation
+    raises ``ValueError``.
+
+    For every window (in window order), region (in region order) and element
+    (in element order), every non-``missing`` cell of every day of the
+    inclusive interval contributes a sample ``(v, u)`` of value and
+    uncertainty.  ``count`` is the number of samples ``n``; when ``n`` is
+    below ``min_count``, ``mean``, ``variance``, ``skewness`` and
+    ``uncertainty`` are all ``None``.  Otherwise, with
+    ``m = sum(v) / n`` and ``variance = sum((v - m) ** 2) / n``, ``mean`` is
+    ``m``, ``variance`` is that variance, ``skewness`` is ``None`` when the
+    variance is zero and ``sum((v - m) ** 3) / (n * variance ** 1.5)``
+    otherwise, and ``uncertainty`` is ``sqrt(sum(u ** 2)) / n`` over the
+    samples' uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/multi-skew-v1``,
+    ``elements`` and ``windows`` are passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, mean, variance, skewness,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _skew_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MULTI_SKEW_SCHEMA,
+        "elements": elements,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
