@@ -46,6 +46,7 @@ __all__ = [
     "aggregate_weighted_multi_autocorr",
     "aggregate_multi_quantile",
     "aggregate_weighted_multi_quantile",
+    "aggregate_multi_entropy",
 ]
 
 _SCHEMA = "climate-grid/regional-v1"
@@ -85,6 +86,7 @@ _MULTI_AUTOCORR_SCHEMA = "climate-grid/multi-ac-v1"
 _WEIGHTED_MULTI_AUTOCORR_SCHEMA = "climate-grid/weighted-multi-ac-v1"
 _MULTI_QUANTILE_SCHEMA = "climate-grid/multi-quantile-window-v1"
 _WEIGHTED_MULTI_QUANTILE_SCHEMA = "climate-grid/weighted-multi-quantile-window-v1"
+_MULTI_ENTROPY_SCHEMA = "climate-grid/multi-entropy-window-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
 _SERIES_KEYS = frozenset({"values", "status", "uncertainty"})
@@ -5126,6 +5128,103 @@ def aggregate_weighted_multi_quantile(
         "schema": _WEIGHTED_MULTI_QUANTILE_SCHEMA,
         "elements": elements,
         "quantiles": quantiles,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_entropy(
+    temporal, elements, regions, windows, edges, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into per-window region entropy at once.
+
+    Combines :func:`aggregate_multi` and :func:`aggregate_entropy`:
+    ``temporal``, ``regions``, ``windows``, ``edges`` and ``min_count``
+    follow :func:`aggregate_entropy` (wrong container/item/argument types
+    raise ``TypeError``; every other contract violation raises
+    ``ValueError``), and ``elements`` is a non-empty list of unique
+    non-empty str element names that must all exist in ``temporal.data``
+    (wrong item types raise ``TypeError``; an empty, duplicate or unknown
+    element raises ``ValueError``).
+
+    For every window (in window order), region (in region order) and
+    element (in element order), every non-``missing`` cell of every day of
+    the inclusive interval contributes a sample ``(v, u)`` of value and
+    uncertainty.  With ``B = len(edges) + 1`` bins, samples are binned
+    exactly as in :func:`aggregate_histogram`, ``count`` is the number of
+    samples ``n`` and ``bin_counts`` lists the ``B`` int bin counts.  When
+    ``n`` is below ``min_count``, ``entropy`` and ``uncertainty`` are both
+    ``None``.  Otherwise, with ``p = bin_counts[i] / n``, ``entropy`` is
+    ``-sum(p * log2(p))`` over the bins with ``p > 0`` and ``uncertainty``
+    is ``sqrt(sum(u ** 2)) / n`` over the samples' uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, edges,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/multi-entropy-window-v1``, ``elements``, ``edges`` and
+    ``windows`` are passed through unchanged and ``regions`` lists the
+    region names in input order.  ``data`` is a flat list of rows in
+    window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, bin_counts, entropy, uncertainty``.
+    ``count`` and the members of ``bin_counts`` are ints and every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    _validate_axis(edges, "edges")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _entropy_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    edges,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MULTI_ENTROPY_SCHEMA,
+        "elements": elements,
+        "edges": edges,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
