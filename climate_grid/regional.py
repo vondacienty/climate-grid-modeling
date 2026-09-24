@@ -24,6 +24,7 @@ __all__ = [
     "aggregate_coverage",
     "aggregate_exceedance",
     "aggregate_quantile",
+    "aggregate_multi_quantile",
     "aggregate_histogram",
     "aggregate_entropy",
     "aggregate_weighted_histogram",
@@ -57,6 +58,7 @@ _WEIGHTED_VARIANCE_SCHEMA = "climate-grid/weighted-variance-window-v1"
 _MULTI_WINDOW_SCHEMA = "climate-grid/multi-window-v1"
 _WEIGHTED_MULTI_WINDOW_SCHEMA = "climate-grid/weighted-multi-window-v1"
 _QUANTILE_SCHEMA = "climate-grid/quantile-window-v1"
+_MULTI_QUANTILE_SCHEMA = "climate-grid/multi-quantile-window-v1"
 _HISTOGRAM_SCHEMA = "climate-grid/histogram-window-v1"
 _ENTROPY_SCHEMA = "climate-grid/entropy-window-v1"
 _WEIGHTED_HISTOGRAM_SCHEMA = "climate-grid/weighted-histogram-window-v1"
@@ -3032,6 +3034,102 @@ def aggregate_quantile(
             {"name": name, "start": start, "end": end}
             for name, start, end, _t_start, _t_end in validated_windows
         ],
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_quantile(
+    temporal, elements, regions, windows, quantiles, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into per-window region quantiles at once.
+
+    Combines :func:`aggregate_multi` and :func:`aggregate_quantile`:
+    ``temporal``, ``regions``, ``windows`` and ``min_count`` follow
+    :func:`aggregate_window`; ``elements`` is a non-empty list of unique
+    non-empty str element names that must all exist in ``temporal.data``
+    (wrong item types raise ``TypeError``; an empty, duplicate or unknown
+    element raises ``ValueError``); ``quantiles`` is a non-empty list of
+    finite non-bool numbers with ``0 <= q <= 1`` in strictly increasing
+    order (wrong item types raise ``TypeError``; an empty, out-of-range or
+    non-increasing list raises ``ValueError``).
+
+    For every window (in window order), region (in region order) and element
+    (in element order), every non-``missing`` cell of every day of the
+    inclusive interval contributes a sample.  ``count`` is the number of
+    samples; when it is below ``min_count``, ``quantiles`` is a list of
+    ``None`` of the same length as the argument and ``uncertainty`` is
+    ``None``.  Otherwise the samples are sorted ascending and each quantile
+    ``q`` is computed as ``h = (count - 1) * q``, ``a = floor(h)``,
+    ``b = ceil(h)``, ``v[a] + (h - a) * (v[b] - v[a])``; ``uncertainty`` is
+    ``sqrt(sum(u ** 2)) / count`` over the samples' uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, quantiles,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/multi-quantile-window-v1``, ``elements``, ``quantiles``
+    and ``windows`` are passed through unchanged and ``regions`` lists the
+    region names in input order.  ``data`` is a flat list of rows in
+    window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, quantiles, uncertainty``.  ``count``
+    is an int and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_quantiles = _validate_quantiles(quantiles)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _quantile_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    validated_quantiles,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MULTI_QUANTILE_SCHEMA,
+        "elements": elements,
+        "quantiles": quantiles,
+        "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
