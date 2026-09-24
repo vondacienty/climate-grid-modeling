@@ -35,6 +35,7 @@ __all__ = [
     "aggregate_correlation",
     "aggregate_weighted_correlation",
     "aggregate_autocorrelation",
+    "aggregate_weighted_autocorrelation",
     "aggregate_regression",
     "aggregate_weighted_regression",
     "aggregate_change",
@@ -69,6 +70,9 @@ _WEIGHTED_TREND_SCHEMA = "climate-grid/weighted-trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _AUTOCORRELATION_SCHEMA = "climate-grid/autocorrelation-window-v1"
+_WEIGHTED_AUTOCORRELATION_SCHEMA = (
+    "climate-grid/weighted-autocorrelation-window-v1"
+)
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
 _WEIGHTED_REGRESSION_SCHEMA = "climate-grid/weighted-regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
@@ -1030,6 +1034,76 @@ def _autocorrelation_window_region(
     else:
         correlation = covariance / math.sqrt(variance_x * variance_y)
     aggregated_uncertainty = math.sqrt(uncertainty_sq_sum) / count
+
+    return {
+        "count": count,
+        "correlation": (
+            None if correlation is None else _round_output(correlation)
+        ),
+        "uncertainty": _round_output(aggregated_uncertainty),
+    }
+
+
+def _weighted_autocorrelation_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    weights: list[float],
+    t_start: int,
+    t_end: int,
+    min_count: int,
+) -> dict:
+    paired_weights: list[float] = []
+    paired_x: list[float] = []
+    paired_y: list[float] = []
+    paired_ux: list[float] = []
+    paired_uy: list[float] = []
+    for t in range(t_start, t_end):
+        for cell_index, (i, j) in enumerate(cells):
+            if status[t][i][j] != "missing" and status[t + 1][i][j] != "missing":
+                paired_weights.append(weights[cell_index])
+                paired_x.append(values[t][i][j])
+                paired_y.append(values[t + 1][i][j])
+                paired_ux.append(uncertainty[t][i][j])
+                paired_uy.append(uncertainty[t + 1][i][j])
+
+    count = len(paired_x)
+    if count < min_count:
+        return {
+            "count": count,
+            "correlation": None,
+            "uncertainty": None,
+        }
+
+    weight_sum = sum(paired_weights)
+    mean_x = sum(w * x for w, x in zip(paired_weights, paired_x)) / weight_sum
+    mean_y = sum(w * y for w, y in zip(paired_weights, paired_y)) / weight_sum
+    covariance = (
+        sum(
+            w * (x - mean_x) * (y - mean_y)
+            for w, x, y in zip(paired_weights, paired_x, paired_y)
+        )
+        / weight_sum
+    )
+    variance_x = (
+        sum(w * (x - mean_x) ** 2 for w, x in zip(paired_weights, paired_x))
+        / weight_sum
+    )
+    variance_y = (
+        sum(w * (y - mean_y) ** 2 for w, y in zip(paired_weights, paired_y))
+        / weight_sum
+    )
+    if variance_x == 0.0 or variance_y == 0.0:
+        correlation = None
+    else:
+        correlation = covariance / math.sqrt(variance_x * variance_y)
+    aggregated_uncertainty = math.sqrt(
+        sum(
+            (w * ux) ** 2 + (w * uy) ** 2
+            for w, ux, uy in zip(paired_weights, paired_ux, paired_uy)
+        )
+    ) / weight_sum
 
     return {
         "count": count,
@@ -3856,6 +3930,94 @@ def aggregate_autocorrelation(
 
     return {
         "schema": _AUTOCORRELATION_SCHEMA,
+        "element": element,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_weighted_autocorrelation(
+    temporal, element, regions, windows, weights, *, min_count: int = 1
+) -> dict:
+    """Aggregate a reconstructed grid element into weighted lag-1 autocorrelation.
+
+    Behaves like :func:`aggregate_autocorrelation` — ``temporal``,
+    ``element``, ``regions``, ``windows`` and ``min_count`` follow the same
+    validation, exceptions and adjacent-day pairing rules, and
+    :func:`aggregate_weighted_window` for the weights: ``weights`` is a
+    non-empty list with one entry per region, in region order, each a dict
+    with exactly the keys ``name`` and ``values`` in that order, where
+    ``name`` equals the corresponding region's name and ``values`` holds one
+    finite non-bool positive int or float per cell, aligned with that
+    region's ``cells``.
+
+    For every window (in window order) and region (in region order), every
+    cell of every pair of adjacent days ``(t, t + 1)`` of the inclusive
+    interval contributes a weighted pair ``(x, y, ux, uy, w) =
+    (v[t], v[t + 1], u[t], u[t + 1], w)`` only when its status is
+    non-``missing`` on both days; a missing day breaks pairing across it.
+    ``count`` is the number ``n`` of such pairs; when ``n`` is below
+    ``min_count``, ``correlation`` and ``uncertainty`` are both ``None``.
+    Otherwise, with ``W = sum(w)``, ``x_bar = sum(w * x) / W`` and
+    ``y_bar = sum(w * y) / W``; ``C = sum(w * (x - x_bar) * (y - y_bar)) /
+    W``, ``Vx = sum(w * (x - x_bar) ** 2) / W`` and
+    ``Vy = sum(w * (y - y_bar) ** 2) / W``; ``correlation`` is
+    ``C / sqrt(Vx * Vy)``, or ``None`` when ``Vx * Vy`` is zero; and
+    ``uncertainty`` is
+    ``sqrt(sum((w * ux) ** 2 + (w * uy) ** 2)) / W`` over the paired samples.
+
+    The returned mapping uses the key order ``schema, element, windows,
+    regions, data``; ``schema`` is
+    ``climate-grid/weighted-autocorrelation-window-v1``, ``element`` echoes
+    the argument, ``windows`` is passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` follows the window
+    order; each entry uses the key order ``name, regions``, where each region
+    entry uses the key order ``name, count, correlation, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_weights = _validate_weights(weights, validated_regions)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    series = data[element]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        region_stats = []
+        for (r_name, cells), cell_weights in zip(
+            validated_regions, validated_weights
+        ):
+            stats = _weighted_autocorrelation_window_region(
+                series["values"],
+                series["status"],
+                series["uncertainty"],
+                cells,
+                cell_weights,
+                t_start,
+                t_end,
+                min_count,
+            )
+            region_stats.append({"name": r_name, **stats})
+        result_data.append({"name": w_name, "regions": region_stats})
+
+    return {
+        "schema": _WEIGHTED_AUTOCORRELATION_SCHEMA,
         "element": element,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
