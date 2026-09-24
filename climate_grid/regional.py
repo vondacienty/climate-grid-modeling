@@ -33,6 +33,7 @@ __all__ = [
     "aggregate_trend",
     "aggregate_weighted_trend",
     "aggregate_correlation",
+    "aggregate_multi_correlation",
     "aggregate_weighted_correlation",
     "aggregate_autocorrelation",
     "aggregate_weighted_autocorrelation",
@@ -69,6 +70,7 @@ _KURTOSIS_SCHEMA = "climate-grid/kurtosis-window-v1"
 _TREND_SCHEMA = "climate-grid/trend-window-v1"
 _WEIGHTED_TREND_SCHEMA = "climate-grid/weighted-trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
+_MULTI_CORRELATION_SCHEMA = "climate-grid/multi-correlation-window-v1"
 _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _AUTOCORRELATION_SCHEMA = "climate-grid/autocorrelation-window-v1"
 _WEIGHTED_AUTOCORRELATION_SCHEMA = "climate-grid/weighted-autocorrelation-window-v1"
@@ -3861,6 +3863,109 @@ def aggregate_correlation(
         "schema": _CORRELATION_SCHEMA,
         "element_x": element_x,
         "element_y": element_y,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_correlation(
+    temporal, elements, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate element pairs into per-window correlation statistics at once.
+
+    Combines :func:`aggregate_multi_window` and
+    :func:`aggregate_correlation`: ``temporal``, ``regions``, ``windows`` and
+    ``min_count`` follow :func:`aggregate_window`'s validation, exceptions and
+    closed-interval sampling rules, and ``elements`` is a non-empty list of
+    unique non-empty str element names that must all exist in
+    ``temporal.data`` (wrong item types raise ``TypeError``; an empty,
+    duplicate or unknown element raises ``ValueError``).
+
+    For every window (in window order), region (in region order) and element
+    pair ``i < j`` (in element-list order), a cell of a day contributes a
+    paired sample ``(vx, vy, ux, uy)`` only when its status is
+    non-``missing`` for both elements.  ``count`` is the number of paired
+    samples ``n``; when ``n`` is below ``min_count``, ``covariance``,
+    ``correlation`` and ``uncertainty`` are all ``None``.  Otherwise the
+    de-meaned values are ``dx = vx - x_bar`` and ``dy = vy - y_bar`` with
+    ``x_bar = sum(vx) / n`` and ``y_bar = sum(vy) / n``; ``covariance`` is
+    ``sum(dx * dy) / n``; the variances are ``sx = sum(dx ** 2) / n`` and
+    ``sy = sum(dy ** 2) / n``; ``correlation`` is
+    ``covariance / sqrt(sx * sy)``, or ``None`` when either variance is
+    zero; and ``uncertainty`` is ``sqrt(sum(ux ** 2 + uy ** 2)) / n`` over
+    the paired samples.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/multi-correlation-window-v1``,
+    ``elements`` and ``windows`` are passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in window-then-region-then-pair order; each row uses the key order
+    ``window, region, element_x, element_y, count, covariance, correlation,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for i in range(len(elements)):
+                for j in range(i + 1, len(elements)):
+                    element_x = elements[i]
+                    element_y = elements[j]
+                    series_x = data[element_x]
+                    series_y = data[element_y]
+                    stats = _correlation_window_region(
+                        series_x["values"],
+                        series_x["status"],
+                        series_x["uncertainty"],
+                        series_y["values"],
+                        series_y["status"],
+                        series_y["uncertainty"],
+                        cells,
+                        t_start,
+                        t_end,
+                        min_count,
+                    )
+                    result_data.append(
+                        {
+                            "window": w_name,
+                            "region": r_name,
+                            "element_x": element_x,
+                            "element_y": element_y,
+                            **stats,
+                        }
+                    )
+
+    return {
+        "schema": _MULTI_CORRELATION_SCHEMA,
+        "elements": elements,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
