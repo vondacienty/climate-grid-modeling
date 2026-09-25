@@ -824,15 +824,15 @@ _SCENARIO_COVERAGE_SUMMARY_ROW_KEYS = (
 )
 
 
-def _validate_coverage_windows(windows: Any) -> list:
+def _validate_coverage_windows(windows: Any, *, prefix: str = "coverage.windows") -> list:
     if not isinstance(windows, list):
-        raise TypeError("coverage.windows must be a list")
+        raise TypeError(f"{prefix} must be a list")
     if len(windows) == 0:
-        raise ValueError("coverage.windows must be non-empty")
+        raise ValueError(f"{prefix} must be non-empty")
 
     seen_names: set[str] = set()
     for w_index, window in enumerate(windows):
-        where = f"coverage.windows[{w_index}]"
+        where = f"{prefix}[{w_index}]"
         if not isinstance(window, dict):
             raise TypeError(f"{where} must be a dict")
         if list(window.keys()) != ["name", "start", "end"]:
@@ -1105,5 +1105,281 @@ def coverage_summary(coverage) -> dict:
         "elements": list(elements),
         "windows": windows,
         "regions": list(regions),
+        "data": result_data,
+    }
+
+
+_SCENARIO_COVERAGE_DELTA_SCHEMA = "climate-grid/scenario-cov-delta-v1"
+_SCENARIO_COVERAGE_DELTA_ROW_KEYS = (
+    "element",
+    "region",
+    "total_delta",
+    "available_delta",
+    "observed_delta",
+    "interpolated_delta",
+    "rate_delta",
+    "observed_rate_delta",
+    "interpolated_rate_delta",
+    "uncertainty",
+)
+
+
+def _validate_coverage_summary(
+    summary: Any, where: str
+) -> tuple[list[str], list, list[str], list]:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _SCENARIO_COVERAGE_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, elements, windows, "
+            "regions, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _SCENARIO_COVERAGE_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_SCENARIO_COVERAGE_SUMMARY_SCHEMA!r}"
+        )
+
+    elements = summary["elements"]
+    if not isinstance(elements, list):
+        raise TypeError(f"{where}.elements must be a list")
+    if len(elements) == 0:
+        raise ValueError(f"{where}.elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"{where}.elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate {where}.elements entry: {element!r}")
+        seen_elements.add(element)
+
+    windows = _validate_coverage_windows(
+        summary["windows"], prefix=f"{where}.windows"
+    )
+
+    regions = summary["regions"]
+    if not isinstance(regions, list):
+        raise TypeError(f"{where}.regions must be a list")
+    if len(regions) == 0:
+        raise ValueError(f"{where}.regions must be non-empty")
+    seen_regions: set[str] = set()
+    for index, region in enumerate(regions):
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.regions[{index}] must be a str")
+        if region == "":
+            raise ValueError(f"{where}.regions[{index}] must be non-empty")
+        if region in seen_regions:
+            raise ValueError(f"duplicate {where}.regions entry: {region!r}")
+        seen_regions.add(region)
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    n_regions = len(regions)
+    n_elements = len(elements)
+    expected_rows = n_elements * n_regions
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows "
+            "(one per element/region combination, in "
+            "element-then-region order)"
+        )
+
+    row_index = 0
+    for element in elements:
+        for region in regions:
+            row_where = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _SCENARIO_COVERAGE_SUMMARY_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys element, region, "
+                    "total, available, observed, interpolated, rate, "
+                    "observed_rate, interpolated_rate, uncertainty in order"
+                )
+
+            if not isinstance(row["element"], str):
+                raise TypeError(f"{row_where}.element must be a str")
+            if row["element"] != element:
+                raise ValueError(
+                    f"{row_where}.element must be {element!r} for its "
+                    "element-then-region position"
+                )
+            if not isinstance(row["region"], str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row["region"] != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its "
+                    "element-then-region position"
+                )
+
+            for count_name in ("total", "available", "observed", "interpolated"):
+                count = row[count_name]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(
+                        f"{row_where}.{count_name} must be a non-bool int"
+                    )
+                if count < 0:
+                    raise ValueError(
+                        f"{row_where}.{count_name} must be non-negative"
+                    )
+            if row["observed"] + row["interpolated"] != row["available"]:
+                raise ValueError(
+                    f"{row_where}: observed + interpolated must equal available"
+                )
+            if row["available"] > row["total"]:
+                raise ValueError(f"{row_where}: available must not exceed total")
+
+            rate_fields = ("rate", "observed_rate", "interpolated_rate")
+            rates_are_none = [row[name] is None for name in rate_fields]
+            if not all(rates_are_none) and any(rates_are_none):
+                raise ValueError(
+                    f"{row_where}: rate, observed_rate and interpolated_rate "
+                    "must be all None or all present"
+                )
+            if all(rates_are_none):
+                if row["total"] > 0:
+                    raise ValueError(
+                        f"{row_where}: rates must be present when total is "
+                        "positive"
+                    )
+            else:
+                if row["total"] <= 0:
+                    raise ValueError(
+                        f"{row_where}: rates require a positive total"
+                    )
+                expected = {
+                    "rate": row["available"] / row["total"],
+                    "observed_rate": row["observed"] / row["total"],
+                    "interpolated_rate": row["interpolated"] / row["total"],
+                }
+                for name, value in expected.items():
+                    _validate_number(
+                        row[name], f"{row_where}.{name}", nullable=False
+                    )
+                    if row[name] != _round_output(value):
+                        raise ValueError(
+                            f"{row_where}.{name} must equal the count over total"
+                        )
+
+            uncertainty = row["uncertainty"]
+            if uncertainty is not None:
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=False
+                )
+                if uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+                if row["available"] == 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be None when available "
+                        "is zero"
+                    )
+
+            row_index += 1
+
+    return elements, windows, regions, data
+
+
+def coverage_delta(left, right) -> dict:
+    """Compute the right-minus-left delta of two coverage summaries.
+
+    ``left`` and ``right`` must be complete :func:`coverage_summary` results
+    (schema ``climate-grid/scenario-cov-summary-v1``) with exactly the keys
+    ``schema, elements, windows, regions, data`` in that order; every member
+    is validated against that contract, including the flat
+    element-then-region ``data`` row order, each row's key order ``element,
+    region, total, available, observed, interpolated, rate, observed_rate,
+    interpolated_rate, uncertainty`` and the count / rate invariants.  The
+    two summaries must share equal ``elements``, ``windows`` and ``regions``
+    in the same order.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/scenario-cov-delta-v1``
+    and ``elements``, ``windows`` and ``regions`` echo the (shared) input
+    arrays.  ``data`` follows the element-then-region order of the inputs;
+    each row uses the key order ``element, region, total_delta,
+    available_delta, observed_delta, interpolated_delta, rate_delta,
+    observed_rate_delta, interpolated_rate_delta, uncertainty``.  The four
+    count deltas are ``right - left`` ints.  Each rate delta is
+    ``right - left`` when both rates are not ``None`` and ``None``
+    otherwise.  ``uncertainty`` is ``sqrt(u_left ** 2 + u_right ** 2)``
+    when both uncertainties are not ``None`` and ``None`` otherwise.
+    Every output float is ``round(x, 12)`` with negative zero normalized
+    to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    left_elements, left_windows, left_regions, left_data = (
+        _validate_coverage_summary(left, "left")
+    )
+    right_elements, _right_windows, right_regions, right_data = (
+        _validate_coverage_summary(right, "right")
+    )
+
+    if right_elements != left_elements:
+        raise ValueError(
+            "left and right must have equal elements in the same order"
+        )
+    if _right_windows != left_windows:
+        raise ValueError(
+            "left and right must have equal windows in the same order"
+        )
+    if right_regions != left_regions:
+        raise ValueError(
+            "left and right must have equal regions in the same order"
+        )
+
+    result_data = []
+    for left_row, right_row in zip(left_data, right_data):
+        rate_deltas = {}
+        for name in ("rate", "observed_rate", "interpolated_rate"):
+            left_rate = left_row[name]
+            right_rate = right_row[name]
+            if left_rate is None or right_rate is None:
+                rate_deltas[name] = None
+            else:
+                rate_deltas[name] = _round_output(right_rate - left_rate)
+
+        left_uncertainty = left_row["uncertainty"]
+        right_uncertainty = right_row["uncertainty"]
+        if left_uncertainty is None or right_uncertainty is None:
+            uncertainty = None
+        else:
+            uncertainty = _round_output(
+                math.sqrt(left_uncertainty ** 2 + right_uncertainty ** 2)
+            )
+
+        result_data.append(
+            {
+                "element": left_row["element"],
+                "region": left_row["region"],
+                "total_delta": right_row["total"] - left_row["total"],
+                "available_delta": right_row["available"] - left_row["available"],
+                "observed_delta": right_row["observed"] - left_row["observed"],
+                "interpolated_delta": (
+                    right_row["interpolated"] - left_row["interpolated"]
+                ),
+                "rate_delta": rate_deltas["rate"],
+                "observed_rate_delta": rate_deltas["observed_rate"],
+                "interpolated_rate_delta": rate_deltas["interpolated_rate"],
+                "uncertainty": uncertainty,
+            }
+        )
+
+    return {
+        "schema": _SCENARIO_COVERAGE_DELTA_SCHEMA,
+        "elements": list(left_elements),
+        "windows": left_windows,
+        "regions": list(left_regions),
         "data": result_data,
     }
