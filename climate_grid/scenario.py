@@ -9,6 +9,8 @@ from typing import Any
 
 from .regional import (
     _coverage_window_region,
+    _quantile_window_region,
+    _validate_quantiles as _regional_validate_quantiles,
     _validate_regions,
     _validate_windows,
     _window_region,
@@ -2002,6 +2004,99 @@ def aggregate_value_delta_multi(delta, regions, windows, *, min_count: int = 1) 
     return {
         "schema": _ENSEMBLE_DELTA_REGION_SCHEMA,
         "elements": list(elements),
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+_DELTA_QUANTILE_REGION_SCHEMA = "climate-grid/dq-region-v1"
+
+
+def aggregate_value_delta_quantile(
+    delta, regions, windows, quantiles, *, min_count: int = 1
+) -> dict:
+    """Aggregate an ensemble-delta-multi grid into per-window region quantiles.
+
+    ``delta`` must be a complete :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``) with exactly the keys
+    ``schema, elements, times, lats, lons, quantiles, data`` in that order;
+    every member is validated against that contract, including each item's
+    key order ``values, status, uncertainty, quantile_values`` and the
+    nested ``[quantile][time][lat][lon]`` quantile frames.  ``regions``,
+    ``windows`` and ``min_count`` follow
+    :func:`climate_grid.regional.aggregate_window` exactly: region
+    ``cells`` are checked against the delta grid and window
+    ``start``/``end`` must occur in ``delta.times``.  ``quantiles`` follows
+    :func:`climate_grid.regional.aggregate_quantile` exactly: a non-empty
+    list of finite non-bool numbers with ``0 <= q <= 1`` in strictly
+    increasing order.
+
+    For every window (in window order), region (in region order) and
+    element (in delta element order), the non-missing ``(value,
+    uncertainty)`` samples of the closed calendar interval are collected
+    across the region's cells; ``count`` is the sample count ``n``.  When
+    ``n`` is below ``min_count``, ``quantiles`` is a list of ``None`` of
+    the same length as the argument and ``uncertainty`` is ``None``.
+    Otherwise the samples are sorted ascending and each quantile ``q`` is
+    computed as ``h = (n - 1) * q``, ``a = floor(h)``, ``b = ceil(h)``,
+    ``v[a] + (h - a) * (v[b] - v[a])``; ``uncertainty`` is
+    ``sqrt(sum(u ** 2)) / n`` over the sampled uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, quantiles,
+    windows, regions, data``; ``schema`` is ``climate-grid/dq-region-v1``,
+    ``elements``, ``quantiles`` and ``windows`` echo the delta elements and
+    the arguments, and ``regions`` lists the region names in input order.
+    ``data`` is a flat list of rows in window-then-region-then-element
+    order; each row uses the key order ``window, region, element, count,
+    quantiles, uncertainty``.  ``count`` is an int and every output float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs
+    are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _delta_quantiles, data = _validate_ensemble_multi(
+        delta, schema=_ENSEMBLE_DELTA_MULTI_SCHEMA, where="delta"
+    )
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    validated_quantiles = _regional_validate_quantiles(quantiles)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _quantile_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    validated_quantiles,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _DELTA_QUANTILE_REGION_SCHEMA,
+        "elements": list(elements),
+        "quantiles": quantiles,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
