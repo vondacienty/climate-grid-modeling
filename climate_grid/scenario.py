@@ -11,6 +11,7 @@ from .regional import (
     _coverage_window_region,
     _validate_regions,
     _validate_windows,
+    _window_region,
 )
 
 _SCHEMA = "climate-grid/scenario-v1"
@@ -581,6 +582,7 @@ _ENSEMBLE_MULTI_SERIES_KEY_SET = frozenset(_ENSEMBLE_MULTI_SERIES_KEYS)
 def _validate_ensemble_multi(
     ensemble: Any,
     *,
+    schema: str = _ENSEMBLE_MULTI_SCHEMA,
     where: str = "ensemble",
 ) -> tuple[list[str], list, list, list, list, dict]:
     if not isinstance(ensemble, dict):
@@ -591,11 +593,11 @@ def _validate_ensemble_multi(
             "lats, lons, quantiles, data in order"
         )
 
-    schema = ensemble["schema"]
-    if not isinstance(schema, str):
+    schema_value = ensemble["schema"]
+    if not isinstance(schema_value, str):
         raise TypeError(f"{where}.schema must be a str")
-    if schema != _ENSEMBLE_MULTI_SCHEMA:
-        raise ValueError(f"{where}.schema must be {_ENSEMBLE_MULTI_SCHEMA!r}")
+    if schema_value != schema:
+        raise ValueError(f"{where}.schema must be {schema!r}")
 
     elements = ensemble["elements"]
     if not isinstance(elements, list):
@@ -1920,4 +1922,87 @@ def value_delta_multi(left, right) -> dict:
         "lons": list(left_lons),
         "quantiles": list(left_quantiles),
         "data": out_data,
+    }
+
+
+_ENSEMBLE_DELTA_REGION_SCHEMA = "climate-grid/ensemble-delta-region-v1"
+
+
+def aggregate_value_delta_multi(delta, regions, windows, *, min_count: int = 1) -> dict:
+    """Aggregate an ensemble-delta-multi grid into per-window region stats.
+
+    ``delta`` must be a complete :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``) with exactly the keys
+    ``schema, elements, times, lats, lons, quantiles, data`` in that order;
+    every member is validated against that contract, including each item's
+    key order ``values, status, uncertainty, quantile_values`` and the
+    nested ``[quantile][time][lat][lon]`` quantile frames.  ``regions``,
+    ``windows`` and ``min_count`` follow
+    :func:`climate_grid.regional.aggregate_window` exactly: region
+    ``cells`` are checked against the delta grid and window
+    ``start``/``end`` must occur in ``delta.times``.
+
+    For every window (in window order), region (in region order) and
+    element (in delta element order), the non-missing ``(value,
+    uncertainty)`` samples of the closed calendar interval are collected
+    across the region's cells; ``count`` is the sample count ``n``.  When
+    ``n`` is below ``min_count``, ``mean``, ``min``, ``max`` and
+    ``uncertainty`` are all ``None``; otherwise they are the sample mean
+    ``Σv / n``, the sample minimum, the sample maximum and
+    ``sqrt(Σu²) / n`` over the sampled uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/ensemble-delta-region-v1``,
+    ``elements`` and ``windows`` echo the delta elements and the ``windows``
+    argument, and ``regions`` lists the region names in input order.
+    ``data`` is a flat list of rows in window-then-region-then-element
+    order; each row uses the key order ``window, region, element, count,
+    mean, min, max, uncertainty``.  ``count`` is an int and every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _quantiles, data = _validate_ensemble_multi(
+        delta, schema=_ENSEMBLE_DELTA_MULTI_SCHEMA, where="delta"
+    )
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _ENSEMBLE_DELTA_REGION_SCHEMA,
+        "elements": list(elements),
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
     }
