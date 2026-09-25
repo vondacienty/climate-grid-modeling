@@ -2911,3 +2911,121 @@ def batch_exceed(delta, regions, windows, thresholds, *, min_count: int = 1) -> 
         "regions": region_names,
         "data": result_data,
     }
+
+
+_EXCEED_COMPARE_SCHEMA = "climate-grid/exceed-compare-v1"
+
+
+def compare_exceed(items, regions, windows, thresholds, *, min_count: int = 1) -> dict:
+    """Compare exceedance stats across named scenario deltas.
+
+    ``items`` is a list of at least two items; each item is a dict with
+    exactly the keys ``name, delta`` in that order, where ``name`` is a
+    unique non-empty str and ``delta`` is a complete
+    :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``).  All items must share equal
+    ``elements``, ``times``, ``lats`` and ``lons`` in the same order.
+    ``regions``, ``windows``, ``thresholds`` and ``min_count`` follow
+    :func:`batch_exceed` exactly.
+
+    For every item (in ``items`` order) the per-scenario batch is exactly
+    ``batch_exceed(item["delta"], regions, windows, thresholds, min_count=min_count)``.
+
+    The returned mapping uses the key order ``schema, scenarios, elements,
+    thresholds, windows, regions, data``; ``schema`` is
+    ``climate-grid/exceed-compare-v1``, ``scenarios`` lists the item names
+    in input order, ``elements`` follows the first item's delta element
+    order, ``thresholds`` and ``windows`` echo the arguments as-is and
+    ``regions`` lists the region names in input order.  ``data`` is a flat
+    list of rows in scenario-then-threshold-then-element-then-region
+    order; each row uses the key order ``scenario, threshold, element,
+    region, count, exceed, rate, mean_excess, uncertainty`` where
+    ``scenario`` is the item name and the remaining values are copied from
+    the corresponding batch row.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must have at least 2 items")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    validated = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if list(item.keys()) != ["name", "delta"]:
+            raise ValueError(
+                f"{where} must have exactly the keys name, delta in order"
+            )
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate item name: {name!r}")
+        seen_names.add(name)
+        names.append(name)
+        validated.append(
+            _validate_ensemble_multi(
+                item["delta"],
+                schema=_ENSEMBLE_DELTA_MULTI_SCHEMA,
+                where=f"{where}.delta",
+            )
+        )
+
+    first_elements, first_times, first_lats, first_lons = (
+        validated[0][0],
+        validated[0][1],
+        validated[0][2],
+        validated[0][3],
+    )
+    for index in range(1, len(validated)):
+        elements, times, lats, lons, _quantiles, _data = validated[index]
+        if (
+            elements != first_elements
+            or times != first_times
+            or lats != first_lats
+            or lons != first_lons
+        ):
+            raise ValueError(
+                "all items must share identical elements, times, lats and lons"
+            )
+
+    region_names: list[str] = []
+    result_data = []
+    for index, item in enumerate(items):
+        batch = batch_exceed(
+            item["delta"], regions, windows, thresholds, min_count=min_count
+        )
+        if not region_names:
+            region_names = batch["regions"]
+        for row in batch["data"]:
+            result_data.append(
+                {
+                    "scenario": names[index],
+                    "threshold": row["threshold"],
+                    "element": row["element"],
+                    "region": row["region"],
+                    "count": row["count"],
+                    "exceed": row["exceed"],
+                    "rate": row["rate"],
+                    "mean_excess": row["mean_excess"],
+                    "uncertainty": row["uncertainty"],
+                }
+            )
+
+    return {
+        "schema": _EXCEED_COMPARE_SCHEMA,
+        "scenarios": names,
+        "elements": list(first_elements),
+        "thresholds": thresholds,
+        "windows": windows,
+        "regions": region_names,
+        "data": result_data,
+    }
