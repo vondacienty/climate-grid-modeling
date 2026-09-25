@@ -3042,3 +3042,194 @@ def compare_exceed(
         "regions": region_names,
         "data": result_data,
     }
+
+
+_QSHIFT_SCHEMA = "climate-grid/qshift-v1"
+
+
+def quantile_shift(items, regions, windows, quantiles, *, min_count: int = 1) -> dict:
+    """Compare scenario deltas against a reference via quantiles of shifts.
+
+    ``items`` must be a list of at least two mappings, each with exactly the
+    keys ``name, delta`` in that order.  ``name`` is a unique non-empty str
+    labeling the scenario and ``delta`` is a complete
+    :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``); every item's delta is validated
+    against that contract and all deltas must share equal ``elements``,
+    ``times``, ``lats`` and ``lons`` arrays in the same order.  ``regions``,
+    ``windows``, ``quantiles`` and ``min_count`` follow
+    :func:`aggregate_value_delta_quantile` exactly.
+
+    The first item is the reference.  For every subsequent scenario, every
+    window (in window order), region (in region order) and element (in
+    element order), the cells of the closed calendar interval are swept:
+    only where both the scenario and the reference cell are non-missing a
+    sample is taken with ``d = v1 - v0`` and ``du = sqrt(u1 ** 2 + u0 ** 2)``;
+    ``count`` is the sample count ``n``.  When ``n`` is below ``min_count``,
+    ``quantiles`` is a list of ``None`` of the same length as the argument
+    and ``uncertainty`` is ``None``.  Otherwise the samples are sorted
+    ascending and each quantile ``q`` is computed as ``h = (n - 1) * q``,
+    ``a = floor(h)``, ``b = ceil(h)``, ``d[a] + (h - a) * (d[b] - d[a])``;
+    ``uncertainty`` is ``sqrt(sum(du ** 2)) / n``.
+
+    The returned mapping uses the key order ``schema, reference, scenarios,
+    quantiles, windows, regions, data``; ``schema`` is
+    ``climate-grid/qshift-v1``, ``reference`` is the first item's name,
+    ``scenarios`` lists the remaining item names in item order,
+    ``quantiles`` and ``windows`` echo the arguments as-is and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in scenario-then-window-then-region-then-element order; each row uses
+    the key order ``scenario, window, region, element, count, quantiles,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong ``items`` / item-member / argument types
+    and ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two items")
+
+    scenario_names: list[str] = []
+    validated_datas: list = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _COMPARE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, delta in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate scenario name: {name!r}")
+        seen_names.add(name)
+
+        elements, times, lats, lons, _quantiles, data = _validate_ensemble_multi(
+            item["delta"],
+            schema=_ENSEMBLE_DELTA_MULTI_SCHEMA,
+            where=f"{where}.delta",
+        )
+        if not validated_datas:
+            first_elements = elements
+            first_times = times
+            first_lats = lats
+            first_lons = lons
+        else:
+            if elements != first_elements:
+                raise ValueError(
+                    "all items must have equal elements in the same order"
+                )
+            if times != first_times:
+                raise ValueError(
+                    "all items must have equal times in the same order"
+                )
+            if lats != first_lats:
+                raise ValueError(
+                    "all items must have equal lats in the same order"
+                )
+            if lons != first_lons:
+                raise ValueError(
+                    "all items must have equal lons in the same order"
+                )
+
+        scenario_names.append(name)
+        validated_datas.append(data)
+
+    validated_regions = _validate_regions(regions, len(first_lats), len(first_lons))
+    validated_windows = _validate_windows(windows, first_times)
+    validated_quantiles = _regional_validate_quantiles(quantiles)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    reference_data = validated_datas[0]
+    result_data = []
+    for item_index in range(1, len(items)):
+        scenario_name = scenario_names[item_index]
+        scenario_data = validated_datas[item_index]
+        for w_name, _start, _end, t_start, t_end in validated_windows:
+            for r_name, cells in validated_regions:
+                for element in first_elements:
+                    series = scenario_data[element]
+                    reference_series = reference_data[element]
+                    series_status = series["status"]
+                    reference_status = reference_series["status"]
+                    series_values = series["values"]
+                    reference_values = reference_series["values"]
+                    series_uncertainty = series["uncertainty"]
+                    reference_uncertainty = reference_series["uncertainty"]
+
+                    diffs: list[float] = []
+                    diff_uncertainties: list[float] = []
+                    for t in range(t_start, t_end + 1):
+                        for i, j in cells:
+                            if (
+                                series_status[t][i][j] == "missing"
+                                or reference_status[t][i][j] == "missing"
+                            ):
+                                continue
+                            diffs.append(
+                                series_values[t][i][j] - reference_values[t][i][j]
+                            )
+                            diff_uncertainties.append(
+                                math.sqrt(
+                                    series_uncertainty[t][i][j] ** 2
+                                    + reference_uncertainty[t][i][j] ** 2
+                                )
+                            )
+
+                    count = len(diffs)
+                    if count < min_count:
+                        quantile_values = [None for _q in validated_quantiles]
+                        uncertainty = None
+                    else:
+                        diffs.sort()
+                        quantile_values = []
+                        for q in validated_quantiles:
+                            h = (count - 1) * q
+                            a = math.floor(h)
+                            b = math.ceil(h)
+                            quantile_values.append(
+                                _round_output(
+                                    diffs[a] + (h - a) * (diffs[b] - diffs[a])
+                                )
+                            )
+                        uncertainty = _round_output(
+                            math.sqrt(
+                                sum(du ** 2 for du in diff_uncertainties)
+                            )
+                            / count
+                        )
+
+                    result_data.append(
+                        {
+                            "scenario": scenario_name,
+                            "window": w_name,
+                            "region": r_name,
+                            "element": element,
+                            "count": count,
+                            "quantiles": quantile_values,
+                            "uncertainty": uncertainty,
+                        }
+                    )
+
+    return {
+        "schema": _QSHIFT_SCHEMA,
+        "reference": scenario_names[0],
+        "scenarios": scenario_names[1:],
+        "quantiles": quantiles,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
