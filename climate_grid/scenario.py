@@ -3565,3 +3565,310 @@ def quantile_shift_summary(shift, *, min_count: int = 1) -> dict:
         "regions": list(regions),
         "data": result_data,
     }
+
+
+_QSHIFT_RANK_SCHEMA = "climate-grid/qshift-rank-v1"
+_QSHIFT_SUMMARY_KEYS = (
+    "schema",
+    "reference",
+    "scenarios",
+    "elements",
+    "quantiles",
+    "windows",
+    "regions",
+    "data",
+)
+_QSHIFT_SUMMARY_ROW_KEYS = (
+    "scenario",
+    "element",
+    "count",
+    "quantiles",
+    "uncertainty",
+)
+
+
+def _validate_qshift_summary(
+    summary: Any, *, where: str = "summary"
+) -> tuple[str, list[str], list[str], list, list, list[str], list]:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _QSHIFT_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, scenarios, "
+            "elements, quantiles, windows, regions, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _QSHIFT_SUMMARY_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_QSHIFT_SUMMARY_SCHEMA!r}")
+
+    reference = summary["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = summary["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where}.scenarios[{index}] must be a str")
+        if scenario == "":
+            raise ValueError(f"{where}.scenarios[{index}] must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where}.scenarios entry: {scenario!r}")
+        seen_scenarios.add(scenario)
+    if reference in seen_scenarios:
+        raise ValueError(f"{where}.reference must not appear in {where}.scenarios")
+
+    elements = summary["elements"]
+    if not isinstance(elements, list):
+        raise TypeError(f"{where}.elements must be a list")
+    if len(elements) == 0:
+        raise ValueError(f"{where}.elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"{where}.elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate {where}.elements entry: {element!r}")
+        seen_elements.add(element)
+
+    quantiles = _regional_validate_quantiles(summary["quantiles"])
+
+    windows = _validate_coverage_windows(
+        summary["windows"], prefix=f"{where}.windows"
+    )
+
+    regions = summary["regions"]
+    if not isinstance(regions, list):
+        raise TypeError(f"{where}.regions must be a list")
+    if len(regions) == 0:
+        raise ValueError(f"{where}.regions must be non-empty")
+    seen_regions: set[str] = set()
+    for index, region in enumerate(regions):
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.regions[{index}] must be a str")
+        if region == "":
+            raise ValueError(f"{where}.regions[{index}] must be non-empty")
+        if region in seen_regions:
+            raise ValueError(f"duplicate {where}.regions entry: {region!r}")
+        seen_regions.add(region)
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) == 0:
+        raise ValueError(f"{where}.data must be non-empty")
+
+    n_quantiles = len(quantiles)
+    n_elements = len(elements)
+    expected_rows = len(scenarios) * n_elements
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows "
+            "(one per scenario/element combination, in scenario-then-element order)"
+        )
+
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            target = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{target} must be a dict")
+            if tuple(row.keys()) != _QSHIFT_SUMMARY_ROW_KEYS:
+                raise ValueError(
+                    f"{target} must have exactly the keys scenario, element, "
+                    "count, quantiles, uncertainty in order"
+                )
+
+            if not isinstance(row["scenario"], str):
+                raise TypeError(f"{target}.scenario must be a str")
+            if row["scenario"] != scenario:
+                raise ValueError(
+                    f"{target}.scenario must be {scenario!r} for its "
+                    "scenario-then-element position"
+                )
+            if not isinstance(row["element"], str):
+                raise TypeError(f"{target}.element must be a str")
+            if row["element"] != element:
+                raise ValueError(
+                    f"{target}.element must be {element!r} for its "
+                    "scenario-then-element position"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{target}.count must be a non-bool int")
+            if count < 0:
+                raise ValueError(f"{target}.count must be non-negative")
+
+            row_quantiles = row["quantiles"]
+            if not isinstance(row_quantiles, list):
+                raise TypeError(f"{target}.quantiles must be a list")
+            if len(row_quantiles) != n_quantiles:
+                raise ValueError(
+                    f"{target}.quantiles must have {n_quantiles} items "
+                    "(one per quantile)"
+                )
+            none_flags = []
+            for q_index, value in enumerate(row_quantiles):
+                _validate_number(
+                    value, f"{target}.quantiles[{q_index}]", nullable=True
+                )
+                none_flags.append(value is None)
+            if any(none_flags) and not all(none_flags):
+                raise ValueError(
+                    f"{target}.quantiles must be all None or all numbers"
+                )
+
+            uncertainty = row["uncertainty"]
+            _validate_number(uncertainty, f"{target}.uncertainty", nullable=True)
+            if (uncertainty is None) != all(none_flags):
+                raise ValueError(
+                    f"{target}: quantiles and uncertainty must be None together"
+                )
+            if uncertainty is not None and uncertainty < 0:
+                raise ValueError(f"{target}.uncertainty must be non-negative")
+            if count == 0 and uncertainty is not None:
+                raise ValueError(
+                    f"{target}: a zero count requires None quantiles and uncertainty"
+                )
+
+            row_index += 1
+
+    return reference, scenarios, elements, quantiles, windows, regions, data
+
+
+def rank_quantile_shift(summary, quantile, *, min_count: int = 1) -> dict:
+    """Rank scenarios per element by one quantile of a shift summary.
+
+    ``summary`` must be a complete :func:`quantile_shift_summary` result
+    (schema ``climate-grid/qshift-summary-v1``) with exactly the keys
+    ``schema, reference, scenarios, elements, quantiles, windows, regions,
+    data`` in that order; every member is validated against that contract,
+    including the scenario-then-element ``data`` row order, each row's key
+    order ``scenario, element, count, quantiles, uncertainty`` and the count
+    / quantile invariants (a row's ``quantiles`` are all ``None`` or all
+    finite non-bool numbers, ``uncertainty`` is ``None`` exactly when the
+    quantiles are, and a zero ``count`` requires the ``None`` form).
+    ``quantile`` must be one of the finite non-bool items of
+    ``summary.quantiles`` (matched by equality).  ``min_count`` must be a
+    non-bool positive int.
+
+    For each element, a scenario row whose ``count`` is below
+    ``min_count`` or whose selected quantile value or ``uncertainty`` is
+    ``None`` gets ``difference=None``, ``uncertainty=None`` and
+    ``rank=None``.  Every other row's ``difference`` is its quantile value
+    for the selected quantile; the valid rows are ordered by ``difference``
+    descending with ties keeping the original scenario order, and receive
+    consecutive ``rank`` values starting at 1.  The invalid rows follow in
+    their original scenario order.
+
+    The returned mapping uses the key order ``schema, reference, scenarios,
+    elements, quantile, data``; ``schema`` is
+    ``climate-grid/qshift-rank-v1`` and ``reference``, ``scenarios``,
+    ``elements`` and ``quantile`` echo the inputs.  ``data`` is ordered by
+    element and then by rank within each element; each row uses the key
+    order ``element, scenario, count, difference, uncertainty, rank``.
+    ``count`` and non-null ``rank`` are ints and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        reference,
+        scenarios,
+        elements,
+        summary_quantiles,
+        _windows,
+        _regions,
+        data,
+    ) = _validate_qshift_summary(summary)
+
+    if not isinstance(quantile, (int, float)) or isinstance(quantile, bool):
+        raise TypeError("quantile must be a finite non-bool int or float")
+    if not math.isfinite(quantile):
+        raise ValueError("quantile must be finite")
+    q_index = None
+    for index, value in enumerate(summary_quantiles):
+        if value == quantile:
+            q_index = index
+            break
+    if q_index is None:
+        raise ValueError("quantile must be one of summary.quantiles")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    n_scenarios = len(scenarios)
+    n_elements = len(elements)
+
+    result_data = []
+    for e_index, element in enumerate(elements):
+        rows = [
+            data[s_index * n_elements + e_index]
+            for s_index in range(n_scenarios)
+        ]
+
+        valid = []
+        invalid = []
+        for s_index, row in enumerate(rows):
+            difference = row["quantiles"][q_index]
+            uncertainty = row["uncertainty"]
+            if (
+                row["count"] < min_count
+                or difference is None
+                or uncertainty is None
+            ):
+                invalid.append(s_index)
+            else:
+                valid.append((s_index, difference, uncertainty))
+
+        # Stable sort keeps the original scenario order for tied differences.
+        valid.sort(key=lambda entry: entry[1], reverse=True)
+
+        for rank, (s_index, difference, uncertainty) in enumerate(valid, start=1):
+            result_data.append(
+                {
+                    "element": element,
+                    "scenario": scenarios[s_index],
+                    "count": rows[s_index]["count"],
+                    "difference": _round_output(difference),
+                    "uncertainty": _round_output(uncertainty),
+                    "rank": rank,
+                }
+            )
+        for s_index in invalid:
+            result_data.append(
+                {
+                    "element": element,
+                    "scenario": scenarios[s_index],
+                    "count": rows[s_index]["count"],
+                    "difference": None,
+                    "uncertainty": None,
+                    "rank": None,
+                }
+            )
+
+    return {
+        "schema": _QSHIFT_RANK_SCHEMA,
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "quantile": quantile,
+        "data": result_data,
+    }
