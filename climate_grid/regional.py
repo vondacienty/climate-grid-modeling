@@ -43,6 +43,7 @@ __all__ = [
     "aggregate_autocorrelation",
     "aggregate_weighted_autocorrelation",
     "aggregate_regression",
+    "aggregate_multi_regression",
     "aggregate_weighted_regression",
     "aggregate_change",
     "aggregate_change_multi",
@@ -89,6 +90,7 @@ _WEIGHTED_CORRELATION_SCHEMA = "climate-grid/weighted-correlation-window-v1"
 _AUTOCORRELATION_SCHEMA = "climate-grid/autocorrelation-window-v1"
 _WEIGHTED_AUTOCORRELATION_SCHEMA = "climate-grid/weighted-autocorrelation-window-v1"
 _REGRESSION_SCHEMA = "climate-grid/regression-window-v1"
+_MREG_SCHEMA = "climate-grid/mreg-v1"
 _WEIGHTED_REGRESSION_SCHEMA = "climate-grid/weighted-regression-window-v1"
 _CHANGE_SCHEMA = "climate-grid/change-window-v1"
 _MULTI_CHANGE_SCHEMA = "climate-grid/multi-change-window-v1"
@@ -4975,6 +4977,115 @@ def aggregate_regression(
         "schema": _REGRESSION_SCHEMA,
         "element_x": element_x,
         "element_y": element_y,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_regression(
+    temporal, elements, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate element pairs into per-window regression stats at once.
+
+    Combines :func:`aggregate_multi` and :func:`aggregate_regression`:
+    ``temporal``, ``regions`` and ``min_count`` follow :func:`aggregate`;
+    ``elements`` is a non-empty list of unique non-empty str element names
+    that must all exist in ``temporal.data`` (wrong container or item types
+    raise ``TypeError``; an empty, duplicate or unknown element raises
+    ``ValueError``); ``windows`` follows :func:`aggregate_window` — a
+    non-empty list of dicts with exactly the keys ``name``, ``start`` and
+    ``end`` in that order, where ``name`` is a unique non-empty str and
+    ``start``/``end`` are valid ``YYYY-MM-DD`` dates occurring in
+    ``temporal.times`` with ``start <= end``.
+
+    Every unordered pair of elements ``(i, j)`` with ``i < j`` (in element
+    order) is treated like :func:`aggregate_regression`: for every window
+    (in window order) and region (in region order), a cell of a day
+    contributes a paired sample ``(x, y, ux, uy)`` only when its status is
+    non-``missing`` for both elements.  ``count`` is the number ``n`` of
+    paired samples; when ``n`` is below ``min_count``, ``slope``,
+    ``intercept`` and ``uncertainty`` are all ``None``.  Otherwise
+    ``x_bar`` and ``y_bar`` are the sample means; ``dx = x - x_bar`` and
+    ``dy = y - y_bar``; with ``Sxx = sum(dx ** 2)`` and
+    ``Sxy = sum(dx * dy)``, ``slope`` and ``intercept`` are ``None`` when
+    ``Sxx`` is zero and otherwise ``slope = Sxy / Sxx`` and
+    ``intercept = y_bar - slope * x_bar``; ``uncertainty`` is
+    ``sqrt(sum(ux ** 2 + uy ** 2)) / n`` over the paired samples.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/mreg-v1``, ``elements``
+    and ``windows`` are passed through unchanged and ``regions`` lists the
+    region names in input order.  ``data`` is a flat list of rows in
+    window-then-region-then-pair order; each row uses the key order
+    ``window, region, element_x, element_y, count, slope, intercept,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    pairs = [
+        (elements[i], elements[j])
+        for i in range(len(elements))
+        for j in range(i + 1, len(elements))
+    ]
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for name_x, name_y in pairs:
+                series_x = data[name_x]
+                series_y = data[name_y]
+                stats = _regression_window_region(
+                    series_x["values"],
+                    series_x["status"],
+                    series_x["uncertainty"],
+                    series_y["values"],
+                    series_y["status"],
+                    series_y["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element_x": name_x,
+                        "element_y": name_y,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MREG_SCHEMA,
+        "elements": elements,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
