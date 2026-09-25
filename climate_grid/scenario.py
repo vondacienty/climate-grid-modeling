@@ -306,6 +306,7 @@ def downscale(temporal, deltas, *, mode: str = "additive") -> dict:
 
 
 _ENSEMBLE_SCHEMA = "climate-grid/ensemble-v1"
+_ENSEMBLE_MULTI_SCHEMA = "climate-grid/ensemble-multi-v1"
 _DEFAULT_QUANTILES = [0.05, 0.5, 0.95]
 
 
@@ -329,6 +330,66 @@ def _validate_quantiles(quantiles: Any) -> list:
         if quantiles[index] <= quantiles[index - 1]:
             raise ValueError("quantiles must be strictly increasing")
     return list(quantiles)
+
+
+def _validate_scenarios(scenarios: Any) -> tuple[list, list, list, list[str], list]:
+    if not isinstance(scenarios, list):
+        raise TypeError("scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError("scenarios must be non-empty")
+
+    validated = [
+        _validate_temporal(
+            scenario, schema=_SCHEMA, where=f"scenarios[{index}]"
+        )
+        for index, scenario in enumerate(scenarios)
+    ]
+    times, lats, lons, data = validated[0]
+    elements = list(data.keys())
+    for index in range(1, len(validated)):
+        other_times, other_lats, other_lons, other_data = validated[index]
+        if other_times != times or other_lats != lats or other_lons != lons:
+            raise ValueError(
+                "all scenarios must share identical times, lats and lons"
+            )
+        if list(other_data.keys()) != elements:
+            raise ValueError(
+                "all scenarios must have the same data elements in the same order"
+            )
+    return times, lats, lons, elements, validated
+
+
+def _aggregate_cell(
+    samples: list[tuple], qs: list
+) -> tuple:
+    """Combine ``(value, uncertainty, status)`` samples for one cell.
+
+    Returns ``(value, status, uncertainty, quantile_values)``; with no
+    samples the value and uncertainty are ``None``, status ``"missing"`` and
+    every quantile is ``None``.
+    """
+    if not samples:
+        return None, "missing", None, [None for _ in qs]
+    n = len(samples)
+    value = _round_output(sum(sample[0] for sample in samples) / n)
+    status = (
+        "observed"
+        if all(sample[2] == "observed" for sample in samples)
+        else "interpolated"
+    )
+    uncertainty = _round_output(
+        math.sqrt(sum(sample[1] ** 2 for sample in samples)) / n
+    )
+    ordered = sorted(sample[0] for sample in samples)
+    quantile_values = []
+    for q in qs:
+        h = (n - 1) * q
+        lower = int(math.floor(h))
+        upper = min(lower + 1, n - 1)
+        fraction = h - lower
+        interpolated = ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+        quantile_values.append(_round_output(interpolated))
+    return value, status, uncertainty, quantile_values
 
 
 def ensemble(scenarios, element, *, quantiles=None) -> dict:
@@ -363,35 +424,13 @@ def ensemble(scenarios, element, *, quantiles=None) -> dict:
     Raises ``TypeError`` for wrong container/item/argument types and
     ``ValueError`` for any other contract violation.
     """
-    if not isinstance(scenarios, list):
-        raise TypeError("scenarios must be a list")
-    if len(scenarios) == 0:
-        raise ValueError("scenarios must be non-empty")
-
-    validated = [
-        _validate_temporal(
-            scenario, schema=_SCHEMA, where=f"scenarios[{index}]"
-        )
-        for index, scenario in enumerate(scenarios)
-    ]
-    times, lats, lons, data = validated[0]
-    elements = list(data.keys())
-    for index in range(1, len(validated)):
-        other_times, other_lats, other_lons, other_data = validated[index]
-        if other_times != times or other_lats != lats or other_lons != lons:
-            raise ValueError(
-                "all scenarios must share identical times, lats and lons"
-            )
-        if list(other_data.keys()) != elements:
-            raise ValueError(
-                "all scenarios must have the same data elements in the same order"
-            )
+    times, lats, lons, elements, validated = _validate_scenarios(scenarios)
 
     if not isinstance(element, str):
         raise TypeError("element must be a str")
     if element == "":
         raise ValueError("element must be non-empty")
-    if element not in data:
+    if element not in elements:
         raise ValueError(f"element {element!r} is not present in the scenarios")
 
     qs = _validate_quantiles(quantiles)
@@ -433,31 +472,14 @@ def ensemble(scenarios, element, *, quantiles=None) -> dict:
                     for series in series_list
                     if series["status"][t][i][j] != "missing"
                 ]
-                if not samples:
-                    out_status[t][i][j] = "missing"
-                    continue
-                n = len(samples)
-                out_values[t][i][j] = _round_output(
-                    sum(sample[0] for sample in samples) / n
-                )
-                out_status[t][i][j] = (
-                    "observed"
-                    if all(sample[2] == "observed" for sample in samples)
-                    else "interpolated"
-                )
-                out_uncertainty[t][i][j] = _round_output(
-                    math.sqrt(sum(sample[1] ** 2 for sample in samples)) / n
-                )
-                ordered = sorted(sample[0] for sample in samples)
-                for q_index, q in enumerate(qs):
-                    h = (n - 1) * q
-                    lower = int(math.floor(h))
-                    upper = min(lower + 1, n - 1)
-                    fraction = h - lower
-                    interpolated = ordered[lower] + (
-                        ordered[upper] - ordered[lower]
-                    ) * fraction
-                    out_quantiles[q_index][t][i][j] = _round_output(interpolated)
+                (
+                    out_values[t][i][j],
+                    out_status[t][i][j],
+                    out_uncertainty[t][i][j],
+                    cell_quantiles,
+                ) = _aggregate_cell(samples, qs)
+                for q_index, cell_value in enumerate(cell_quantiles):
+                    out_quantiles[q_index][t][i][j] = cell_value
 
     return {
         "schema": _ENSEMBLE_SCHEMA,
@@ -470,4 +492,108 @@ def ensemble(scenarios, element, *, quantiles=None) -> dict:
         "status": out_status,
         "uncertainty": out_uncertainty,
         "quantile_values": out_quantiles,
+    }
+
+
+def ensemble_multi(scenarios, *, quantiles=None) -> dict:
+    """Combine scenario-v1 downscale results across every element.
+
+    ``scenarios`` is a non-empty list of :func:`downscale` results (schema
+    ``climate-grid/scenario-v1``); every member is validated against that
+    contract and all members must share identical ``times``, ``lats``,
+    ``lons`` axes and the same ``data`` elements in the same order.
+    ``quantiles`` is ``None`` (default ``[0.05, 0.5, 0.95]``) or a non-empty
+    list of finite non-bool numbers in ``[0, 1]``, strictly increasing.
+
+    For every element and ``[time][lat][lon]`` cell the non-missing
+    ``(value, uncertainty)`` samples across the scenarios are combined: with
+    no samples the cell gets ``values=None``, ``status="missing"`` and
+    ``uncertainty=None`` with every quantile ``None``; otherwise ``values``
+    is the sample mean ``Σv / n``, ``status`` is ``"observed"`` when every
+    sample is observed and ``"interpolated"`` otherwise, and
+    ``uncertainty`` is ``√(Σu²) / n``.  Each requested quantile is computed
+    from the ascending sample values by linear interpolation on the
+    position ``h = (n - 1) q``.
+
+    The returned mapping uses the key order ``schema, elements, times,
+    lats, lons, quantiles, data``; ``schema`` is
+    ``climate-grid/ensemble-multi-v1`` and the axes are carried over from
+    the scenarios.  ``data`` follows the scenarios' element order and each
+    item uses the key order ``values, status, uncertainty,
+    quantile_values``; the first three members are nested
+    ``[time][lat][lon]`` lists and ``quantile_values`` is nested
+    ``[quantile][time][lat][lon]`` with ``None`` for sample-less cells.
+    Every computed output number is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    times, lats, lons, elements, validated = _validate_scenarios(scenarios)
+    qs = _validate_quantiles(quantiles)
+
+    n_times = len(times)
+    n_lat = len(lats)
+    n_lon = len(lons)
+
+    out_data: dict[str, dict] = {}
+    for element in elements:
+        series_list = [member[3][element] for member in validated]
+
+        out_values = [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        out_status = [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        out_uncertainty = [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        out_quantiles = [
+            [
+                [[None for _ in range(n_lon)] for _ in range(n_lat)]
+                for _ in range(n_times)
+            ]
+            for _ in qs
+        ]
+
+        for t in range(n_times):
+            for i in range(n_lat):
+                for j in range(n_lon):
+                    samples = [
+                        (
+                            series["values"][t][i][j],
+                            series["uncertainty"][t][i][j],
+                            series["status"][t][i][j],
+                        )
+                        for series in series_list
+                        if series["status"][t][i][j] != "missing"
+                    ]
+                    (
+                        out_values[t][i][j],
+                        out_status[t][i][j],
+                        out_uncertainty[t][i][j],
+                        cell_quantiles,
+                    ) = _aggregate_cell(samples, qs)
+                    for q_index, cell_value in enumerate(cell_quantiles):
+                        out_quantiles[q_index][t][i][j] = cell_value
+
+        out_data[element] = {
+            "values": out_values,
+            "status": out_status,
+            "uncertainty": out_uncertainty,
+            "quantile_values": out_quantiles,
+        }
+
+    return {
+        "schema": _ENSEMBLE_MULTI_SCHEMA,
+        "elements": list(elements),
+        "times": list(times),
+        "lats": list(lats),
+        "lons": list(lons),
+        "quantiles": qs,
+        "data": out_data,
     }
