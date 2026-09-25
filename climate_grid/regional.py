@@ -36,6 +36,7 @@ __all__ = [
     "aggregate_weighted_multi_window",
     "aggregate_weighted_multi_variance",
     "aggregate_trend",
+    "aggregate_multi_trend",
     "aggregate_weighted_trend",
     "aggregate_correlation",
     "aggregate_multi_correlation",
@@ -83,6 +84,7 @@ _KURTOSIS_SCHEMA = "climate-grid/kurtosis-window-v1"
 _MULTI_SKEW_SCHEMA = "climate-grid/multi-skew-v1"
 _MULTI_KURTOSIS_SCHEMA = "climate-grid/multi-kurtosis-v1"
 _TREND_SCHEMA = "climate-grid/trend-window-v1"
+_MULTI_TREND_SCHEMA = "climate-grid/multi-trend-window-v1"
 _WEIGHTED_TREND_SCHEMA = "climate-grid/weighted-trend-window-v1"
 _CORRELATION_SCHEMA = "climate-grid/correlation-window-v1"
 _MULTI_CORRELATION_SCHEMA = "climate-grid/multi-correlation-window-v1"
@@ -4317,6 +4319,100 @@ def aggregate_trend(
     return {
         "schema": _TREND_SCHEMA,
         "element": element,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+def aggregate_multi_trend(
+    temporal, elements, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate several elements into per-window trend statistics at once.
+
+    Combines :func:`aggregate_multi_window` and :func:`aggregate_trend`:
+    ``temporal``, ``regions`` and ``min_count`` follow :func:`aggregate`;
+    ``elements`` is a non-empty list of unique non-empty str element names
+    that must all exist in ``temporal.data`` (wrong item types raise
+    ``TypeError``; an empty, duplicate or unknown element raises
+    ``ValueError``); ``windows`` and the closed-interval, non-``missing``
+    sampling rules follow :func:`aggregate_window` and
+    :func:`aggregate_trend`.
+
+    For every window (in window order), region (in region order) and element
+    (in element order), each day of the inclusive interval whose number ``n``
+    of non-``missing`` cells satisfies ``n >= min_count`` is retained,
+    contributing the daily mean ``m = sum(v) / n`` and daily uncertainty
+    ``sqrt(sum(u ** 2)) / n`` over those cells.  With ``x`` the day offset
+    from the window start, ``k`` the number of retained days, ``x_bar`` and
+    ``m_bar`` the means of the offsets and daily means, the statistics are
+    ``mean = m_bar``, ``slope = sum((x - x_bar) * (m - m_bar)) /
+    sum((x - x_bar) ** 2)``, ``intercept = m_bar - slope * x_bar`` and
+    ``uncertainty = sqrt(sum(u ** 2)) / k`` over the retained days'
+    uncertainties.  ``count`` is ``k``; when ``k`` is below 2, ``mean``,
+    ``slope``, ``intercept`` and ``uncertainty`` are all ``None``.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/multi-trend-window-v1``,
+    ``elements`` and ``windows`` are passed through unchanged and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, mean, slope, intercept, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+    """
+    times, lats, lons, data = _validate_temporal(temporal)
+
+    if not isinstance(elements, list):
+        raise TypeError("elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+        if element not in data:
+            raise ValueError(f"unknown element: {element!r}")
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _trend_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _MULTI_TREND_SCHEMA,
+        "elements": elements,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
