@@ -4169,6 +4169,119 @@ def _validate_rank_stability(
     return scenarios, elements, data
 
 
+def _validate_weights(
+    weights: Any, n_elements: int, *, prefix: str = "weights"
+) -> list:
+    if not isinstance(weights, list):
+        raise TypeError(f"{prefix} must be a list")
+    if len(weights) != n_elements:
+        raise ValueError(
+            f"{prefix} must have one item per stability element "
+            f"({n_elements} expected)"
+        )
+    for index, weight in enumerate(weights):
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise TypeError(
+                f"{prefix}[{index}] must be a finite non-bool int or float"
+            )
+        if not math.isfinite(weight):
+            raise ValueError(f"{prefix}[{index}] must be finite")
+        if weight < 0:
+            raise ValueError(f"{prefix}[{index}] must be non-negative")
+    return weights
+
+
+def _composite_scenario_stats(
+    scenarios: list[str],
+    elements: list[str],
+    data: list,
+    weights: list,
+    min_elements: int,
+) -> list:
+    """Compute the unranked composite stats for each scenario.
+
+    Returns one entry per scenario in scenario order; a scenario with fewer
+    than ``min_elements`` contributing rows gets a dict whose ``mean``,
+    ``best``, ``worst`` and ``u`` are ``None`` (its ``covered`` count is
+    still recorded), otherwise the dict carries the computed stats (no
+    ``rank``).
+
+    The included weights are scaled by the scenario's largest positive
+    weight before summation, and the weighted sums use ``math.fsum`` while
+    the uncertainty norm uses ``math.hypot`` so that large finite weights
+    cannot overflow an intermediate product or square.  Scaling cancels out
+    of every weighted ratio, so the results are mathematically identical to
+    the unscaled formulas.
+    """
+    n_scenarios = len(scenarios)
+    n_elements = len(elements)
+
+    stats = []
+    for s_index, scenario in enumerate(scenarios):
+        included = [
+            (weights[e_index], data[e_index * n_scenarios + s_index])
+            for e_index in range(n_elements)
+            if weights[e_index] > 0
+            and data[e_index * n_scenarios + s_index]["rank_count"] > 0
+        ]
+        covered = len(included)
+        if covered < min_elements:
+            stats.append(
+                {
+                    "scenario": scenario,
+                    "covered": covered,
+                    "mean": None,
+                    "best": None,
+                    "worst": None,
+                    "u": None,
+                }
+            )
+            continue
+
+        scale = max(weight for weight, _row in included)
+        scaled = [(weight / scale, row) for weight, row in included]
+        total_weight = math.fsum(weight for weight, _row in scaled)
+        mean = (
+            math.fsum(weight * row["mean_rank"] for weight, row in scaled)
+            / total_weight
+        )
+        u = (
+            math.hypot(
+                *(weight * row["uncertainty"] for weight, row in scaled)
+            )
+            / total_weight
+        )
+        stats.append(
+            {
+                "scenario": scenario,
+                "covered": covered,
+                "mean": _round_output(mean),
+                "best": min(row["best_rank"] for _weight, row in scaled),
+                "worst": max(row["worst_rank"] for _weight, row in scaled),
+                "u": _round_output(u),
+            }
+        )
+
+    return stats
+
+
+def _composite_ranks(stats: list) -> tuple[list, list]:
+    """Rank composite stats by ascending rounded mean (stable for ties).
+
+    Returns ``(ranks, ranked_indices)``: one rank per scenario entry
+    (``None`` for rows whose stats are missing) and the scenario indices in
+    rank order; ranks run consecutively from 1.
+    """
+    ranked_indices = sorted(
+        (index for index, row in enumerate(stats) if row["mean"] is not None),
+        key=lambda index: stats[index]["mean"],
+    )
+    ranks = [None] * len(stats)
+    for rank, index in enumerate(ranked_indices, start=1):
+        ranks[index] = rank
+    return ranks, ranked_indices
+
+
 def composite_rank(stability, weights, *, min_elements: int = 1) -> dict:
     """Combine per-element rank stability stats into a composite ranking.
 
@@ -4196,7 +4309,12 @@ def composite_rank(stability, weights, *, min_elements: int = 1) -> dict:
     Otherwise, with ``W`` the sum of the included weights, ``mean`` is
     ``Σ(w × mean_rank) / W``, ``best`` is the minimum ``best_rank``,
     ``worst`` is the maximum ``worst_rank`` and ``u`` is
-    ``√Σ(w × uncertainty)² / W`` over the included rows.
+    ``√Σ(w × uncertainty)² / W`` over the included rows.  The sums are
+    evaluated after scaling the included weights by the scenario's largest
+    positive weight (the factor cancels out of every ratio), using
+    ``math.fsum`` for the weighted sums and ``math.hypot`` for the
+    uncertainty norm, so large finite weights cannot overflow an
+    intermediate product or square.
 
     The scenarios are then ranked by ascending ``mean`` with ties keeping
     the original ``scenarios`` order; ``rank`` runs consecutively from 1.
@@ -4216,86 +4334,165 @@ def composite_rank(stability, weights, *, min_elements: int = 1) -> dict:
     ``ValueError`` for any other contract violation.
     """
     scenarios, elements, data = _validate_rank_stability(stability)
-
-    if not isinstance(weights, list):
-        raise TypeError("weights must be a list")
-    if len(weights) != len(elements):
-        raise ValueError(
-            "weights must have one item per stability element "
-            f"({len(elements)} expected)"
-        )
-    for index, weight in enumerate(weights):
-        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
-            raise TypeError(
-                f"weights[{index}] must be a finite non-bool int or float"
-            )
-        if not math.isfinite(weight):
-            raise ValueError(f"weights[{index}] must be finite")
-        if weight < 0:
-            raise ValueError(f"weights[{index}] must be non-negative")
+    _validate_weights(weights, len(elements))
 
     if not isinstance(min_elements, int) or isinstance(min_elements, bool):
         raise TypeError("min_elements must be a non-bool int")
     if min_elements < 1:
         raise ValueError("min_elements must be positive")
 
-    n_scenarios = len(scenarios)
-    n_elements = len(elements)
+    stats = _composite_scenario_stats(
+        scenarios, elements, data, weights, min_elements
+    )
+    ranks, ranked_indices = _composite_ranks(stats)
 
-    valid = []
-    invalid = []
-    for s_index, scenario in enumerate(scenarios):
-        included = [
-            (weights[e_index], data[e_index * n_scenarios + s_index])
-            for e_index in range(n_elements)
-            if weights[e_index] > 0
-            and data[e_index * n_scenarios + s_index]["rank_count"] > 0
-        ]
-        covered = len(included)
-        if covered < min_elements:
-            invalid.append(
-                {
-                    "scenario": scenario,
-                    "covered": covered,
-                    "mean": None,
-                    "best": None,
-                    "worst": None,
-                    "u": None,
-                    "rank": None,
-                }
-            )
-            continue
-        total_weight = sum(weight for weight, _row in included)
-        valid.append(
-            {
-                "scenario": scenario,
-                "covered": covered,
-                "mean": _round_output(
-                    sum(weight * row["mean_rank"] for weight, row in included)
-                    / total_weight
-                ),
-                "best": min(row["best_rank"] for _weight, row in included),
-                "worst": max(row["worst_rank"] for _weight, row in included),
-                "u": _round_output(
-                    math.sqrt(
-                        sum(
-                            (weight * row["uncertainty"]) ** 2
-                            for weight, row in included
-                        )
-                    )
-                    / total_weight
-                ),
-                "rank": None,
-            }
-        )
-
-    # The sort is stable, so ties keep the original scenarios order.
-    valid.sort(key=lambda row: row["mean"])
-    for rank, row in enumerate(valid, start=1):
-        row["rank"] = rank
+    result_data = []
+    for index in ranked_indices:
+        row = dict(stats[index])
+        row["rank"] = ranks[index]
+        result_data.append(row)
+    for index, row in enumerate(stats):
+        if row["mean"] is None:
+            invalid_row = dict(row)
+            invalid_row["rank"] = None
+            result_data.append(invalid_row)
 
     return {
         "schema": _COMPOSITE_RANK_SCHEMA,
         "scenarios": list(scenarios),
-        "data": valid + invalid,
+        "data": result_data,
+    }
+
+
+_CRANK_SENSITIVITY_SCHEMA = "climate-grid/crank-sensitivity-v1"
+_CRANK_SENSITIVITY_CONFIG_KEYS = ("name", "weights")
+
+
+def _validate_sensitivity_configs(configs: Any, n_elements: int) -> list:
+    if not isinstance(configs, list):
+        raise TypeError("configs must be a list")
+    if len(configs) == 0:
+        raise ValueError("configs must be non-empty")
+
+    names = []
+    seen_names: set[str] = set()
+    for index, config in enumerate(configs):
+        where = f"configs[{index}]"
+        if not isinstance(config, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(config.keys()) != _CRANK_SENSITIVITY_CONFIG_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, weights in order"
+            )
+
+        name = config["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate configuration name: {name!r}")
+        seen_names.add(name)
+        names.append(name)
+
+        _validate_weights(
+            config["weights"],
+            n_elements,
+            prefix=f"{where}.weights",
+        )
+
+    return names
+
+
+def rank_sensitivity(stability, configs, *, min_elements: int = 1) -> dict:
+    """Measure how composite scenario ranks vary across weight configurations.
+
+    ``stability`` must be a complete :func:`rank_stability` result,
+    validated exactly as in :func:`composite_rank`.  ``configs`` is a
+    non-empty list of dicts, each with exactly the keys ``name, weights`` in
+    that order; ``name`` is a unique non-empty str and ``weights`` follows
+    the :func:`composite_rank` weights contract (one finite non-bool
+    non-negative number per ``stability.elements`` entry).
+    ``min_elements`` follows :func:`composite_rank` as well.
+
+    Each configuration produces a composite ranking exactly as
+    :func:`composite_rank` would (including the ``min_elements`` cutoff).
+    For every scenario (in scenario order) the configurations whose
+    composite ``rank`` is not ``None`` are collected; ``count`` is their
+    number.  When ``count`` is zero, ``mean_rank``, ``best_rank``,
+    ``worst_rank`` and ``uncertainty`` are all ``None``; otherwise they are
+    the mean, minimum and maximum of the scenario's ranks and the population
+    dispersion ``sqrt(fsum((rank - mean_rank) ** 2) / count)``.
+
+    The returned mapping uses the key order ``schema, configurations,
+    scenarios, data``; ``schema`` is
+    ``climate-grid/crank-sensitivity-v1``, ``configurations`` is the
+    configuration names in input order, ``scenarios`` echoes the stability
+    scenarios and ``data`` is a flat list of rows in scenario order.  Each
+    row uses the key order ``scenario, count, mean_rank, best_rank,
+    worst_rank, uncertainty``; ``count``, ``best_rank`` and ``worst_rank``
+    are ints and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scenarios, elements, data = _validate_rank_stability(stability)
+    names = _validate_sensitivity_configs(configs, len(elements))
+
+    if not isinstance(min_elements, int) or isinstance(min_elements, bool):
+        raise TypeError("min_elements must be a non-bool int")
+    if min_elements < 1:
+        raise ValueError("min_elements must be positive")
+
+    # ranks_by_config[config_index][scenario_index] is the composite rank
+    # (or None) for that configuration and scenario.
+    ranks_by_config = []
+    for config in configs:
+        stats = _composite_scenario_stats(
+            scenarios, elements, data, config["weights"], min_elements
+        )
+        ranks, _ranked_indices = _composite_ranks(stats)
+        ranks_by_config.append(ranks)
+
+    result_data = []
+    for s_index, scenario in enumerate(scenarios):
+        ranks = [
+            ranks_by_config[c_index][s_index]
+            for c_index in range(len(configs))
+            if ranks_by_config[c_index][s_index] is not None
+        ]
+        count = len(ranks)
+        if count == 0:
+            mean_rank = None
+            best_rank = None
+            worst_rank = None
+            uncertainty = None
+        else:
+            mean_value = math.fsum(ranks) / count
+            mean_rank = _round_output(mean_value)
+            best_rank = min(ranks)
+            worst_rank = max(ranks)
+            uncertainty = _round_output(
+                math.sqrt(
+                    math.fsum((rank - mean_rank) ** 2 for rank in ranks)
+                    / count
+                )
+            )
+        result_data.append(
+            {
+                "scenario": scenario,
+                "count": count,
+                "mean_rank": mean_rank,
+                "best_rank": best_rank,
+                "worst_rank": worst_rank,
+                "uncertainty": uncertainty,
+            }
+        )
+
+    return {
+        "schema": _CRANK_SENSITIVITY_SCHEMA,
+        "configurations": names,
+        "scenarios": list(scenarios),
+        "data": result_data,
     }
