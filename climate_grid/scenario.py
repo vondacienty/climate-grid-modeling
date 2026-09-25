@@ -2101,3 +2101,93 @@ def aggregate_value_delta_quantile(
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
+
+
+_ENSEMBLE_DELTA_COVERAGE_SCHEMA = "climate-grid/ensemble-delta-coverage-v1"
+
+
+def aggregate_value_delta_coverage(
+    delta, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate an ensemble-delta-multi grid into per-window coverage stats.
+
+    ``delta`` must be a complete :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``) with exactly the keys
+    ``schema, elements, times, lats, lons, quantiles, data`` in that order;
+    every member is validated against that contract, including each item's
+    key order ``values, status, uncertainty, quantile_values`` and the
+    nested ``[quantile][time][lat][lon]`` quantile frames.  ``regions``,
+    ``windows`` and ``min_count`` follow
+    :func:`climate_grid.regional.aggregate_window` exactly: region
+    ``cells`` are checked against the delta grid and window
+    ``start``/``end`` must occur in ``delta.times``.
+
+    For every window (in window order), region (in region order) and
+    element (in delta element order), the closed calendar interval is
+    swept as a grid: ``total`` is the number of days in the inclusive
+    interval times the number of cells in the region.  ``available``
+    counts non-``missing`` cells, split into ``observed`` and
+    ``interpolated``; all four counts are ints.  When ``available`` is
+    below ``min_count``, ``rate``, ``observed_rate``,
+    ``interpolated_rate`` and ``uncertainty`` are all ``None``.
+    Otherwise the three rates are ``available / total``, ``observed /
+    total`` and ``interpolated / total`` and ``uncertainty`` is
+    ``sqrt(sum(u ** 2)) / available`` over the available cells'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is
+    ``climate-grid/ensemble-delta-coverage-v1``, ``elements`` and
+    ``windows`` echo the delta elements and the ``windows`` argument, and
+    ``regions`` lists the region names in input order.  ``data`` is a
+    flat list of rows in window-then-region-then-element order; each row
+    uses the key order ``window, region, element, total, available,
+    observed, interpolated, rate, observed_rate, interpolated_rate,
+    uncertainty``.  The four counts are ints and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs
+    are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _quantiles, data = _validate_ensemble_multi(
+        delta, schema=_ENSEMBLE_DELTA_MULTI_SCHEMA, where="delta"
+    )
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _coverage_window_region(
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _ENSEMBLE_DELTA_COVERAGE_SCHEMA,
+        "elements": list(elements),
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
