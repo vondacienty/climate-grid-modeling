@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import datetime
 import math
 import re
@@ -2249,5 +2250,141 @@ def aggregate_value_delta_coverage_summary(coverage) -> dict:
         "elements": list(elements),
         "windows": windows,
         "regions": list(regions),
+        "data": result_data,
+    }
+
+
+_ENSEMBLE_DELTA_HISTOGRAM_REGION_SCHEMA = (
+    "climate-grid/ensemble-delta-histogram-region-v1"
+)
+
+
+def _histogram_window_region(
+    values: list,
+    status: list,
+    uncertainty: list,
+    cells: list[tuple[int, int]],
+    t_start: int,
+    t_end: int,
+    edges: list,
+    min_count: int,
+) -> dict:
+    n_bins = len(edges) + 1
+    bin_counts = [0] * n_bins
+    window_uncertainties: list[float] = []
+    count = 0
+    for t in range(t_start, t_end + 1):
+        for i, j in cells:
+            if status[t][i][j] != "missing":
+                bin_counts[bisect.bisect_right(edges, values[t][i][j])] += 1
+                window_uncertainties.append(uncertainty[t][i][j])
+                count += 1
+
+    if count < min_count:
+        return {
+            "count": count,
+            "bin_counts": bin_counts,
+            "rates": [None] * n_bins,
+            "uncertainty": None,
+        }
+
+    return {
+        "count": count,
+        "bin_counts": bin_counts,
+        "rates": [_round_output(bin_count / count) for bin_count in bin_counts],
+        "uncertainty": _round_output(
+            math.sqrt(sum(u ** 2 for u in window_uncertainties)) / count
+        ),
+    }
+
+
+def aggregate_value_delta_histogram(
+    delta, regions, windows, edges, *, min_count: int = 1
+) -> dict:
+    """Aggregate an ensemble-delta-multi grid into per-window region histograms.
+
+    ``delta`` must be a complete :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``) with exactly the keys
+    ``schema, elements, times, lats, lons, quantiles, data`` in that order;
+    every member is validated against that contract, including each item's
+    key order ``values, status, uncertainty, quantile_values`` and the
+    nested ``[quantile][time][lat][lon]`` quantile frames.  ``regions``,
+    ``windows`` and ``min_count`` follow
+    :func:`climate_grid.regional.aggregate_window` exactly: region
+    ``cells`` are checked against the delta grid and window
+    ``start``/``end`` must occur in ``delta.times``.  ``edges`` is a
+    non-empty list of finite non-bool numbers in strictly increasing
+    order.
+
+    For every window (in window order), region (in region order) and
+    element (in delta element order), the non-missing ``(value,
+    uncertainty)`` samples of the closed calendar interval are collected
+    across the region's cells; ``count`` is the sample count ``n``.  The
+    samples are binned into ``B = len(edges) + 1`` bins: a value below
+    ``edges[0]`` falls into bin ``0``, a value with
+    ``edges[k - 1] <= v < edges[k]`` falls into bin ``k`` and a value at
+    or above the last edge falls into bin ``B - 1``; ``bin_counts`` holds
+    the ``B`` per-bin sample counts.  When ``n`` is below ``min_count``,
+    ``rates`` is a list of ``None`` of length ``B`` and ``uncertainty``
+    is ``None``; otherwise ``rates[i]`` is ``bin_counts[i] / n`` and
+    ``uncertainty`` is ``sqrt(Σu²) / n`` over the sampled uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, edges,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/ensemble-delta-histogram-region-v1``, ``elements``
+    echoes the delta elements, ``edges`` and ``windows`` echo the
+    arguments and ``regions`` lists the region names in input order.
+    ``data`` is a flat list of rows in window-then-region-then-element
+    order; each row uses the key order ``window, region, element, count,
+    bin_counts, rates, uncertainty``.  ``count`` and the ``bin_counts``
+    items are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _quantiles, data = _validate_ensemble_multi(
+        delta, schema=_ENSEMBLE_DELTA_MULTI_SCHEMA, where="delta"
+    )
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+    _validate_axis(edges, "edges")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _histogram_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    edges,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _ENSEMBLE_DELTA_HISTOGRAM_REGION_SCHEMA,
+        "elements": list(elements),
+        "edges": edges,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
