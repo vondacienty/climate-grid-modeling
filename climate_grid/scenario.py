@@ -780,3 +780,290 @@ def coverage_multi(
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
+
+
+_SCENARIO_COVERAGE_SUMMARY_SCHEMA = "climate-grid/scenario-cov-summary-v1"
+_SCENARIO_COVERAGE_KEYS = ("schema", "elements", "windows", "regions", "data")
+_SCENARIO_COVERAGE_ROW_KEYS = (
+    "window",
+    "region",
+    "element",
+    "total",
+    "available",
+    "observed",
+    "interpolated",
+    "rate",
+    "observed_rate",
+    "interpolated_rate",
+    "uncertainty",
+)
+_SCENARIO_COVERAGE_SUMMARY_ROW_KEYS = (
+    "element",
+    "region",
+    "total",
+    "available",
+    "observed",
+    "interpolated",
+    "rate",
+    "observed_rate",
+    "interpolated_rate",
+    "uncertainty",
+)
+
+
+def _validate_coverage_names(values: Any, where: str) -> list[str]:
+    if not isinstance(values, list):
+        raise TypeError(f"{where} must be a list")
+    if len(values) == 0:
+        raise ValueError(f"{where} must be non-empty")
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        target = f"{where}[{index}]"
+        if not isinstance(value, str):
+            raise TypeError(f"{target} must be a str")
+        if value == "":
+            raise ValueError(f"{target} must be non-empty")
+        if value in seen:
+            raise ValueError(f"duplicate {where} entry: {value!r}")
+        seen.add(value)
+    return list(values)
+
+
+def _validate_coverage_windows(windows: Any) -> list[str]:
+    if not isinstance(windows, list):
+        raise TypeError("coverage.windows must be a list")
+    if len(windows) == 0:
+        raise ValueError("coverage.windows must be non-empty")
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for index, window in enumerate(windows):
+        where = f"coverage.windows[{index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{where} must be a dict")
+        if list(window.keys()) != ["name", "start", "end"]:
+            raise ValueError(
+                f"{where} must have exactly the keys name, start, end in order"
+            )
+
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen:
+            raise ValueError(f"duplicate coverage window name: {name!r}")
+        seen.add(name)
+        names.append(name)
+
+        start_day = _parse_date(window["start"], f"{where}.start")
+        end_day = _parse_date(window["end"], f"{where}.end")
+        if start_day > end_day:
+            raise ValueError(f"{where}.start must be on or before {where}.end")
+
+    return names
+
+
+def _validate_scenario_coverage(coverage: Any) -> tuple[list[str], list[str], list[str], list]:
+    if not isinstance(coverage, dict):
+        raise TypeError("coverage must be a dict")
+    if tuple(coverage.keys()) != _SCENARIO_COVERAGE_KEYS:
+        raise ValueError(
+            "coverage must have exactly the keys schema, elements, windows, "
+            "regions, data in order"
+        )
+
+    schema = coverage["schema"]
+    if not isinstance(schema, str):
+        raise TypeError("coverage.schema must be a str")
+    if schema != _SCENARIO_COVERAGE_SCHEMA:
+        raise ValueError(f"coverage.schema must be {_SCENARIO_COVERAGE_SCHEMA!r}")
+
+    elements = _validate_coverage_names(coverage["elements"], "coverage.elements")
+    window_names = _validate_coverage_windows(coverage["windows"])
+    region_names = _validate_coverage_names(coverage["regions"], "coverage.regions")
+
+    data = coverage["data"]
+    if not isinstance(data, list):
+        raise TypeError("coverage.data must be a list")
+
+    n_windows = len(window_names)
+    n_regions = len(region_names)
+    n_elements = len(elements)
+    expected_rows = n_windows * n_regions * n_elements
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"coverage.data must have {expected_rows} rows (one per "
+            "window/region/element combination)"
+        )
+
+    row_index = 0
+    for w_name in window_names:
+        for r_name in region_names:
+            for e_name in elements:
+                where = f"coverage.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{where} must be a dict")
+                if tuple(row.keys()) != _SCENARIO_COVERAGE_ROW_KEYS:
+                    raise ValueError(
+                        f"{where} must have exactly the keys window, region, "
+                        "element, total, available, observed, interpolated, "
+                        "rate, observed_rate, interpolated_rate, uncertainty "
+                        "in order"
+                    )
+
+                for key, expected in (
+                    ("window", w_name),
+                    ("region", r_name),
+                    ("element", e_name),
+                ):
+                    value = row[key]
+                    if not isinstance(value, str):
+                        raise TypeError(f"{where}.{key} must be a str")
+                    if value != expected:
+                        raise ValueError(
+                            f"{where}.{key} must be {expected!r}; rows must be "
+                            "in window-then-region-then-element order"
+                        )
+
+                for key in ("total", "available", "observed", "interpolated"):
+                    value = row[key]
+                    if not isinstance(value, int) or isinstance(value, bool):
+                        raise TypeError(f"{where}.{key} must be a non-bool int")
+                    if value < 0:
+                        raise ValueError(f"{where}.{key} must be non-negative")
+                if row["available"] > row["total"]:
+                    raise ValueError(f"{where}: available must not exceed total")
+                if row["observed"] + row["interpolated"] != row["available"]:
+                    raise ValueError(
+                        f"{where}: observed plus interpolated must equal available"
+                    )
+
+                for key in (
+                    "rate",
+                    "observed_rate",
+                    "interpolated_rate",
+                    "uncertainty",
+                ):
+                    _validate_number(row[key], f"{where}.{key}", nullable=True)
+
+                row_index += 1
+
+    return elements, window_names, region_names, data
+
+
+def coverage_summary(coverage) -> dict:
+    """Aggregate a scenario-cov result across all windows per element/region.
+
+    ``coverage`` must be a complete :func:`coverage_multi` result (schema
+    ``climate-grid/scenario-cov-v1``) with exactly the keys ``schema,
+    elements, windows, regions, data`` in that order.  ``elements`` and
+    ``regions`` are non-empty lists of unique non-empty str names;
+    ``windows`` is a non-empty list of ``{name, start, end}`` window dicts
+    in that key order with unique non-empty names and YYYY-MM-DD dates
+    whose start is on or before end.  ``data`` must contain one row per
+    window/region/element combination in window-then-region-then-element
+    order; each row uses the key order ``window, region, element, total,
+    available, observed, interpolated, rate, observed_rate,
+    interpolated_rate, uncertainty``, the four counts are non-negative
+    non-bool ints with ``observed + interpolated == available <= total``
+    and the rate/uncertainty cells are finite non-bool numbers or
+    ``None``.
+
+    Rows sharing an element and region are pooled across every window
+    (element order outermost, region order innermost): the four counts
+    are summed.  When the pooled ``total`` is positive, ``rate``,
+    ``observed_rate`` and ``interpolated_rate`` are ``available / total``,
+    ``observed / total`` and ``interpolated / total``; otherwise all
+    three are ``None``.  The pooled ``uncertainty`` is ``None`` when the
+    pooled available count is zero or when any contributing row with
+    ``available > 0`` has an ``uncertainty`` of ``None``; otherwise it is
+    ``sqrt(sum((available * uncertainty) ** 2)) / sum(available)`` over
+    the pooled rows.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/scenario-cov-summary-v1``
+    and the three arrays are echoed from ``coverage``.  Each ``data`` row
+    uses the key order ``element, region, total, available, observed,
+    interpolated, rate, observed_rate, interpolated_rate, uncertainty``.
+    The counts are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, window_names, region_names, data = _validate_scenario_coverage(
+        coverage
+    )
+
+    n_windows = len(window_names)
+    n_regions = len(region_names)
+    n_elements = len(elements)
+
+    result_data = []
+    for e_index, element in enumerate(elements):
+        for r_index, region in enumerate(region_names):
+            total = 0
+            available = 0
+            observed = 0
+            interpolated = 0
+            available_sum = 0
+            weighted_sq_sum = 0.0
+            uncertainty_missing = False
+
+            for w_index in range(n_windows):
+                row = data[(w_index * n_regions + r_index) * n_elements + e_index]
+                total += row["total"]
+                available += row["available"]
+                observed += row["observed"]
+                interpolated += row["interpolated"]
+                row_available = row["available"]
+                if row_available > 0:
+                    available_sum += row_available
+                    row_uncertainty = row["uncertainty"]
+                    if row_uncertainty is None:
+                        uncertainty_missing = True
+                    else:
+                        weighted_sq_sum += (
+                            row_available * row_uncertainty
+                        ) ** 2
+
+            if total > 0:
+                rate = _round_output(available / total)
+                observed_rate = _round_output(observed / total)
+                interpolated_rate = _round_output(interpolated / total)
+            else:
+                rate = None
+                observed_rate = None
+                interpolated_rate = None
+
+            if available_sum == 0 or uncertainty_missing:
+                uncertainty = None
+            else:
+                uncertainty = _round_output(
+                    math.sqrt(weighted_sq_sum) / available_sum
+                )
+
+            result_data.append(
+                {
+                    "element": element,
+                    "region": region,
+                    "total": total,
+                    "available": available,
+                    "observed": observed,
+                    "interpolated": interpolated,
+                    "rate": rate,
+                    "observed_rate": observed_rate,
+                    "interpolated_rate": interpolated_rate,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _SCENARIO_COVERAGE_SUMMARY_SCHEMA,
+        "elements": list(elements),
+        "windows": coverage["windows"],
+        "regions": list(region_names),
+        "data": result_data,
+    }
