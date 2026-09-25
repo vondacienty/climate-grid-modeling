@@ -7,6 +7,12 @@ import math
 import re
 from typing import Any
 
+from .regional import (
+    _coverage_window_region,
+    _validate_regions,
+    _validate_windows,
+)
+
 _SCHEMA = "climate-grid/scenario-v1"
 _TEMPORAL_SCHEMA = "climate-grid/temporal-v1"
 _TEMPORAL_KEYS = frozenset({"schema", "times", "lats", "lons", "data"})
@@ -309,9 +315,11 @@ _ENSEMBLE_SCHEMA = "climate-grid/ensemble-v1"
 _DEFAULT_QUANTILES = [0.05, 0.5, 0.95]
 
 
-def _validate_quantiles(quantiles: Any) -> list:
+def _validate_quantiles(quantiles: Any, *, allow_none: bool = True) -> list:
     if quantiles is None:
-        return list(_DEFAULT_QUANTILES)
+        if allow_none:
+            return list(_DEFAULT_QUANTILES)
+        raise TypeError("quantiles must be a list")
     if not isinstance(quantiles, list):
         raise TypeError("quantiles must be a list")
     if len(quantiles) == 0:
@@ -547,4 +555,228 @@ def ensemble_multi(scenarios, *, quantiles=None) -> dict:
         "lons": list(lons),
         "quantiles": qs,
         "data": out_data,
+    }
+
+
+_SCENARIO_COVERAGE_SCHEMA = "climate-grid/scenario-cov-v1"
+_ENSEMBLE_MULTI_KEYS = (
+    "schema",
+    "elements",
+    "times",
+    "lats",
+    "lons",
+    "quantiles",
+    "data",
+)
+_ENSEMBLE_MULTI_SERIES_KEYS = frozenset(
+    {"values", "status", "uncertainty", "quantile_values"}
+)
+
+
+def _validate_ensemble_multi(
+    ensemble: Any,
+) -> tuple[list[str], list, list, list, list, dict]:
+    if not isinstance(ensemble, dict):
+        raise TypeError("ensemble must be a dict")
+    if tuple(ensemble.keys()) != _ENSEMBLE_MULTI_KEYS:
+        raise ValueError(
+            "ensemble must have exactly the keys schema, elements, times, "
+            "lats, lons, quantiles, data in order"
+        )
+
+    schema = ensemble["schema"]
+    if not isinstance(schema, str):
+        raise TypeError("ensemble.schema must be a str")
+    if schema != _ENSEMBLE_MULTI_SCHEMA:
+        raise ValueError(f"ensemble.schema must be {_ENSEMBLE_MULTI_SCHEMA!r}")
+
+    elements = ensemble["elements"]
+    if not isinstance(elements, list):
+        raise TypeError("ensemble.elements must be a list")
+    if len(elements) == 0:
+        raise ValueError("ensemble.elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"ensemble.elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"ensemble.elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate ensemble element: {element!r}")
+        seen_elements.add(element)
+
+    times = ensemble["times"]
+    if not isinstance(times, list):
+        raise TypeError("ensemble.times must be a list")
+    if len(times) == 0:
+        raise ValueError("ensemble.times must be non-empty")
+    days = [
+        _parse_date(value, f"ensemble.times[{index}]")
+        for index, value in enumerate(times)
+    ]
+    for index in range(1, len(days)):
+        if (days[index] - days[index - 1]).days != 1:
+            raise ValueError(
+                "ensemble.times must be strictly increasing consecutive days"
+            )
+
+    lats = ensemble["lats"]
+    lons = ensemble["lons"]
+    _validate_axis(lats, "ensemble.lats")
+    _validate_axis(lons, "ensemble.lons")
+
+    quantiles = _validate_quantiles(ensemble["quantiles"], allow_none=False)
+
+    data = ensemble["data"]
+    if not isinstance(data, dict):
+        raise TypeError("ensemble.data must be a dict")
+    if len(data) == 0:
+        raise ValueError("ensemble.data must be non-empty")
+    if list(data.keys()) != elements:
+        raise ValueError(
+            "ensemble.data keys must match ensemble.elements exactly and in order"
+        )
+
+    n_times = len(times)
+    n_lat = len(lats)
+    n_lon = len(lons)
+    for element in elements:
+        where = f"ensemble.data[{element!r}]"
+        series = data[element]
+        if not isinstance(series, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(series.keys()) != _ENSEMBLE_MULTI_SERIES_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys values, status, "
+                "uncertainty, quantile_values"
+            )
+        _validate_series(series, n_times, n_lat, n_lon, where)
+        quantile_values = series["quantile_values"]
+        if not isinstance(quantile_values, list):
+            raise TypeError(f"{where}.quantile_values must be a list")
+        if len(quantile_values) != len(quantiles):
+            raise ValueError(
+                f"{where}.quantile_values must have {len(quantiles)} frames "
+                "(one per quantile)"
+            )
+        for q_index, frame in enumerate(quantile_values):
+            frame_where = f"{where}.quantile_values[{q_index}]"
+            if not isinstance(frame, list):
+                raise TypeError(f"{frame_where} must be a list")
+            if len(frame) != n_times:
+                raise ValueError(
+                    f"{frame_where} must have {n_times} frames (one per time)"
+                )
+            for t, row in enumerate(frame):
+                row_where = f"{frame_where}[{t}]"
+                if not isinstance(row, list):
+                    raise TypeError(f"{row_where} must be a list")
+                if len(row) != n_lat:
+                    raise ValueError(
+                        f"{row_where} must have {n_lat} rows (one per lat)"
+                    )
+                for i, cells in enumerate(row):
+                    cells_where = f"{row_where}[{i}]"
+                    if not isinstance(cells, list):
+                        raise TypeError(f"{cells_where} must be a list")
+                    if len(cells) != n_lon:
+                        raise ValueError(
+                            f"{cells_where} must have {n_lon} cells (one per lon)"
+                        )
+                    for j, cell in enumerate(cells):
+                        target = f"{cells_where}[{j}]"
+                        _validate_number(cell, target, nullable=True)
+                        if (cell is None) != (
+                            series["status"][t][i][j] == "missing"
+                        ):
+                            raise ValueError(
+                                f"{target}: quantile cells must be None exactly "
+                                "where the cell status is missing"
+                            )
+
+    return elements, times, lats, lons, quantiles, data
+
+
+def coverage_multi(
+    ensemble, regions, windows, *, min_count: int = 1
+) -> dict:
+    """Aggregate an ensemble-multi grid into per-window coverage stats.
+
+    ``ensemble`` must be an :func:`ensemble_multi` result (schema
+    ``climate-grid/ensemble-multi-v1``) with exactly the keys ``schema,
+    elements, times, lats, lons, quantiles, data`` in that order; every
+    member is validated against the ensemble-multi contract, including the
+    nested ``[quantile][time][lat][lon]`` quantile frames (finite non-bool
+    numbers or ``None``).  ``regions``, ``windows`` and ``min_count`` follow
+    :func:`climate_grid.regional.aggregate_window` exactly: region
+    ``cells`` are checked against the ensemble grid and window
+    ``start``/``end`` must occur in ``ensemble.times``.
+
+    For every window (in window order), region (in region order) and
+    element (in ensemble element order), the closed calendar interval is
+    swept as a grid: ``total`` is the number of days in the inclusive
+    interval times the number of cells in the region.  ``available``
+    counts non-``missing`` cells, split into ``observed`` and
+    ``interpolated``; all four counts are ints.  When ``available`` is
+    below ``min_count``, ``rate``, ``observed_rate``,
+    ``interpolated_rate`` and ``uncertainty`` are all ``None``.
+    Otherwise the three rates are ``available / total``, ``observed /
+    total`` and ``interpolated / total`` and ``uncertainty`` is
+    ``sqrt(sum(u ** 2)) / available`` over the available cells'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is ``climate-grid/scenario-cov-v1``,
+    ``elements`` and ``windows`` echo the arguments (``elements`` taken
+    from the ensemble) and ``regions`` lists the region names in input
+    order.  ``data`` is a flat list of rows in
+    window-then-region-then-element order; each row uses the key order
+    ``window, region, element, total, available, observed, interpolated,
+    rate, observed_rate, interpolated_rate, uncertainty``.  The four
+    counts are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _quantiles, data = _validate_ensemble_multi(
+        ensemble
+    )
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _coverage_window_region(
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _SCENARIO_COVERAGE_SCHEMA,
+        "elements": list(elements),
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
     }
