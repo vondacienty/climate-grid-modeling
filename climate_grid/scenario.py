@@ -62,61 +62,63 @@ def _validate_number(cell: Any, target: str, *, nullable: bool) -> None:
         raise ValueError(f"{target} must be finite")
 
 
-def _validate_temporal(temporal: Any) -> tuple[list[str], list, list, dict]:
+def _validate_temporal(
+    temporal: Any, *, schema: str = _TEMPORAL_SCHEMA, where: str = "temporal"
+) -> tuple[list[str], list, list, dict]:
     if not isinstance(temporal, dict):
-        raise TypeError("temporal must be a dict")
+        raise TypeError(f"{where} must be a dict")
     if set(temporal.keys()) != _TEMPORAL_KEYS:
         raise ValueError(
-            "temporal must have exactly the keys schema, times, lats, lons, data"
+            f"{where} must have exactly the keys schema, times, lats, lons, data"
         )
     if not isinstance(temporal["schema"], str):
-        raise TypeError("temporal.schema must be a str")
-    if temporal["schema"] != _TEMPORAL_SCHEMA:
-        raise ValueError(f"temporal.schema must be {_TEMPORAL_SCHEMA!r}")
+        raise TypeError(f"{where}.schema must be a str")
+    if temporal["schema"] != schema:
+        raise ValueError(f"{where}.schema must be {schema!r}")
 
     times = temporal["times"]
     if not isinstance(times, list):
-        raise TypeError("temporal.times must be a list")
+        raise TypeError(f"{where}.times must be a list")
     if len(times) == 0:
-        raise ValueError("temporal.times must be non-empty")
+        raise ValueError(f"{where}.times must be non-empty")
     days = [
-        _parse_date(value, f"temporal.times[{index}]")
+        _parse_date(value, f"{where}.times[{index}]")
         for index, value in enumerate(times)
     ]
     for index in range(1, len(days)):
         if (days[index] - days[index - 1]).days != 1:
             raise ValueError(
-                "temporal.times must be strictly increasing consecutive days"
+                f"{where}.times must be strictly increasing consecutive days"
             )
 
     lats = temporal["lats"]
     lons = temporal["lons"]
-    _validate_axis(lats, "temporal.lats")
-    _validate_axis(lons, "temporal.lons")
+    _validate_axis(lats, f"{where}.lats")
+    _validate_axis(lons, f"{where}.lons")
 
     data = temporal["data"]
     if not isinstance(data, dict):
-        raise TypeError("temporal.data must be a dict")
+        raise TypeError(f"{where}.data must be a dict")
     if len(data) == 0:
-        raise ValueError("temporal.data must be non-empty")
+        raise ValueError(f"{where}.data must be non-empty")
 
     n_times = len(times)
     n_lat = len(lats)
     n_lon = len(lons)
     for element, series in data.items():
         if not isinstance(element, str):
-            raise TypeError("temporal.data element names must be str")
+            raise TypeError(f"{where}.data element names must be str")
         if element == "":
-            raise ValueError("temporal.data element names must be non-empty")
-        where = f"temporal.data[{element!r}]"
+            raise ValueError(f"{where}.data element names must be non-empty")
+        series_where = f"{where}.data[{element!r}]"
         if not isinstance(series, dict):
-            raise TypeError(f"{where} must be a dict")
+            raise TypeError(f"{series_where} must be a dict")
         if set(series.keys()) != _SERIES_KEYS:
             raise ValueError(
-                f"{where} must have exactly the keys values, status, uncertainty"
+                f"{series_where} must have exactly the keys values, status, uncertainty"
             )
         _validate_series(
-            series, n_times, n_lat, n_lon, where
+            series, n_times, n_lat, n_lon, series_where
         )
 
     return times, lats, lons, data
@@ -300,4 +302,172 @@ def downscale(temporal, deltas, *, mode: str = "additive") -> dict:
         "lats": list(lats),
         "lons": list(lons),
         "data": out_data,
+    }
+
+
+_ENSEMBLE_SCHEMA = "climate-grid/ensemble-v1"
+_DEFAULT_QUANTILES = [0.05, 0.5, 0.95]
+
+
+def _validate_quantiles(quantiles: Any) -> list:
+    if quantiles is None:
+        return list(_DEFAULT_QUANTILES)
+    if not isinstance(quantiles, list):
+        raise TypeError("quantiles must be a list")
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must be non-empty")
+    for index, q in enumerate(quantiles):
+        if not isinstance(q, (int, float)) or isinstance(q, bool):
+            raise TypeError(
+                f"quantiles[{index}] must be a finite non-bool int or float"
+            )
+        if not math.isfinite(q):
+            raise ValueError(f"quantiles[{index}] must be finite")
+        if q < 0.0 or q > 1.0:
+            raise ValueError(f"quantiles[{index}] must be between 0 and 1")
+    for index in range(1, len(quantiles)):
+        if quantiles[index] <= quantiles[index - 1]:
+            raise ValueError("quantiles must be strictly increasing")
+    return list(quantiles)
+
+
+def ensemble(scenarios, element, *, quantiles=None) -> dict:
+    """Combine scenario-v1 downscale results into a per-cell ensemble.
+
+    ``scenarios`` is a non-empty list of :func:`downscale` results (schema
+    ``climate-grid/scenario-v1``); every member is validated against that
+    contract and all members must share identical ``times``, ``lats``,
+    ``lons`` axes and the same ``data`` elements in the same order.
+    ``element`` is a non-empty str naming one of those elements.
+    ``quantiles`` is ``None`` (default ``[0.05, 0.5, 0.95]``) or a non-empty
+    list of finite non-bool numbers in ``[0, 1]``, strictly increasing.
+
+    For every ``[time][lat][lon]`` cell the non-missing ``(value,
+    uncertainty)`` samples across the scenarios are combined: with no
+    samples the cell gets ``values=None``, ``status="missing"`` and
+    ``uncertainty=None``; otherwise ``values`` is the sample mean
+    ``Σv / n``, ``status`` is ``"observed"`` when every sample is observed
+    and ``"interpolated"`` otherwise, and ``uncertainty`` is
+    ``√(Σu²) / n``.  Each requested quantile is computed from the ascending
+    sample values by linear interpolation on the position ``h = (n - 1) q``.
+
+    The returned mapping uses the key order ``schema, element, times, lats,
+    lons, quantiles, values, status, uncertainty, quantile_values``;
+    ``schema`` is ``climate-grid/ensemble-v1`` and the axes are carried over
+    from the scenarios.  ``values``, ``status`` and ``uncertainty`` are
+    nested ``[time][lat][lon]`` lists; ``quantile_values`` is nested
+    ``[quantile][time][lat][lon]`` with ``None`` for sample-less cells.
+    Every computed output number is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(scenarios, list):
+        raise TypeError("scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError("scenarios must be non-empty")
+
+    validated = [
+        _validate_temporal(
+            scenario, schema=_SCHEMA, where=f"scenarios[{index}]"
+        )
+        for index, scenario in enumerate(scenarios)
+    ]
+    times, lats, lons, data = validated[0]
+    elements = list(data.keys())
+    for index in range(1, len(validated)):
+        other_times, other_lats, other_lons, other_data = validated[index]
+        if other_times != times or other_lats != lats or other_lons != lons:
+            raise ValueError(
+                "all scenarios must share identical times, lats and lons"
+            )
+        if list(other_data.keys()) != elements:
+            raise ValueError(
+                "all scenarios must have the same data elements in the same order"
+            )
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in data:
+        raise ValueError(f"element {element!r} is not present in the scenarios")
+
+    qs = _validate_quantiles(quantiles)
+
+    n_times = len(times)
+    n_lat = len(lats)
+    n_lon = len(lons)
+    series_list = [member[3][element] for member in validated]
+
+    out_values = [
+        [[None for _ in range(n_lon)] for _ in range(n_lat)]
+        for _ in range(n_times)
+    ]
+    out_status = [
+        [[None for _ in range(n_lon)] for _ in range(n_lat)]
+        for _ in range(n_times)
+    ]
+    out_uncertainty = [
+        [[None for _ in range(n_lon)] for _ in range(n_lat)]
+        for _ in range(n_times)
+    ]
+    out_quantiles = [
+        [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        for _ in qs
+    ]
+
+    for t in range(n_times):
+        for i in range(n_lat):
+            for j in range(n_lon):
+                samples = [
+                    (
+                        series["values"][t][i][j],
+                        series["uncertainty"][t][i][j],
+                        series["status"][t][i][j],
+                    )
+                    for series in series_list
+                    if series["status"][t][i][j] != "missing"
+                ]
+                if not samples:
+                    out_status[t][i][j] = "missing"
+                    continue
+                n = len(samples)
+                out_values[t][i][j] = _round_output(
+                    sum(sample[0] for sample in samples) / n
+                )
+                out_status[t][i][j] = (
+                    "observed"
+                    if all(sample[2] == "observed" for sample in samples)
+                    else "interpolated"
+                )
+                out_uncertainty[t][i][j] = _round_output(
+                    math.sqrt(sum(sample[1] ** 2 for sample in samples)) / n
+                )
+                ordered = sorted(sample[0] for sample in samples)
+                for q_index, q in enumerate(qs):
+                    h = (n - 1) * q
+                    lower = int(math.floor(h))
+                    upper = min(lower + 1, n - 1)
+                    fraction = h - lower
+                    interpolated = ordered[lower] + (
+                        ordered[upper] - ordered[lower]
+                    ) * fraction
+                    out_quantiles[q_index][t][i][j] = _round_output(interpolated)
+
+    return {
+        "schema": _ENSEMBLE_SCHEMA,
+        "element": element,
+        "times": list(times),
+        "lats": list(lats),
+        "lons": list(lons),
+        "quantiles": qs,
+        "values": out_values,
+        "status": out_status,
+        "uncertainty": out_uncertainty,
+        "quantile_values": out_quantiles,
     }
