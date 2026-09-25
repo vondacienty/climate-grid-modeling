@@ -2843,3 +2843,71 @@ def aggregate_value_delta_exceedance_summary(exceedance) -> dict:
         "regions": list(regions),
         "data": result_data,
     }
+
+
+_EXCEED_BATCH_SCHEMA = "climate-grid/exceed-batch-v1"
+
+
+def batch_exceed(delta, regions, windows, thresholds, *, min_count: int = 1) -> dict:
+    """Summarize exceedance stats for a batch of thresholds.
+
+    ``delta``, ``regions``, ``windows`` and ``min_count`` follow
+    :func:`aggregate_value_delta_exceedance` exactly.  ``thresholds`` must
+    be a non-empty, strictly increasing list of finite non-bool int/float
+    items; a non-list or a wrong item type raises ``TypeError`` while an
+    empty list, a non-finite item or a non-increasing sequence raises
+    ``ValueError``.
+
+    For every threshold ``t`` (in ``thresholds`` order) the per-threshold
+    summary is exactly
+    ``aggregate_value_delta_exceedance_summary(aggregate_value_delta_exceedance(delta, regions, windows, t, min_count=min_count))``.
+
+    The returned mapping uses the key order ``schema, elements, thresholds,
+    windows, regions, data``; ``schema`` is ``climate-grid/exceed-batch-v1``,
+    ``elements`` follows the delta element order, ``thresholds`` and
+    ``windows`` echo the arguments as-is and ``regions`` lists the region
+    names in input order.  ``data`` is a flat list of rows in
+    threshold-then-element-then-region order; each row uses the key order
+    ``threshold, element, region, count, exceed, rate, mean_excess,
+    uncertainty`` where ``threshold`` is ``t`` and the remaining values are
+    copied from the corresponding summary row.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    _validate_axis(thresholds, "thresholds")
+
+    elements: list[str] = []
+    region_names: list[str] = []
+    result_data = []
+    for threshold in thresholds:
+        summary = aggregate_value_delta_exceedance_summary(
+            aggregate_value_delta_exceedance(
+                delta, regions, windows, threshold, min_count=min_count
+            )
+        )
+        if not elements:
+            elements = summary["elements"]
+            region_names = summary["regions"]
+        for row in summary["data"]:
+            result_data.append(
+                {
+                    "threshold": threshold,
+                    "element": row["element"],
+                    "region": row["region"],
+                    "count": row["count"],
+                    "exceed": row["exceed"],
+                    "rate": row["rate"],
+                    "mean_excess": row["mean_excess"],
+                    "uncertainty": row["uncertainty"],
+                }
+            )
+
+    return {
+        "schema": _EXCEED_BATCH_SCHEMA,
+        "elements": elements,
+        "thresholds": thresholds,
+        "windows": windows,
+        "regions": region_names,
+        "data": result_data,
+    }
