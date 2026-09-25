@@ -3983,3 +3983,308 @@ def rank_stability(summary, *, min_count: int = 1) -> dict:
         "quantiles": summary["quantiles"],
         "data": result_data,
     }
+
+
+_QSHIFT_RANK_STABILITY_KEYS = (
+    "schema",
+    "reference",
+    "scenarios",
+    "elements",
+    "quantiles",
+    "data",
+)
+_QSHIFT_RANK_STABILITY_ROW_KEYS = (
+    "element",
+    "scenario",
+    "rank_count",
+    "mean_rank",
+    "best_rank",
+    "worst_rank",
+    "uncertainty",
+)
+_COMPOSITE_RANK_SCHEMA = "climate-grid/crank-v1"
+
+
+def _validate_rank_stability(
+    stability: Any, *, where: str = "stability"
+) -> tuple[str, list[str], list[str], list, list]:
+    if not isinstance(stability, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(stability.keys()) != _QSHIFT_RANK_STABILITY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, scenarios, "
+            "elements, quantiles, data in order"
+        )
+
+    schema = stability["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _QSHIFT_RANK_STABILITY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_QSHIFT_RANK_STABILITY_SCHEMA!r}"
+        )
+
+    reference = stability["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = stability["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where}.scenarios[{index}] must be a str")
+        if scenario == "":
+            raise ValueError(f"{where}.scenarios[{index}] must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where}.scenarios entry: {scenario!r}")
+        seen_scenarios.add(scenario)
+    if reference in seen_scenarios:
+        raise ValueError(f"{where}.reference must not appear in {where}.scenarios")
+
+    elements = stability["elements"]
+    if not isinstance(elements, list):
+        raise TypeError(f"{where}.elements must be a list")
+    if len(elements) == 0:
+        raise ValueError(f"{where}.elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"{where}.elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate {where}.elements entry: {element!r}")
+        seen_elements.add(element)
+
+    quantiles = _regional_validate_quantiles(stability["quantiles"])
+
+    data = stability["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    n_scenarios = len(scenarios)
+    n_elements = len(elements)
+    n_quantiles = len(quantiles)
+    expected_rows = n_elements * n_scenarios
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows "
+            "(one per element/scenario combination, in "
+            "element-then-scenario order)"
+        )
+
+    row_index = 0
+    for element in elements:
+        for scenario in scenarios:
+            target = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{target} must be a dict")
+            if tuple(row.keys()) != _QSHIFT_RANK_STABILITY_ROW_KEYS:
+                raise ValueError(
+                    f"{target} must have exactly the keys element, scenario, "
+                    "rank_count, mean_rank, best_rank, worst_rank, uncertainty "
+                    "in order"
+                )
+
+            if not isinstance(row["element"], str):
+                raise TypeError(f"{target}.element must be a str")
+            if row["element"] != element:
+                raise ValueError(
+                    f"{target}.element must be {element!r} for its "
+                    "element-then-scenario position"
+                )
+            if not isinstance(row["scenario"], str):
+                raise TypeError(f"{target}.scenario must be a str")
+            if row["scenario"] != scenario:
+                raise ValueError(
+                    f"{target}.scenario must be {scenario!r} for its "
+                    "element-then-scenario position"
+                )
+
+            rank_count = row["rank_count"]
+            if not isinstance(rank_count, int) or isinstance(rank_count, bool):
+                raise TypeError(f"{target}.rank_count must be a non-bool int")
+            if rank_count < 0 or rank_count > n_quantiles:
+                raise ValueError(
+                    f"{target}.rank_count must be between 0 and {n_quantiles}"
+                )
+
+            stat_fields = ("mean_rank", "best_rank", "worst_rank", "uncertainty")
+            none_flags = [row[name] is None for name in stat_fields]
+            if any(none_flags) and not all(none_flags):
+                raise ValueError(
+                    f"{target}: mean_rank, best_rank, worst_rank and "
+                    "uncertainty must be all None or all present"
+                )
+            if rank_count == 0:
+                if not all(none_flags):
+                    raise ValueError(
+                        f"{target}: a zero rank_count requires None mean_rank, "
+                        "best_rank, worst_rank and uncertainty"
+                    )
+            else:
+                if all(none_flags):
+                    raise ValueError(
+                        f"{target}: a positive rank_count requires present "
+                        "mean_rank, best_rank, worst_rank and uncertainty"
+                    )
+                _validate_number(
+                    row["mean_rank"], f"{target}.mean_rank", nullable=False
+                )
+                for name in ("best_rank", "worst_rank"):
+                    value = row[name]
+                    if not isinstance(value, int) or isinstance(value, bool):
+                        raise TypeError(f"{target}.{name} must be a non-bool int")
+                    if value < 1 or value > n_scenarios:
+                        raise ValueError(
+                            f"{target}.{name} must be between 1 and {n_scenarios}"
+                        )
+                if row["best_rank"] > row["worst_rank"]:
+                    raise ValueError(
+                        f"{target}.best_rank must not exceed worst_rank"
+                    )
+                if not row["best_rank"] <= row["mean_rank"] <= row["worst_rank"]:
+                    raise ValueError(
+                        f"{target}.mean_rank must lie between best_rank and "
+                        "worst_rank"
+                    )
+                _validate_number(
+                    row["uncertainty"], f"{target}.uncertainty", nullable=False
+                )
+                if row["uncertainty"] < 0:
+                    raise ValueError(
+                        f"{target}.uncertainty must be non-negative"
+                    )
+
+            row_index += 1
+
+    return reference, scenarios, elements, quantiles, data
+
+
+def composite_rank(stability, weights, *, min_elements: int = 1) -> dict:
+    """Combine per-element rank stability stats into a composite ranking.
+
+    ``stability`` must be a complete :func:`rank_stability` result (schema
+    ``climate-grid/qshift-rank-stability-v1``) with exactly the keys
+    ``schema, reference, scenarios, elements, quantiles, data`` in that
+    order; every member is validated against that contract, including the
+    flat element-then-scenario ``data`` row order, each row's key order
+    ``element, scenario, rank_count, mean_rank, best_rank, worst_rank,
+    uncertainty`` and the rank invariants (``rank_count`` is a non-bool int
+    between 0 and the number of quantiles; a zero ``rank_count`` requires
+    the four stats to be ``None`` and a positive one requires them all
+    present, with ``best_rank``/``worst_rank`` non-bool ints between 1 and
+    the number of scenarios bracketing ``mean_rank`` and a non-negative
+    ``uncertainty``).  ``weights`` is a list with one item per
+    ``stability.elements`` entry, in element order; each item must be a
+    finite non-bool non-negative number.  Zero weights do not participate
+    and do not count towards ``covered``; an all-zero ``weights`` list is
+    allowed.  ``min_elements`` must be a non-bool positive int.
+
+    For every scenario (in scenario order) the participating rows are those
+    whose element weight is positive and whose ``rank_count`` is positive;
+    ``covered`` is the number of participating rows.  When ``covered`` is
+    below ``min_elements``, ``mean``, ``best``, ``worst``, ``u`` and
+    ``rank`` are all ``None``.  Otherwise, with ``W`` the sum of the
+    participating weights, ``mean`` is ``sum(w * mean_rank) / W``, ``best``
+    is the minimum ``best_rank``, ``worst`` is the maximum ``worst_rank``
+    and ``u`` is ``sqrt(sum((w * uncertainty) ** 2)) / W`` over the
+    participating rows.
+
+    The scenarios are then ranked by ascending ``mean`` with ties keeping
+    the original ``scenarios`` order; ``rank`` runs consecutively from 1.
+    Scenarios below ``min_elements`` follow the ranked ones in their
+    original scenario order.
+
+    The returned mapping uses the key order ``schema, scenarios, data``;
+    ``schema`` is ``climate-grid/crank-v1`` and ``scenarios`` echoes the
+    stability scenarios.  Each ``data`` row uses the key order ``scenario,
+    covered, mean, best, worst, u, rank``; ``covered``, ``best``, ``worst``
+    and ``rank`` are ints (or ``None``) and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    _reference, scenarios, elements, _quantiles, data = _validate_rank_stability(
+        stability
+    )
+
+    if not isinstance(weights, list):
+        raise TypeError("weights must be a list")
+    if len(weights) != len(elements):
+        raise ValueError("weights must have one item per stability element")
+    for index, weight in enumerate(weights):
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise TypeError(
+                f"weights[{index}] must be a finite non-bool int or float"
+            )
+        if not math.isfinite(weight):
+            raise ValueError(f"weights[{index}] must be finite")
+        if weight < 0:
+            raise ValueError(f"weights[{index}] must be non-negative")
+
+    if not isinstance(min_elements, int) or isinstance(min_elements, bool):
+        raise TypeError("min_elements must be a non-bool int")
+    if min_elements < 1:
+        raise ValueError("min_elements must be positive")
+
+    n_scenarios = len(scenarios)
+    n_elements = len(elements)
+
+    ranked = []
+    below = []
+    for s_index, scenario in enumerate(scenarios):
+        participating = [
+            (weights[e_index], data[e_index * n_scenarios + s_index])
+            for e_index in range(n_elements)
+            if weights[e_index] > 0
+            and data[e_index * n_scenarios + s_index]["rank_count"] > 0
+        ]
+        covered = len(participating)
+        row = {"scenario": scenario, "covered": covered}
+        if covered < min_elements:
+            row.update(
+                {"mean": None, "best": None, "worst": None, "u": None, "rank": None}
+            )
+            below.append(row)
+            continue
+        total_weight = sum(weight for weight, _row in participating)
+        row["mean"] = _round_output(
+            sum(weight * item["mean_rank"] for weight, item in participating)
+            / total_weight
+        )
+        row["best"] = min(item["best_rank"] for _weight, item in participating)
+        row["worst"] = max(item["worst_rank"] for _weight, item in participating)
+        row["u"] = _round_output(
+            math.sqrt(
+                sum(
+                    (weight * item["uncertainty"]) ** 2
+                    for weight, item in participating
+                )
+            )
+            / total_weight
+        )
+        ranked.append(row)
+
+    # The sort is stable, so ties keep the original scenarios order.
+    ranked.sort(key=lambda item: item["mean"])
+    result_data = []
+    for rank, row in enumerate(ranked, start=1):
+        row["rank"] = rank
+        result_data.append(row)
+    result_data.extend(below)
+
+    return {
+        "schema": _COMPOSITE_RANK_SCHEMA,
+        "scenarios": list(scenarios),
+        "data": result_data,
+    }
