@@ -3855,3 +3855,133 @@ def rank_quantile_shift(summary, quantile, *, min_count: int = 1) -> dict:
         "quantile": quantile,
         "data": result_data,
     }
+
+
+_QSHIFT_RANK_STABILITY_SCHEMA = "climate-grid/qshift-rank-stability-v1"
+_QSHIFT_RANK_STABILITY_ROW_KEYS = (
+    "element",
+    "scenario",
+    "rank_count",
+    "mean_rank",
+    "best_rank",
+    "worst_rank",
+    "uncertainty",
+)
+
+
+def rank_stability(summary, *, min_count: int = 1) -> dict:
+    """Summarize per-scenario rank stability across quantiles of a qshift summary.
+
+    ``summary`` must be a complete :func:`quantile_shift_summary` result
+    (schema ``climate-grid/qshift-summary-v1``) with exactly the keys
+    ``schema, reference, scenarios, elements, quantiles, windows, regions,
+    data`` in that order; every member is validated against that contract,
+    including the flat scenario-then-element ``data`` row order, each row's
+    key order ``scenario, element, count, quantiles, uncertainty`` and the
+    count / quantile invariants (a row's ``quantiles`` are all ``None`` or
+    all finite non-bool numbers, ``uncertainty`` is ``None`` exactly when
+    the quantiles are, and a zero ``count`` requires the ``None`` form).
+    ``min_count`` must be a non-bool positive int.
+
+    For every element (in element order) and quantile (in quantile order),
+    a scenario is eligible for that quantile when its summary row has
+    ``count >= min_count`` and both the quantile value and the row
+    ``uncertainty`` are not ``None``.  The eligible scenarios are ranked by
+    descending quantile value with ties keeping the original ``scenarios``
+    order; ranks run consecutively from 1.
+
+    Rows are then aggregated per element (in element order) and scenario
+    (in the original scenario order): ``rank_count`` is the number of
+    quantiles at which the scenario was eligible.  With ``rank_count`` of
+    zero, ``mean_rank``, ``best_rank``, ``worst_rank`` and ``uncertainty``
+    are all ``None``.  Otherwise ``mean_rank``, ``best_rank`` and
+    ``worst_rank`` are the mean, minimum and maximum of the scenario's
+    ranks, and ``uncertainty`` is ``sqrt(sum(u ** 2)) / rank_count`` where
+    ``u`` is the summary row's ``uncertainty`` counted once per eligible
+    quantile.
+
+    The returned mapping uses the key order ``schema, reference, scenarios,
+    elements, quantiles, data``; ``schema`` is
+    ``climate-grid/qshift-rank-stability-v1`` and ``reference``,
+    ``scenarios``, ``elements`` and ``quantiles`` echo the summary.
+    ``data`` is a flat list of rows in element-then-scenario order; each
+    row uses the key order ``element, scenario, rank_count, mean_rank,
+    best_rank, worst_rank, uncertainty``.  ``rank_count``, ``best_rank``
+    and ``worst_rank`` are ints (or ``None``) and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    reference, scenarios, elements, quantiles, data = (
+        _validate_qshift_summary(summary)
+    )
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    n_elements = len(elements)
+    n_scenarios = len(scenarios)
+
+    result_data = []
+    for e_index, element in enumerate(elements):
+        rows = [
+            data[s_index * n_elements + e_index]
+            for s_index in range(n_scenarios)
+        ]
+        # ranks[s] collects the ranks scenario s earns, one per quantile.
+        ranks_by_scenario: list[list[int]] = [[] for _ in range(n_scenarios)]
+        for q_index in range(len(quantiles)):
+            eligible = []
+            for s_index, row in enumerate(rows):
+                value = row["quantiles"][q_index]
+                if (
+                    row["count"] >= min_count
+                    and value is not None
+                    and row["uncertainty"] is not None
+                ):
+                    eligible.append((s_index, value))
+            eligible.sort(key=lambda pair: pair[1], reverse=True)
+            for rank, (s_index, _value) in enumerate(eligible, start=1):
+                ranks_by_scenario[s_index].append(rank)
+
+        for s_index, row in enumerate(rows):
+            ranks = ranks_by_scenario[s_index]
+            rank_count = len(ranks)
+            if rank_count == 0:
+                mean_rank = None
+                best_rank = None
+                worst_rank = None
+                uncertainty = None
+            else:
+                mean_rank = _round_output(sum(ranks) / rank_count)
+                best_rank = min(ranks)
+                worst_rank = max(ranks)
+                u = row["uncertainty"]
+                uncertainty = _round_output(
+                    math.sqrt(rank_count * u ** 2) / rank_count
+                )
+
+            result_data.append(
+                {
+                    "element": element,
+                    "scenario": row["scenario"],
+                    "rank_count": rank_count,
+                    "mean_rank": mean_rank,
+                    "best_rank": best_rank,
+                    "worst_rank": worst_rank,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _QSHIFT_RANK_STABILITY_SCHEMA,
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "quantiles": summary["quantiles"],
+        "data": result_data,
+    }
