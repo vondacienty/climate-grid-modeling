@@ -1501,3 +1501,248 @@ def coverage_delta_multi(left, right) -> dict:
         "regions": list(left_regions),
         "data": result_data,
     }
+
+
+_SCENARIO_COVERAGE_DELTA_SUMMARY_MULTI_SCHEMA = (
+    "climate-grid/scenario-cov-delta-summary-multi-v1"
+)
+_SCENARIO_COVERAGE_DELTA_SUMMARY_MULTI_ROW_KEYS = (
+    "element",
+    "region",
+    "total_delta",
+    "available_delta",
+    "observed_delta",
+    "interpolated_delta",
+    "rate_delta",
+    "observed_rate_delta",
+    "interpolated_rate_delta",
+    "uncertainty",
+)
+
+
+def _validate_coverage_delta_multi(
+    delta: Any, *, where: str = "delta"
+) -> tuple[list[str], list, list[str], list]:
+    if not isinstance(delta, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(delta.keys()) != _SCENARIO_COVERAGE_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, elements, windows, "
+            "regions, data in order"
+        )
+
+    schema = delta["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _SCENARIO_COVERAGE_DELTA_MULTI_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_SCENARIO_COVERAGE_DELTA_MULTI_SCHEMA!r}"
+        )
+
+    elements = delta["elements"]
+    if not isinstance(elements, list):
+        raise TypeError(f"{where}.elements must be a list")
+    if len(elements) == 0:
+        raise ValueError(f"{where}.elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"{where}.elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate {where} element: {element!r}")
+        seen_elements.add(element)
+
+    windows = _validate_coverage_windows(
+        delta["windows"], prefix=f"{where}.windows"
+    )
+
+    regions = delta["regions"]
+    if not isinstance(regions, list):
+        raise TypeError(f"{where}.regions must be a list")
+    if len(regions) == 0:
+        raise ValueError(f"{where}.regions must be non-empty")
+    seen_regions: set[str] = set()
+    for index, region in enumerate(regions):
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.regions[{index}] must be a str")
+        if region == "":
+            raise ValueError(f"{where}.regions[{index}] must be non-empty")
+        if region in seen_regions:
+            raise ValueError(f"duplicate {where} region: {region!r}")
+        seen_regions.add(region)
+
+    data = delta["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+    expected_rows = n_windows * n_regions * n_elements
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows "
+            "(one per window/region/element combination, in "
+            "window-then-region-then-element order)"
+        )
+
+    row_index = 0
+    for window in windows:
+        for region in regions:
+            for element in elements:
+                target = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{target} must be a dict")
+                if tuple(row.keys()) != _SCENARIO_COVERAGE_DELTA_MULTI_ROW_KEYS:
+                    raise ValueError(
+                        f"{target} must have exactly the keys window, region, "
+                        "element, total_delta, available_delta, observed_delta, "
+                        "interpolated_delta, rate_delta, observed_rate_delta, "
+                        "interpolated_rate_delta, uncertainty in order"
+                    )
+
+                if not isinstance(row["window"], str):
+                    raise TypeError(f"{target}.window must be a str")
+                if row["window"] != window["name"]:
+                    raise ValueError(
+                        f"{target}.window must be {window['name']!r} for its "
+                        "window-then-region-then-element position"
+                    )
+                if not isinstance(row["region"], str):
+                    raise TypeError(f"{target}.region must be a str")
+                if row["region"] != region:
+                    raise ValueError(
+                        f"{target}.region must be {region!r} for its "
+                        "window-then-region-then-element position"
+                    )
+                if not isinstance(row["element"], str):
+                    raise TypeError(f"{target}.element must be a str")
+                if row["element"] != element:
+                    raise ValueError(
+                        f"{target}.element must be {element!r} for its "
+                        "window-then-region-then-element position"
+                    )
+
+                for count_name in (
+                    "total_delta",
+                    "available_delta",
+                    "observed_delta",
+                    "interpolated_delta",
+                ):
+                    count = row[count_name]
+                    if not isinstance(count, int) or isinstance(count, bool):
+                        raise TypeError(
+                            f"{target}.{count_name} must be a non-bool int"
+                        )
+
+                for name in (
+                    "rate_delta",
+                    "observed_rate_delta",
+                    "interpolated_rate_delta",
+                    "uncertainty",
+                ):
+                    _validate_number(row[name], f"{target}.{name}", nullable=True)
+
+                row_index += 1
+
+    return elements, windows, regions, data
+
+
+def coverage_delta_multi_summary(delta) -> dict:
+    """Summarize a per-window coverage delta result across all windows.
+
+    ``delta`` must be a complete :func:`coverage_delta_multi` result (schema
+    ``climate-grid/scenario-cov-delta-multi-v1``) with exactly the keys
+    ``schema, elements, windows, regions, data`` in that order; every member
+    is validated against that contract, including the flat
+    window-then-region-then-element ``data`` row order, each row's key order
+    ``window, region, element, total_delta, available_delta, observed_delta,
+    interpolated_delta, rate_delta, observed_rate_delta,
+    interpolated_rate_delta, uncertainty`` and the type / finiteness of every
+    value.
+
+    Rows are aggregated across all windows, in element order and then region
+    order.  The four count deltas are summed as ints.  Each rate delta is
+    the sum of the per-window rate deltas when every window's value is not
+    ``None`` and ``None`` otherwise.  ``uncertainty`` is
+    ``sqrt(sum(u ** 2))`` over the windows when every window's uncertainty
+    is not ``None`` and ``None`` otherwise.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is
+    ``climate-grid/scenario-cov-delta-summary-multi-v1`` and ``elements``,
+    ``windows`` and ``regions`` echo the delta arrays.  Each ``data`` row
+    uses the key order ``element, region, total_delta, available_delta,
+    observed_delta, interpolated_delta, rate_delta, observed_rate_delta,
+    interpolated_rate_delta, uncertainty``; the count deltas are ints and
+    every output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, windows, regions, data = _validate_coverage_delta_multi(delta)
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+
+    result_data = []
+    for e_index, element in enumerate(elements):
+        for r_index, region in enumerate(regions):
+            rows = [
+                data[w_index * n_regions * n_elements + r_index * n_elements + e_index]
+                for w_index in range(n_windows)
+            ]
+
+            rate_deltas = {}
+            for name in (
+                "rate_delta",
+                "observed_rate_delta",
+                "interpolated_rate_delta",
+            ):
+                if any(row[name] is None for row in rows):
+                    rate_deltas[name] = None
+                else:
+                    rate_deltas[name] = _round_output(
+                        sum(row[name] for row in rows)
+                    )
+
+            if any(row["uncertainty"] is None for row in rows):
+                uncertainty = None
+            else:
+                uncertainty = _round_output(
+                    math.sqrt(sum(row["uncertainty"] ** 2 for row in rows))
+                )
+
+            result_data.append(
+                {
+                    "element": element,
+                    "region": region,
+                    "total_delta": sum(row["total_delta"] for row in rows),
+                    "available_delta": sum(
+                        row["available_delta"] for row in rows
+                    ),
+                    "observed_delta": sum(row["observed_delta"] for row in rows),
+                    "interpolated_delta": sum(
+                        row["interpolated_delta"] for row in rows
+                    ),
+                    "rate_delta": rate_deltas["rate_delta"],
+                    "observed_rate_delta": rate_deltas["observed_rate_delta"],
+                    "interpolated_rate_delta": rate_deltas[
+                        "interpolated_rate_delta"
+                    ],
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _SCENARIO_COVERAGE_DELTA_SUMMARY_MULTI_SCHEMA,
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
+        "data": result_data,
+    }
