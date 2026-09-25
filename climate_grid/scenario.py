@@ -874,7 +874,10 @@ def _validate_coverage_windows(windows: Any, *, prefix: str = "coverage.windows"
 
 
 def _validate_coverage(
-    coverage: Any, *, where: str = "coverage"
+    coverage: Any,
+    *,
+    where: str = "coverage",
+    schema: str = _SCENARIO_COVERAGE_SCHEMA,
 ) -> tuple[list[str], list, list[str], list]:
     if not isinstance(coverage, dict):
         raise TypeError(f"{where} must be a dict")
@@ -884,11 +887,11 @@ def _validate_coverage(
             "regions, data in order"
         )
 
-    schema = coverage["schema"]
-    if not isinstance(schema, str):
+    schema_value = coverage["schema"]
+    if not isinstance(schema_value, str):
         raise TypeError(f"{where}.schema must be a str")
-    if schema != _SCENARIO_COVERAGE_SCHEMA:
-        raise ValueError(f"{where}.schema must be {_SCENARIO_COVERAGE_SCHEMA!r}")
+    if schema_value != schema:
+        raise ValueError(f"{where}.schema must be {schema!r}")
 
     elements = coverage["elements"]
     if not isinstance(elements, list):
@@ -2189,5 +2192,113 @@ def aggregate_value_delta_coverage(
         "elements": list(elements),
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+_ENSEMBLE_DELTA_COVERAGE_SUMMARY_SCHEMA = (
+    "climate-grid/ensemble-delta-coverage-summary-v1"
+)
+
+
+def aggregate_value_delta_coverage_summary(coverage) -> dict:
+    """Summarize an ensemble-delta coverage result across all windows.
+
+    ``coverage`` must be a complete
+    :func:`aggregate_value_delta_coverage` result (schema
+    ``climate-grid/ensemble-delta-coverage-v1``) with exactly the keys
+    ``schema, elements, windows, regions, data`` in that order; every member
+    is validated against that contract, including the flat
+    window-then-region-then-element ``data`` row order, each row's key order
+    ``window, region, element, total, available, observed, interpolated,
+    rate, observed_rate, interpolated_rate, uncertainty`` and the count /
+    rate invariants.
+
+    Rows are aggregated across all windows, in element order and then region
+    order, by summing the four counts.  When the summed ``total`` is
+    positive, ``rate``, ``observed_rate`` and ``interpolated_rate`` are the
+    summed counts over the summed total; otherwise the three rates are
+    ``None``.  The aggregated ``uncertainty`` is ``None`` when the summed
+    ``available`` is zero or any contributing row (a row with positive
+    ``available``) has an ``uncertainty`` of ``None``; otherwise it is
+    ``sqrt(sum(available * uncertainty) ** 2) / sum(available)`` over the
+    windows.
+
+    The returned mapping uses the key order ``schema, elements, windows,
+    regions, data``; ``schema`` is
+    ``climate-grid/ensemble-delta-coverage-summary-v1`` and ``elements``,
+    ``windows`` and ``regions`` echo the coverage arrays.  Each ``data`` row
+    uses the key order ``element, region, total, available, observed,
+    interpolated, rate, observed_rate, interpolated_rate, uncertainty``;
+    the counts are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, windows, regions, data = _validate_coverage(
+        coverage, schema=_ENSEMBLE_DELTA_COVERAGE_SCHEMA
+    )
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+
+    result_data = []
+    for e_index, element in enumerate(elements):
+        for r_index, region in enumerate(regions):
+            rows = [
+                data[w_index * n_regions * n_elements + r_index * n_elements + e_index]
+                for w_index in range(n_windows)
+            ]
+
+            total = sum(row["total"] for row in rows)
+            available = sum(row["available"] for row in rows)
+            observed = sum(row["observed"] for row in rows)
+            interpolated = sum(row["interpolated"] for row in rows)
+
+            if total > 0:
+                rate = _round_output(available / total)
+                observed_rate = _round_output(observed / total)
+                interpolated_rate = _round_output(interpolated / total)
+            else:
+                rate = None
+                observed_rate = None
+                interpolated_rate = None
+
+            if available == 0 or any(
+                row["available"] > 0 and row["uncertainty"] is None for row in rows
+            ):
+                uncertainty = None
+            else:
+                weighted_sq_sum = sum(
+                    (row["available"] * row["uncertainty"]) ** 2
+                    for row in rows
+                    if row["available"] > 0
+                )
+                uncertainty = _round_output(
+                    math.sqrt(weighted_sq_sum) / available
+                )
+
+            result_data.append(
+                {
+                    "element": element,
+                    "region": region,
+                    "total": total,
+                    "available": available,
+                    "observed": observed,
+                    "interpolated": interpolated,
+                    "rate": rate,
+                    "observed_rate": observed_rate,
+                    "interpolated_rate": interpolated_rate,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _ENSEMBLE_DELTA_COVERAGE_SUMMARY_SCHEMA,
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
         "data": result_data,
     }
