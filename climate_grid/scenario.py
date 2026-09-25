@@ -2911,3 +2911,134 @@ def batch_exceed(delta, regions, windows, thresholds, *, min_count: int = 1) -> 
         "regions": region_names,
         "data": result_data,
     }
+
+
+_EXCEED_COMPARE_SCHEMA = "climate-grid/exceed-compare-v1"
+_COMPARE_ITEM_KEYS = ("name", "delta")
+
+
+def compare_exceed(
+    items, regions, windows, thresholds, *, min_count: int = 1
+) -> dict:
+    """Compare exceedance batches across multiple scenario deltas.
+
+    ``items`` must be a list of at least two mappings, each with exactly the
+    keys ``name, delta`` in that order.  ``name`` is a unique non-empty str
+    labeling the scenario and ``delta`` is a complete
+    :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``); every item's delta is validated
+    against that contract and all deltas must share equal ``elements``,
+    ``times``, ``lats`` and ``lons`` arrays in the same order.  ``regions``,
+    ``windows``, ``thresholds`` and ``min_count`` follow :func:`batch_exceed`
+    exactly.
+
+    For every item, :func:`batch_exceed` is called with the item's delta and
+    the remaining arguments; the per-scenario rows are concatenated in item
+    (scenario) order, each already ordered threshold-then-element-then-region.
+
+    The returned mapping uses the key order ``schema, scenarios, elements,
+    thresholds, windows, regions, data``; ``schema`` is
+    ``climate-grid/exceed-compare-v1``, ``scenarios`` lists the item names in
+    item order, ``elements`` is taken from the first item's batch result,
+    ``thresholds`` and ``windows`` echo the arguments as-is and ``regions``
+    lists the region names in input order.  ``data`` is a flat list of rows
+    in scenario-then-threshold-then-element-then-region order; each row uses
+    the key order ``scenario, threshold, element, region, count, exceed,
+    rate, mean_excess, uncertainty`` where ``scenario`` is the item name and
+    the remaining values are copied from the corresponding
+    :func:`batch_exceed` row.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong ``items`` / item-member / argument types
+    and ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two items")
+
+    scenario_names: list[str] = []
+    validated_deltas: list = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _COMPARE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, delta in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate scenario name: {name!r}")
+        seen_names.add(name)
+
+        elements, times, lats, lons, _quantiles, _data = _validate_ensemble_multi(
+            item["delta"],
+            schema=_ENSEMBLE_DELTA_MULTI_SCHEMA,
+            where=f"{where}.delta",
+        )
+        if not validated_deltas:
+            first_elements = elements
+            first_times = times
+            first_lats = lats
+            first_lons = lons
+        else:
+            if elements != first_elements:
+                raise ValueError(
+                    "all items must have equal elements in the same order"
+                )
+            if times != first_times:
+                raise ValueError(
+                    "all items must have equal times in the same order"
+                )
+            if lats != first_lats:
+                raise ValueError(
+                    "all items must have equal lats in the same order"
+                )
+            if lons != first_lons:
+                raise ValueError(
+                    "all items must have equal lons in the same order"
+                )
+
+        scenario_names.append(name)
+        validated_deltas.append(item["delta"])
+
+    elements_out: list[str] = []
+    region_names: list[str] = []
+    result_data = []
+    for name, delta in zip(scenario_names, validated_deltas):
+        batch = batch_exceed(
+            delta, regions, windows, thresholds, min_count=min_count
+        )
+        if not elements_out:
+            elements_out = batch["elements"]
+            region_names = batch["regions"]
+        for row in batch["data"]:
+            result_data.append(
+                {
+                    "scenario": name,
+                    "threshold": row["threshold"],
+                    "element": row["element"],
+                    "region": row["region"],
+                    "count": row["count"],
+                    "exceed": row["exceed"],
+                    "rate": row["rate"],
+                    "mean_excess": row["mean_excess"],
+                    "uncertainty": row["uncertainty"],
+                }
+            )
+
+    return {
+        "schema": _EXCEED_COMPARE_SCHEMA,
+        "scenarios": scenario_names,
+        "elements": elements_out,
+        "thresholds": thresholds,
+        "windows": windows,
+        "regions": region_names,
+        "data": result_data,
+    }
