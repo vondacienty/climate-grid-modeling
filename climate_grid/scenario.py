@@ -2843,3 +2843,108 @@ def aggregate_value_delta_exceedance_summary(exceedance) -> dict:
         "regions": list(regions),
         "data": result_data,
     }
+
+_EXCEED_BATCH_SCHEMA = "climate-grid/exceed-batch-v1"
+_EXCEED_BATCH_ROW_KEYS = (
+    "threshold",
+    "element",
+    "region",
+    "count",
+    "exceed",
+    "rate",
+    "mean_excess",
+    "uncertainty",
+)
+
+
+def _validate_thresholds(thresholds: Any) -> None:
+    if not isinstance(thresholds, list):
+        raise TypeError("thresholds must be a list")
+    if len(thresholds) == 0:
+        raise ValueError("thresholds must be non-empty")
+    for index, threshold in enumerate(thresholds):
+        if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+            raise TypeError(
+                f"thresholds[{index}] must be a finite non-bool int or float"
+            )
+        if not math.isfinite(threshold):
+            raise ValueError(f"thresholds[{index}] must be finite")
+    for index in range(1, len(thresholds)):
+        if thresholds[index] <= thresholds[index - 1]:
+            raise ValueError("thresholds must be strictly increasing")
+
+
+def batch_exceed(
+    delta, regions, windows, thresholds, *, min_count: int = 1
+) -> dict:
+    """Aggregate an ensemble-delta-multi grid into threshold-batch summaries.
+
+    ``delta``, ``regions``, ``windows`` and ``min_count`` follow
+    :func:`aggregate_value_delta_exceedance` exactly (same validation,
+    exceptions and sampling).  ``thresholds`` must be a non-empty strictly
+    increasing list of finite non-bool ints or floats; a non-list argument
+    or an item of the wrong type raises ``TypeError`` while an empty list,
+    a non-finite item or a non-increasing sequence raises ``ValueError``.
+
+    For every threshold ``t`` (in thresholds order) the per-threshold
+    summary equals
+    ``aggregate_value_delta_exceedance_summary(
+    aggregate_value_delta_exceedance(delta, regions, windows, t,
+    min_count=min_count))``.
+
+    The returned mapping uses the key order ``schema, elements, thresholds,
+    windows, regions, data``; ``schema`` is ``climate-grid/exceed-batch-v1``,
+    ``elements`` echoes the delta elements in delta order, ``thresholds`` and
+    ``windows`` echo the arguments as-is and ``regions`` lists the region
+    names in name order.  ``data`` is a flat list of rows flattened in
+    threshold-then-element-then-region order; each row uses the key order
+    ``threshold, element, region, count, exceed, rate, mean_excess,
+    uncertainty`` with ``threshold`` set to ``t`` and the remaining values
+    copied from the threshold's summary rows.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _quantiles, _data = _validate_ensemble_multi(
+        delta, schema=_ENSEMBLE_DELTA_MULTI_SCHEMA, where="delta"
+    )
+    _validate_regions(regions, len(lats), len(lons))
+    _validate_windows(windows, times)
+    _validate_thresholds(thresholds)
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    summaries = []
+    for threshold in thresholds:
+        exceedance = aggregate_value_delta_exceedance(
+            delta, regions, windows, threshold, min_count=min_count
+        )
+        summary = aggregate_value_delta_exceedance_summary(exceedance)
+        summaries.append(summary)
+        for row in summary["data"]:
+            result_data.append(
+                {
+                    "threshold": threshold,
+                    "element": row["element"],
+                    "region": row["region"],
+                    "count": row["count"],
+                    "exceed": row["exceed"],
+                    "rate": row["rate"],
+                    "mean_excess": row["mean_excess"],
+                    "uncertainty": row["uncertainty"],
+                }
+            )
+
+    first_summary = summaries[0]
+    return {
+        "schema": _EXCEED_BATCH_SCHEMA,
+        "elements": list(first_summary["elements"]),
+        "thresholds": thresholds,
+        "windows": windows,
+        "regions": list(first_summary["regions"]),
+        "data": result_data,
+    }
