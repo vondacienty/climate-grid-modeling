@@ -2550,3 +2550,296 @@ def aggregate_value_delta_exceedance(
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
+
+
+_DELTA_EXCEED_SUMMARY_SCHEMA = "climate-grid/delta-exceed-summary-v1"
+_ENSEMBLE_DELTA_EXCEEDANCE_KEYS = (
+    "schema",
+    "elements",
+    "threshold",
+    "windows",
+    "regions",
+    "data",
+)
+_ENSEMBLE_DELTA_EXCEEDANCE_ROW_KEYS = (
+    "window",
+    "region",
+    "element",
+    "count",
+    "exceed",
+    "rate",
+    "mean_excess",
+    "uncertainty",
+)
+
+
+def _validate_exceedance(
+    exceedance: Any, *, where: str = "exceedance"
+) -> tuple[list[str], Any, list, list[str], list]:
+    if not isinstance(exceedance, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(exceedance.keys()) != _ENSEMBLE_DELTA_EXCEEDANCE_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, elements, threshold, "
+            "windows, regions, data in order"
+        )
+
+    schema_value = exceedance["schema"]
+    if not isinstance(schema_value, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema_value != _ENSEMBLE_DELTA_EXCEEDANCE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_ENSEMBLE_DELTA_EXCEEDANCE_SCHEMA!r}"
+        )
+
+    elements = exceedance["elements"]
+    if not isinstance(elements, list):
+        raise TypeError(f"{where}.elements must be a list")
+    if len(elements) == 0:
+        raise ValueError(f"{where}.elements must be non-empty")
+    seen_elements: set[str] = set()
+    for index, element in enumerate(elements):
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.elements[{index}] must be a str")
+        if element == "":
+            raise ValueError(f"{where}.elements[{index}] must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate {where} element: {element!r}")
+        seen_elements.add(element)
+
+    threshold = exceedance["threshold"]
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        raise TypeError(f"{where}.threshold must be a finite non-bool int or float")
+    if not math.isfinite(threshold):
+        raise ValueError(f"{where}.threshold must be finite")
+
+    windows = _validate_coverage_windows(
+        exceedance["windows"], prefix=f"{where}.windows"
+    )
+
+    regions = exceedance["regions"]
+    if not isinstance(regions, list):
+        raise TypeError(f"{where}.regions must be a list")
+    if len(regions) == 0:
+        raise ValueError(f"{where}.regions must be non-empty")
+    seen_regions: set[str] = set()
+    for index, region in enumerate(regions):
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.regions[{index}] must be a str")
+        if region == "":
+            raise ValueError(f"{where}.regions[{index}] must be non-empty")
+        if region in seen_regions:
+            raise ValueError(f"duplicate {where} region: {region!r}")
+        seen_regions.add(region)
+
+    data = exceedance["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+    expected_rows = n_windows * n_regions * n_elements
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows "
+            "(one per window/region/element combination, in "
+            "window-then-region-then-element order)"
+        )
+
+    row_index = 0
+    for window in windows:
+        for region in regions:
+            for element in elements:
+                target = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{target} must be a dict")
+                if tuple(row.keys()) != _ENSEMBLE_DELTA_EXCEEDANCE_ROW_KEYS:
+                    raise ValueError(
+                        f"{target} must have exactly the keys window, region, "
+                        "element, count, exceed, rate, mean_excess, "
+                        "uncertainty in order"
+                    )
+
+                if not isinstance(row["window"], str):
+                    raise TypeError(f"{target}.window must be a str")
+                if row["window"] != window["name"]:
+                    raise ValueError(
+                        f"{target}.window must be {window['name']!r} for its "
+                        "window-then-region-then-element position"
+                    )
+                if not isinstance(row["region"], str):
+                    raise TypeError(f"{target}.region must be a str")
+                if row["region"] != region:
+                    raise ValueError(
+                        f"{target}.region must be {region!r} for its "
+                        "window-then-region-then-element position"
+                    )
+                if not isinstance(row["element"], str):
+                    raise TypeError(f"{target}.element must be a str")
+                if row["element"] != element:
+                    raise ValueError(
+                        f"{target}.element must be {element!r} for its "
+                        "window-then-region-then-element position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{target}.count must be a non-bool int")
+                if count < 0:
+                    raise ValueError(f"{target}.count must be non-negative")
+
+                exceed = row["exceed"]
+                if exceed is not None:
+                    if not isinstance(exceed, int) or isinstance(exceed, bool):
+                        raise TypeError(
+                            f"{target}.exceed must be a non-bool int or None"
+                        )
+                    if exceed < 0:
+                        raise ValueError(f"{target}.exceed must be non-negative")
+                    if exceed > count:
+                        raise ValueError(
+                            f"{target}.exceed must not exceed count"
+                        )
+
+                stat_fields = ("rate", "mean_excess", "uncertainty")
+                stats_are_none = [row[name] is None for name in stat_fields]
+                if (exceed is None) != all(stats_are_none) or (
+                    any(stats_are_none) and not all(stats_are_none)
+                ):
+                    raise ValueError(
+                        f"{target}: exceed, rate, mean_excess and uncertainty "
+                        "must be all None or all present"
+                    )
+                if exceed is not None:
+                    if count <= 0:
+                        raise ValueError(
+                            f"{target}: present stats require a positive count"
+                        )
+                    for name in stat_fields:
+                        _validate_number(
+                            row[name], f"{target}.{name}", nullable=False
+                        )
+                    if row["rate"] != _round_output(exceed / count):
+                        raise ValueError(
+                            f"{target}.rate must equal exceed over count"
+                        )
+                    if row["mean_excess"] < 0:
+                        raise ValueError(
+                            f"{target}.mean_excess must be non-negative"
+                        )
+                    if row["uncertainty"] < 0:
+                        raise ValueError(
+                            f"{target}.uncertainty must be non-negative"
+                        )
+
+                row_index += 1
+
+    return elements, threshold, windows, regions, data
+
+
+def aggregate_value_delta_exceedance_summary(exceedance) -> dict:
+    """Summarize an ensemble-delta exceedance result across all windows.
+
+    ``exceedance`` must be a complete :func:`aggregate_value_delta_exceedance`
+    result (schema ``climate-grid/ensemble-delta-exceedance-v1``) with exactly
+    the keys ``schema, elements, threshold, windows, regions, data`` in that
+    order; every member is validated against that contract, including the
+    flat window-then-region-then-element ``data`` row order, each row's key
+    order ``window, region, element, count, exceed, rate, mean_excess,
+    uncertainty`` and the count / rate invariants.
+
+    Rows are aggregated across all windows, in element order and then region
+    order, by summing ``count``.  When the summed ``count`` is zero,
+    ``exceed`` is ``0`` and ``rate``, ``mean_excess`` and ``uncertainty``
+    are ``None``.  When the summed ``count`` is positive but any
+    contributing row (a row with positive ``count``) has an ``exceed`` or
+    any of the three stats of ``None``, ``exceed`` and the three stats are
+    all ``None``.  Otherwise ``exceed`` is the summed exceedances, ``rate``
+    is the summed ``exceed`` over the summed ``count``, ``mean_excess`` is
+    ``sum(mean_excess * count) / sum(count)`` over the windows and
+    ``uncertainty`` is ``sqrt(sum((uncertainty * count) ** 2)) /
+    sum(count)`` over the windows.
+
+    The returned mapping uses the key order ``schema, elements, threshold,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/delta-exceed-summary-v1`` and ``elements``, ``threshold``,
+    ``windows`` and ``regions`` echo the exceedance members.  Each ``data``
+    row uses the key order ``element, region, count, exceed, rate,
+    mean_excess, uncertainty``; ``count`` is an int, ``exceed`` is an int or
+    ``None`` and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, threshold, windows, regions, data = _validate_exceedance(exceedance)
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+
+    result_data = []
+    for e_index, element in enumerate(elements):
+        for r_index, region in enumerate(regions):
+            rows = [
+                data[w_index * n_regions * n_elements + r_index * n_elements + e_index]
+                for w_index in range(n_windows)
+            ]
+            contributing = [row for row in rows if row["count"] > 0]
+
+            count = sum(row["count"] for row in rows)
+            if count == 0:
+                exceed = 0
+                rate = None
+                mean_excess = None
+                uncertainty = None
+            elif any(
+                row["exceed"] is None
+                or row["rate"] is None
+                or row["mean_excess"] is None
+                or row["uncertainty"] is None
+                for row in contributing
+            ):
+                exceed = None
+                rate = None
+                mean_excess = None
+                uncertainty = None
+            else:
+                exceed = sum(row["exceed"] for row in contributing)
+                rate = _round_output(exceed / count)
+                mean_excess = _round_output(
+                    sum(row["mean_excess"] * row["count"] for row in contributing)
+                    / count
+                )
+                uncertainty = _round_output(
+                    math.sqrt(
+                        sum(
+                            (row["uncertainty"] * row["count"]) ** 2
+                            for row in contributing
+                        )
+                    )
+                    / count
+                )
+
+            result_data.append(
+                {
+                    "element": element,
+                    "region": region,
+                    "count": count,
+                    "exceed": exceed,
+                    "rate": rate,
+                    "mean_excess": mean_excess,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _DELTA_EXCEED_SUMMARY_SCHEMA,
+        "elements": list(elements),
+        "threshold": threshold,
+        "windows": windows,
+        "regions": list(regions),
+        "data": result_data,
+    }
