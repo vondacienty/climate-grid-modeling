@@ -568,99 +568,111 @@ _ENSEMBLE_MULTI_KEYS = (
     "quantiles",
     "data",
 )
-_ENSEMBLE_MULTI_SERIES_KEYS = frozenset(
-    {"values", "status", "uncertainty", "quantile_values"}
+_ENSEMBLE_DELTA_MULTI_SCHEMA = "climate-grid/ensemble-delta-multi-v1"
+_ENSEMBLE_MULTI_SERIES_KEYS = (
+    "values",
+    "status",
+    "uncertainty",
+    "quantile_values",
 )
+_ENSEMBLE_MULTI_SERIES_KEY_SET = frozenset(_ENSEMBLE_MULTI_SERIES_KEYS)
 
 
 def _validate_ensemble_multi(
     ensemble: Any,
+    *,
+    where: str = "ensemble",
 ) -> tuple[list[str], list, list, list, list, dict]:
     if not isinstance(ensemble, dict):
-        raise TypeError("ensemble must be a dict")
+        raise TypeError(f"{where} must be a dict")
     if tuple(ensemble.keys()) != _ENSEMBLE_MULTI_KEYS:
         raise ValueError(
-            "ensemble must have exactly the keys schema, elements, times, "
+            f"{where} must have exactly the keys schema, elements, times, "
             "lats, lons, quantiles, data in order"
         )
 
     schema = ensemble["schema"]
     if not isinstance(schema, str):
-        raise TypeError("ensemble.schema must be a str")
+        raise TypeError(f"{where}.schema must be a str")
     if schema != _ENSEMBLE_MULTI_SCHEMA:
-        raise ValueError(f"ensemble.schema must be {_ENSEMBLE_MULTI_SCHEMA!r}")
+        raise ValueError(f"{where}.schema must be {_ENSEMBLE_MULTI_SCHEMA!r}")
 
     elements = ensemble["elements"]
     if not isinstance(elements, list):
-        raise TypeError("ensemble.elements must be a list")
+        raise TypeError(f"{where}.elements must be a list")
     if len(elements) == 0:
-        raise ValueError("ensemble.elements must be non-empty")
+        raise ValueError(f"{where}.elements must be non-empty")
     seen_elements: set[str] = set()
     for index, element in enumerate(elements):
         if not isinstance(element, str):
-            raise TypeError(f"ensemble.elements[{index}] must be a str")
+            raise TypeError(f"{where}.elements[{index}] must be a str")
         if element == "":
-            raise ValueError(f"ensemble.elements[{index}] must be non-empty")
+            raise ValueError(f"{where}.elements[{index}] must be non-empty")
         if element in seen_elements:
-            raise ValueError(f"duplicate ensemble element: {element!r}")
+            raise ValueError(f"duplicate {where} element: {element!r}")
         seen_elements.add(element)
 
     times = ensemble["times"]
     if not isinstance(times, list):
-        raise TypeError("ensemble.times must be a list")
+        raise TypeError(f"{where}.times must be a list")
     if len(times) == 0:
-        raise ValueError("ensemble.times must be non-empty")
+        raise ValueError(f"{where}.times must be non-empty")
     days = [
-        _parse_date(value, f"ensemble.times[{index}]")
+        _parse_date(value, f"{where}.times[{index}]")
         for index, value in enumerate(times)
     ]
     for index in range(1, len(days)):
         if (days[index] - days[index - 1]).days != 1:
             raise ValueError(
-                "ensemble.times must be strictly increasing consecutive days"
+                f"{where}.times must be strictly increasing consecutive days"
             )
 
     lats = ensemble["lats"]
     lons = ensemble["lons"]
-    _validate_axis(lats, "ensemble.lats")
-    _validate_axis(lons, "ensemble.lons")
+    _validate_axis(lats, f"{where}.lats")
+    _validate_axis(lons, f"{where}.lons")
 
     quantiles = _validate_quantiles(ensemble["quantiles"], allow_none=False)
 
     data = ensemble["data"]
     if not isinstance(data, dict):
-        raise TypeError("ensemble.data must be a dict")
+        raise TypeError(f"{where}.data must be a dict")
     if len(data) == 0:
-        raise ValueError("ensemble.data must be non-empty")
+        raise ValueError(f"{where}.data must be non-empty")
     if list(data.keys()) != elements:
         raise ValueError(
-            "ensemble.data keys must match ensemble.elements exactly and in order"
+            f"{where}.data keys must match {where}.elements exactly and in order"
         )
 
     n_times = len(times)
     n_lat = len(lats)
     n_lon = len(lons)
     for element in elements:
-        where = f"ensemble.data[{element!r}]"
+        series_where = f"{where}.data[{element!r}]"
         series = data[element]
         if not isinstance(series, dict):
-            raise TypeError(f"{where} must be a dict")
-        if set(series.keys()) != _ENSEMBLE_MULTI_SERIES_KEYS:
+            raise TypeError(f"{series_where} must be a dict")
+        if set(series.keys()) != _ENSEMBLE_MULTI_SERIES_KEY_SET:
             raise ValueError(
-                f"{where} must have exactly the keys values, status, "
+                f"{series_where} must have exactly the keys values, status, "
                 "uncertainty, quantile_values"
             )
-        _validate_series(series, n_times, n_lat, n_lon, where)
+        if tuple(series.keys()) != _ENSEMBLE_MULTI_SERIES_KEYS:
+            raise ValueError(
+                f"{series_where} must have the keys values, status, "
+                "uncertainty, quantile_values in order"
+            )
+        _validate_series(series, n_times, n_lat, n_lon, series_where)
         quantile_values = series["quantile_values"]
         if not isinstance(quantile_values, list):
-            raise TypeError(f"{where}.quantile_values must be a list")
+            raise TypeError(f"{series_where}.quantile_values must be a list")
         if len(quantile_values) != len(quantiles):
             raise ValueError(
-                f"{where}.quantile_values must have {len(quantiles)} frames "
-                "(one per quantile)"
+                f"{series_where}.quantile_values must have {len(quantiles)} "
+                "frames (one per quantile)"
             )
         for q_index, frame in enumerate(quantile_values):
-            frame_where = f"{where}.quantile_values[{q_index}]"
+            frame_where = f"{series_where}.quantile_values[{q_index}]"
             if not isinstance(frame, list):
                 raise TypeError(f"{frame_where} must be a list")
             if len(frame) != n_times:
@@ -691,7 +703,7 @@ def _validate_ensemble_multi(
                         ):
                             raise ValueError(
                                 f"{target}: quantile cells must be None exactly "
-                                "where the cell status is missing"
+                                f"where the cell status is missing"
                             )
 
     return elements, times, lats, lons, quantiles, data
@@ -1751,4 +1763,161 @@ def coverage_delta_multi_summary(delta) -> dict:
         "windows": windows,
         "regions": list(regions),
         "data": result_data,
+    }
+
+
+def value_delta_multi(left, right) -> dict:
+    """Compute the right-minus-left value delta of two ensemble-multi grids.
+
+    ``left`` and ``right`` must be complete :func:`ensemble_multi` results
+    (schema ``climate-grid/ensemble-multi-v1``) with exactly the keys
+    ``schema, elements, times, lats, lons, quantiles, data`` in that order;
+    every member is validated against the ensemble-multi contract, including
+    each item's key order ``values, status, uncertainty, quantile_values``
+    and the nested ``[quantile][time][lat][lon]`` quantile frames.  The two
+    inputs must share equal ``elements``, ``times``, ``lats``, ``lons`` and
+    ``quantiles`` arrays in the same order.
+
+    For every element and every ``[time][lat][lon]`` cell whose status is
+    ``missing`` in either input, the output cell gets ``values=None``,
+    ``status="missing"``, ``uncertainty=None`` and ``None`` for every
+    quantile.  Otherwise ``values`` is ``right - left``, ``status`` is
+    ``"observed"`` only when both input statuses are observed and
+    ``"interpolated"`` otherwise, and ``uncertainty`` is
+    ``sqrt(u_left ** 2 + u_right ** 2)``.  Each quantile value is
+    ``right - left`` when both input quantile cells are not ``None`` and
+    ``None`` otherwise.
+
+    The returned mapping uses the key order ``schema, elements, times, lats,
+    lons, quantiles, data``; ``schema`` is
+    ``climate-grid/ensemble-delta-multi-v1`` and the elements, axes and
+    quantile labels are carried over (echoed) from the inputs.  ``data``
+    follows the shared element order and each item uses the key order
+    ``values, status, uncertainty, quantile_values``; the first three
+    members are nested ``[time][lat][lon]`` lists and ``quantile_values`` is
+    nested ``[quantile][time][lat][lon]``.  Every computed output number is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong container/item types and ``ValueError``
+    for any other contract violation (schema, key order, shape or ordering).
+    """
+    left_elements, left_times, left_lats, left_lons, left_quantiles, left_data = (
+        _validate_ensemble_multi(left, where="left")
+    )
+    (
+        right_elements,
+        right_times,
+        right_lats,
+        right_lons,
+        right_quantiles,
+        right_data,
+    ) = _validate_ensemble_multi(right, where="right")
+
+    if right_elements != left_elements:
+        raise ValueError(
+            "left and right must have equal elements in the same order"
+        )
+    if right_times != left_times:
+        raise ValueError(
+            "left and right must have equal times in the same order"
+        )
+    if right_lats != left_lats:
+        raise ValueError(
+            "left and right must have equal lats in the same order"
+        )
+    if right_lons != left_lons:
+        raise ValueError(
+            "left and right must have equal lons in the same order"
+        )
+    if right_quantiles != left_quantiles:
+        raise ValueError(
+            "left and right must have equal quantiles in the same order"
+        )
+
+    n_quantiles = len(left_quantiles)
+    n_times = len(left_times)
+    n_lat = len(left_lats)
+    n_lon = len(left_lons)
+
+    out_data: dict[str, dict] = {}
+    for element in left_elements:
+        left_series = left_data[element]
+        right_series = right_data[element]
+        left_status = left_series["status"]
+        right_status = right_series["status"]
+        left_values = left_series["values"]
+        right_values = right_series["values"]
+        left_uncertainty = left_series["uncertainty"]
+        right_uncertainty = right_series["uncertainty"]
+        left_quantile_values = left_series["quantile_values"]
+        right_quantile_values = right_series["quantile_values"]
+
+        out_values = [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        out_status = [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        out_uncertainty = [
+            [[None for _ in range(n_lon)] for _ in range(n_lat)]
+            for _ in range(n_times)
+        ]
+        out_quantiles = [
+            [
+                [[None for _ in range(n_lon)] for _ in range(n_lat)]
+                for _ in range(n_times)
+            ]
+            for _ in range(n_quantiles)
+        ]
+
+        for t in range(n_times):
+            for i in range(n_lat):
+                for j in range(n_lon):
+                    if (
+                        left_status[t][i][j] == "missing"
+                        or right_status[t][i][j] == "missing"
+                    ):
+                        out_status[t][i][j] = "missing"
+                        continue
+                    out_values[t][i][j] = _round_output(
+                        right_values[t][i][j] - left_values[t][i][j]
+                    )
+                    out_status[t][i][j] = (
+                        "observed"
+                        if left_status[t][i][j] == "observed"
+                        and right_status[t][i][j] == "observed"
+                        else "interpolated"
+                    )
+                    out_uncertainty[t][i][j] = _round_output(
+                        math.sqrt(
+                            left_uncertainty[t][i][j] ** 2
+                            + right_uncertainty[t][i][j] ** 2
+                        )
+                    )
+                    for q_index in range(n_quantiles):
+                        left_q = left_quantile_values[q_index][t][i][j]
+                        right_q = right_quantile_values[q_index][t][i][j]
+                        if left_q is not None and right_q is not None:
+                            out_quantiles[q_index][t][i][j] = _round_output(
+                                right_q - left_q
+                            )
+
+        out_data[element] = {
+            "values": out_values,
+            "status": out_status,
+            "uncertainty": out_uncertainty,
+            "quantile_values": out_quantiles,
+        }
+
+    return {
+        "schema": _ENSEMBLE_DELTA_MULTI_SCHEMA,
+        "elements": list(left_elements),
+        "times": list(left_times),
+        "lats": list(left_lats),
+        "lons": list(left_lons),
+        "quantiles": list(left_quantiles),
+        "data": out_data,
     }
