@@ -3231,3 +3231,308 @@ def quantile_shift(items, regions, windows, quantiles, *, min_count: int = 1) ->
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
     }
+
+
+_QSHIFT_SUMMARY_SCHEMA = "climate-grid/qshift-summary-v1"
+_QSHIFT_KEYS = (
+    "schema",
+    "reference",
+    "scenarios",
+    "quantiles",
+    "windows",
+    "regions",
+    "data",
+)
+_QSHIFT_ROW_KEYS = (
+    "scenario",
+    "window",
+    "region",
+    "element",
+    "count",
+    "quantiles",
+    "uncertainty",
+)
+
+
+def _validate_qshift(
+    shift: Any, *, where: str = "shift"
+) -> tuple[str, list[str], list[str], list, list, list[str], list]:
+    if not isinstance(shift, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(shift.keys()) != _QSHIFT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, scenarios, "
+            "quantiles, windows, regions, data in order"
+        )
+
+    schema = shift["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _QSHIFT_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_QSHIFT_SCHEMA!r}")
+
+    reference = shift["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = shift["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    seen_scenarios: set[str] = {reference}
+    for index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where}.scenarios[{index}] must be a str")
+        if scenario == "":
+            raise ValueError(f"{where}.scenarios[{index}] must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where} scenario: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+    quantiles = shift["quantiles"]
+    _regional_validate_quantiles(quantiles)
+
+    windows = _validate_coverage_windows(
+        shift["windows"], prefix=f"{where}.windows"
+    )
+
+    regions = shift["regions"]
+    if not isinstance(regions, list):
+        raise TypeError(f"{where}.regions must be a list")
+    if len(regions) == 0:
+        raise ValueError(f"{where}.regions must be non-empty")
+    seen_regions: set[str] = set()
+    for index, region in enumerate(regions):
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.regions[{index}] must be a str")
+        if region == "":
+            raise ValueError(f"{where}.regions[{index}] must be non-empty")
+        if region in seen_regions:
+            raise ValueError(f"duplicate {where} region: {region!r}")
+        seen_regions.add(region)
+
+    data = shift["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    n_scenarios = len(scenarios)
+    n_windows = len(windows)
+    n_regions = len(regions)
+    rows_per_scenario = n_windows * n_regions
+    if len(data) == 0 or len(data) % (rows_per_scenario * n_scenarios) != 0:
+        raise ValueError(
+            f"{where}.data must have one row per "
+            "scenario/window/region/element combination, in "
+            "scenario-then-window-then-region-then-element order"
+        )
+    n_elements = len(data) // (rows_per_scenario * n_scenarios)
+    rows_per_scenario *= n_elements
+
+    elements: list[str] = []
+    seen_elements: set[str] = set()
+    for e_index in range(n_elements):
+        row = data[e_index]
+        if not isinstance(row, dict):
+            raise TypeError(f"{where}.data[{e_index}] must be a dict")
+        if tuple(row.keys()) != _QSHIFT_ROW_KEYS:
+            raise ValueError(
+                f"{where}.data[{e_index}] must have exactly the keys scenario, "
+                "window, region, element, count, quantiles, uncertainty in order"
+            )
+        element = row["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.data[{e_index}].element must be a str")
+        if element == "":
+            raise ValueError(f"{where}.data[{e_index}].element must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate {where} element: {element!r}")
+        seen_elements.add(element)
+        elements.append(element)
+
+    for row_index, row in enumerate(data):
+        target = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{target} must be a dict")
+        if tuple(row.keys()) != _QSHIFT_ROW_KEYS:
+            raise ValueError(
+                f"{target} must have exactly the keys scenario, window, "
+                "region, element, count, quantiles, uncertainty in order"
+            )
+
+        offset = row_index % rows_per_scenario
+        w_index = offset // (n_regions * n_elements)
+        r_index = (offset % (n_regions * n_elements)) // n_elements
+        e_index = offset % n_elements
+
+        if not isinstance(row["scenario"], str):
+            raise TypeError(f"{target}.scenario must be a str")
+        if row["scenario"] != scenarios[row_index // rows_per_scenario]:
+            raise ValueError(
+                f"{target}.scenario must be "
+                f"{scenarios[row_index // rows_per_scenario]!r} for its "
+                "scenario-then-window-then-region-then-element position"
+            )
+        if not isinstance(row["window"], str):
+            raise TypeError(f"{target}.window must be a str")
+        if row["window"] != windows[w_index]["name"]:
+            raise ValueError(
+                f"{target}.window must be {windows[w_index]['name']!r} for its "
+                "scenario-then-window-then-region-then-element position"
+            )
+        if not isinstance(row["region"], str):
+            raise TypeError(f"{target}.region must be a str")
+        if row["region"] != regions[r_index]:
+            raise ValueError(
+                f"{target}.region must be {regions[r_index]!r} for its "
+                "scenario-then-window-then-region-then-element position"
+            )
+        if not isinstance(row["element"], str):
+            raise TypeError(f"{target}.element must be a str")
+        if row["element"] != elements[e_index]:
+            raise ValueError(
+                f"{target}.element must be {elements[e_index]!r} for its "
+                "scenario-then-window-then-region-then-element position"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{target}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{target}.count must be non-negative")
+
+        row_quantiles = row["quantiles"]
+        if not isinstance(row_quantiles, list):
+            raise TypeError(f"{target}.quantiles must be a list")
+        if len(row_quantiles) != len(quantiles):
+            raise ValueError(
+                f"{target}.quantiles must have {len(quantiles)} items "
+                "(one per quantile)"
+            )
+        for q_index, value in enumerate(row_quantiles):
+            _validate_number(
+                value, f"{target}.quantiles[{q_index}]", nullable=True
+            )
+
+        _validate_number(row["uncertainty"], f"{target}.uncertainty", nullable=True)
+        if row["uncertainty"] is not None and row["uncertainty"] < 0:
+            raise ValueError(f"{target}.uncertainty must be non-negative")
+
+    return reference, scenarios, elements, quantiles, windows, regions, data
+
+
+def quantile_shift_summary(shift, *, min_count: int = 1) -> dict:
+    """Summarize a quantile-shift result across all windows and regions.
+
+    ``shift`` must be a complete :func:`quantile_shift` result (schema
+    ``climate-grid/qshift-v1``) with exactly the keys ``schema, reference,
+    scenarios, quantiles, windows, regions, data`` in that order; every
+    member is validated against that contract, including the flat
+    scenario-then-window-then-region-then-element ``data`` row order and
+    each row's key order ``scenario, window, region, element, count,
+    quantiles, uncertainty``.  ``min_count`` must be a positive non-bool
+    int.
+
+    Rows are aggregated across all windows and regions, in scenario order
+    and then element order; the element order is taken from the first
+    scenario/window/region block of ``data``.  ``count`` is the sum of the
+    contributing row counts.  When the summed ``count`` is below
+    ``min_count``, or any contributing row (a row with positive ``count``)
+    has a ``None`` item in ``quantiles`` or a ``None`` ``uncertainty``,
+    ``quantiles`` is a list of ``None`` of the same length as the input
+    quantiles and ``uncertainty`` is ``None``.  Otherwise each quantile is
+    the count-weighted mean ``sum(count * q) / sum(count)`` over the
+    contributing rows and ``uncertainty`` is
+    ``sqrt(sum((count * u) ** 2)) / sum(count)``.
+
+    The returned mapping uses the key order ``schema, reference, scenarios,
+    elements, quantiles, windows, regions, data``; ``schema`` is
+    ``climate-grid/qshift-summary-v1`` and ``reference``, ``scenarios``,
+    ``quantiles``, ``windows`` and ``regions`` echo the shift members
+    as-is.  ``data`` follows the scenario-then-element order; each row
+    uses the key order ``scenario, element, count, quantiles,
+    uncertainty``.  ``count`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    reference, scenarios, elements, quantiles, windows, regions, data = (
+        _validate_qshift(shift)
+    )
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+    rows_per_scenario = n_windows * n_regions * n_elements
+
+    result_data = []
+    for s_index, scenario in enumerate(scenarios):
+        scenario_rows = data[
+            s_index * rows_per_scenario:(s_index + 1) * rows_per_scenario
+        ]
+        for e_index, element in enumerate(elements):
+            rows = [
+                scenario_rows[(w_index * n_regions + r_index) * n_elements + e_index]
+                for w_index in range(n_windows)
+                for r_index in range(n_regions)
+            ]
+            contributing = [row for row in rows if row["count"] > 0]
+            count = sum(row["count"] for row in rows)
+
+            if count < min_count or any(
+                row["uncertainty"] is None
+                or any(value is None for value in row["quantiles"])
+                for row in contributing
+            ):
+                summary_quantiles = [None for _q in quantiles]
+                uncertainty = None
+            else:
+                summary_quantiles = [
+                    _round_output(
+                        sum(
+                            row["count"] * row["quantiles"][q_index]
+                            for row in contributing
+                        )
+                        / count
+                    )
+                    for q_index in range(len(quantiles))
+                ]
+                uncertainty = _round_output(
+                    math.sqrt(
+                        sum(
+                            (row["count"] * row["uncertainty"]) ** 2
+                            for row in contributing
+                        )
+                    )
+                    / count
+                )
+
+            result_data.append(
+                {
+                    "scenario": scenario,
+                    "element": element,
+                    "count": count,
+                    "quantiles": summary_quantiles,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _QSHIFT_SUMMARY_SCHEMA,
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "elements": elements,
+        "quantiles": quantiles,
+        "windows": windows,
+        "regions": list(regions),
+        "data": result_data,
+    }
