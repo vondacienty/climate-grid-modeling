@@ -331,38 +331,7 @@ def _validate_quantiles(quantiles: Any) -> list:
     return list(quantiles)
 
 
-def ensemble(scenarios, element, *, quantiles=None) -> dict:
-    """Combine scenario-v1 downscale results into a per-cell ensemble.
-
-    ``scenarios`` is a non-empty list of :func:`downscale` results (schema
-    ``climate-grid/scenario-v1``); every member is validated against that
-    contract and all members must share identical ``times``, ``lats``,
-    ``lons`` axes and the same ``data`` elements in the same order.
-    ``element`` is a non-empty str naming one of those elements.
-    ``quantiles`` is ``None`` (default ``[0.05, 0.5, 0.95]``) or a non-empty
-    list of finite non-bool numbers in ``[0, 1]``, strictly increasing.
-
-    For every ``[time][lat][lon]`` cell the non-missing ``(value,
-    uncertainty)`` samples across the scenarios are combined: with no
-    samples the cell gets ``values=None``, ``status="missing"`` and
-    ``uncertainty=None``; otherwise ``values`` is the sample mean
-    ``Σv / n``, ``status`` is ``"observed"`` when every sample is observed
-    and ``"interpolated"`` otherwise, and ``uncertainty`` is
-    ``√(Σu²) / n``.  Each requested quantile is computed from the ascending
-    sample values by linear interpolation on the position ``h = (n - 1) q``.
-
-    The returned mapping uses the key order ``schema, element, times, lats,
-    lons, quantiles, values, status, uncertainty, quantile_values``;
-    ``schema`` is ``climate-grid/ensemble-v1`` and the axes are carried over
-    from the scenarios.  ``values``, ``status`` and ``uncertainty`` are
-    nested ``[time][lat][lon]`` lists; ``quantile_values`` is nested
-    ``[quantile][time][lat][lon]`` with ``None`` for sample-less cells.
-    Every computed output number is ``round(x, 12)`` with negative zero
-    normalized to ``0.0``.  Inputs are not modified.
-
-    Raises ``TypeError`` for wrong container/item/argument types and
-    ``ValueError`` for any other contract violation.
-    """
+def _validate_scenarios(scenarios: Any) -> tuple[list, list, list, list[str], list]:
     if not isinstance(scenarios, list):
         raise TypeError("scenarios must be a list")
     if len(scenarios) == 0:
@@ -386,21 +355,12 @@ def ensemble(scenarios, element, *, quantiles=None) -> dict:
             raise ValueError(
                 "all scenarios must have the same data elements in the same order"
             )
+    return times, lats, lons, elements, validated
 
-    if not isinstance(element, str):
-        raise TypeError("element must be a str")
-    if element == "":
-        raise ValueError("element must be non-empty")
-    if element not in data:
-        raise ValueError(f"element {element!r} is not present in the scenarios")
 
-    qs = _validate_quantiles(quantiles)
-
-    n_times = len(times)
-    n_lat = len(lats)
-    n_lon = len(lons)
-    series_list = [member[3][element] for member in validated]
-
+def _combine_cells(
+    series_list: list, qs: list, n_times: int, n_lat: int, n_lon: int
+) -> tuple[list, list, list, list]:
     out_values = [
         [[None for _ in range(n_lon)] for _ in range(n_lat)]
         for _ in range(n_times)
@@ -459,6 +419,57 @@ def ensemble(scenarios, element, *, quantiles=None) -> dict:
                     ) * fraction
                     out_quantiles[q_index][t][i][j] = _round_output(interpolated)
 
+    return out_values, out_status, out_uncertainty, out_quantiles
+
+
+def ensemble(scenarios, element, *, quantiles=None) -> dict:
+    """Combine scenario-v1 downscale results into a per-cell ensemble.
+
+    ``scenarios`` is a non-empty list of :func:`downscale` results (schema
+    ``climate-grid/scenario-v1``); every member is validated against that
+    contract and all members must share identical ``times``, ``lats``,
+    ``lons`` axes and the same ``data`` elements in the same order.
+    ``element`` is a non-empty str naming one of those elements.
+    ``quantiles`` is ``None`` (default ``[0.05, 0.5, 0.95]``) or a non-empty
+    list of finite non-bool numbers in ``[0, 1]``, strictly increasing.
+
+    For every ``[time][lat][lon]`` cell the non-missing ``(value,
+    uncertainty)`` samples across the scenarios are combined: with no
+    samples the cell gets ``values=None``, ``status="missing"`` and
+    ``uncertainty=None``; otherwise ``values`` is the sample mean
+    ``Σv / n``, ``status`` is ``"observed"`` when every sample is observed
+    and ``"interpolated"`` otherwise, and ``uncertainty`` is
+    ``√(Σu²) / n``.  Each requested quantile is computed from the ascending
+    sample values by linear interpolation on the position ``h = (n - 1) q``.
+
+    The returned mapping uses the key order ``schema, element, times, lats,
+    lons, quantiles, values, status, uncertainty, quantile_values``;
+    ``schema`` is ``climate-grid/ensemble-v1`` and the axes are carried over
+    from the scenarios.  ``values``, ``status`` and ``uncertainty`` are
+    nested ``[time][lat][lon]`` lists; ``quantile_values`` is nested
+    ``[quantile][time][lat][lon]`` with ``None`` for sample-less cells.
+    Every computed output number is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    times, lats, lons, elements, validated = _validate_scenarios(scenarios)
+
+    if not isinstance(element, str):
+        raise TypeError("element must be a str")
+    if element == "":
+        raise ValueError("element must be non-empty")
+    if element not in elements:
+        raise ValueError(f"element {element!r} is not present in the scenarios")
+
+    qs = _validate_quantiles(quantiles)
+
+    series_list = [member[3][element] for member in validated]
+    out_values, out_status, out_uncertainty, out_quantiles = _combine_cells(
+        series_list, qs, len(times), len(lats), len(lons)
+    )
+
     return {
         "schema": _ENSEMBLE_SCHEMA,
         "element": element,
@@ -470,4 +481,70 @@ def ensemble(scenarios, element, *, quantiles=None) -> dict:
         "status": out_status,
         "uncertainty": out_uncertainty,
         "quantile_values": out_quantiles,
+    }
+
+
+_ENSEMBLE_MULTI_SCHEMA = "climate-grid/ensemble-multi-v1"
+
+
+def ensemble_multi(scenarios, *, quantiles=None) -> dict:
+    """Combine scenario-v1 downscale results into a per-element ensemble.
+
+    ``scenarios`` is a non-empty list of :func:`downscale` results (schema
+    ``climate-grid/scenario-v1``); every member is validated against that
+    contract and all members must share identical ``times``, ``lats``,
+    ``lons`` axes and the same ``data`` elements in the same order.
+    ``quantiles`` is ``None`` (default ``[0.05, 0.5, 0.95]``) or a non-empty
+    list of finite non-bool numbers in ``[0, 1]``, strictly increasing.
+
+    For every element and every ``[time][lat][lon]`` cell the non-missing
+    ``(value, uncertainty)`` samples across the scenarios are combined: with
+    no samples the cell gets ``values=None``, ``status="missing"`` and
+    ``uncertainty=None``; otherwise ``values`` is the sample mean
+    ``Σv / n``, ``status`` is ``"observed"`` when every sample is observed
+    and ``"interpolated"`` otherwise, and ``uncertainty`` is
+    ``√(Σu²) / n``.  Each requested quantile is computed from the ascending
+    sample values by linear interpolation on the position ``h = (n - 1) q``.
+
+    The returned mapping uses the key order ``schema, elements, times, lats,
+    lons, quantiles, data``; ``schema`` is ``climate-grid/ensemble-multi-v1``
+    and the axes are carried over from the scenarios.  ``data`` follows the
+    scenario element order and each item uses the key order ``values,
+    status, uncertainty, quantile_values``; the first three members are
+    nested ``[time][lat][lon]`` lists and ``quantile_values`` is nested
+    ``[quantile][time][lat][lon]`` with ``None`` for sample-less cells.
+    Every computed output number is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    times, lats, lons, elements, validated = _validate_scenarios(scenarios)
+    qs = _validate_quantiles(quantiles)
+
+    n_times = len(times)
+    n_lat = len(lats)
+    n_lon = len(lons)
+
+    out_data: dict[str, dict] = {}
+    for element in elements:
+        series_list = [member[3][element] for member in validated]
+        out_values, out_status, out_uncertainty, out_quantiles = _combine_cells(
+            series_list, qs, n_times, n_lat, n_lon
+        )
+        out_data[element] = {
+            "values": out_values,
+            "status": out_status,
+            "uncertainty": out_uncertainty,
+            "quantile_values": out_quantiles,
+        }
+
+    return {
+        "schema": _ENSEMBLE_MULTI_SCHEMA,
+        "elements": list(elements),
+        "times": list(times),
+        "lats": list(lats),
+        "lons": list(lons),
+        "quantiles": qs,
+        "data": out_data,
     }
