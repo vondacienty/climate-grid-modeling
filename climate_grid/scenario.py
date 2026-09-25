@@ -10,6 +10,7 @@ from typing import Any
 from .regional import (
     _coverage_window_region,
     _entropy_window_region,
+    _exceedance_window_region,
     _histogram_window_region,
     _quantile_window_region,
     _validate_quantiles as _regional_validate_quantiles,
@@ -2448,6 +2449,106 @@ def aggregate_value_delta_entropy(
         "schema": _ENSEMBLE_DELTA_ENTROPY_REGION_SCHEMA,
         "elements": list(elements),
         "edges": edges,
+        "windows": windows,
+        "regions": [name for name, _ in validated_regions],
+        "data": result_data,
+    }
+
+
+_ENSEMBLE_DELTA_EXCEEDANCE_SCHEMA = (
+    "climate-grid/ensemble-delta-exceedance-v1"
+)
+
+
+def aggregate_value_delta_exceedance(
+    delta, regions, windows, threshold, *, min_count: int = 1
+) -> dict:
+    """Aggregate an ensemble-delta-multi grid into per-window exceedance stats.
+
+    ``delta`` must be a complete :func:`value_delta_multi` result (schema
+    ``climate-grid/ensemble-delta-multi-v1``) with exactly the keys
+    ``schema, elements, times, lats, lons, quantiles, data`` in that order;
+    every member is validated against that contract, including each item's
+    key order ``values, status, uncertainty, quantile_values`` and the
+    nested ``[quantile][time][lat][lon]`` quantile frames.  ``regions``,
+    ``windows`` and ``min_count`` follow
+    :func:`climate_grid.regional.aggregate_window` exactly: region
+    ``cells`` are checked against the delta grid and window
+    ``start``/``end`` must occur in ``delta.times``.  ``threshold`` must be
+    a finite non-bool int or float; a wrong type raises ``TypeError`` while
+    a non-finite value raises ``ValueError``.
+
+    For every window (in window order), region (in region order) and
+    element (in delta element order), the non-missing ``(value,
+    uncertainty)`` samples of the closed calendar interval are collected
+    across the region's cells; ``count`` is the sample count ``n``.  When
+    ``n`` is below ``min_count``, ``exceed``, ``rate``, ``mean_excess``
+    and ``uncertainty`` are all ``None``.  Otherwise ``exceed`` is the
+    count of samples with ``v > threshold``, ``rate`` is
+    ``exceed / n``, ``mean_excess`` is
+    ``sum(max(v - threshold, 0)) / n`` and ``uncertainty`` is
+    ``sqrt(sum(u ** 2)) / n`` over the sampled uncertainties.
+
+    The returned mapping uses the key order ``schema, elements, threshold,
+    windows, regions, data``; ``schema`` is
+    ``climate-grid/ensemble-delta-exceedance-v1``, ``elements`` and
+    ``windows`` echo the delta elements and the ``windows`` argument,
+    ``threshold`` echoes the argument and ``regions`` lists the region
+    names in input order.  ``data`` is a flat list of rows in
+    window-then-region-then-element order; each row uses the key order
+    ``window, region, element, count, exceed, rate, mean_excess,
+    uncertainty``.  ``count`` and ``exceed`` are ints and every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    elements, times, lats, lons, _quantiles, data = _validate_ensemble_multi(
+        delta, schema=_ENSEMBLE_DELTA_MULTI_SCHEMA, where="delta"
+    )
+
+    validated_regions = _validate_regions(regions, len(lats), len(lons))
+    validated_windows = _validate_windows(windows, times)
+
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        raise TypeError("threshold must be a finite non-bool int or float")
+    if not math.isfinite(threshold):
+        raise ValueError("threshold must be finite")
+
+    if not isinstance(min_count, int) or isinstance(min_count, bool):
+        raise TypeError("min_count must be a non-bool int")
+    if min_count < 1:
+        raise ValueError("min_count must be positive")
+
+    result_data = []
+    for w_name, _start, _end, t_start, t_end in validated_windows:
+        for r_name, cells in validated_regions:
+            for element in elements:
+                series = data[element]
+                stats = _exceedance_window_region(
+                    series["values"],
+                    series["status"],
+                    series["uncertainty"],
+                    cells,
+                    t_start,
+                    t_end,
+                    threshold,
+                    min_count,
+                )
+                result_data.append(
+                    {
+                        "window": w_name,
+                        "region": r_name,
+                        "element": element,
+                        **stats,
+                    }
+                )
+
+    return {
+        "schema": _ENSEMBLE_DELTA_EXCEEDANCE_SCHEMA,
+        "elements": list(elements),
+        "threshold": threshold,
         "windows": windows,
         "regions": [name for name, _ in validated_regions],
         "data": result_data,
