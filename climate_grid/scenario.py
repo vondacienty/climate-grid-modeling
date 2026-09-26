@@ -36,6 +36,18 @@ def _round_output(value: float) -> float:
     return value
 
 
+def _check_finite(value: Any, target: str) -> None:
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        # An int too large to convert to float cannot take part in the
+        # downstream float arithmetic; report it as a value violation
+        # rather than letting OverflowError escape.
+        raise ValueError(f"{target} must be finite") from None
+    if not finite:
+        raise ValueError(f"{target} must be finite")
+
+
 def _parse_date(value: Any, where: str) -> datetime.date:
     if not isinstance(value, str):
         raise TypeError(f"{where} must be a str")
@@ -70,8 +82,7 @@ def _validate_number(cell: Any, target: str, *, nullable: bool) -> None:
         return
     if not isinstance(cell, (int, float)) or isinstance(cell, bool):
         raise TypeError(f"{target} must be a number" + (" or None" if nullable else ""))
-    if not math.isfinite(cell):
-        raise ValueError(f"{target} must be finite")
+    _check_finite(cell, target)
 
 
 def _validate_temporal(
@@ -10833,6 +10844,54 @@ def aggregate_region_summary(
 
 
 _REGION_REPORT_INTERVAL_SCHEMA = "climate-grid/rr-interval-v1"
+_REGION_REPORT_INTERVAL_COMPARE_SCHEMA = "climate-grid/rr-interval-compare-v1"
+_REGION_REPORT_INTERVAL_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "baseline",
+    "scenarios",
+    "elements",
+    "windows",
+    "regions",
+    "factors",
+    "data",
+)
+_REGION_REPORT_INTERVAL_COMPARE_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "baseline",
+    "scenarios",
+    "elements",
+    "windows",
+    "regions",
+    "factors",
+    "pairs",
+    "data",
+)
+_REGION_REPORT_INTERVAL_ROW_KEYS = (
+    "region",
+    "element",
+    "window_count",
+    "count",
+    "center",
+    "uncertainty",
+    "lower",
+    "upper",
+)
+_REGION_INTERVAL_COMPARE_ROW_KEYS = (
+    "pair",
+    "left",
+    "right",
+    "element",
+    "factor",
+    "center_delta",
+    "lower_delta",
+    "upper_delta",
+    "overlap",
+)
+_PAIR_KEYS = ("name", "left", "right")
 _REGION_REPORT_AGGREGATE_ROW_KEYS = (
     "region",
     "element",
@@ -11105,16 +11164,20 @@ def region_summary_intervals(aggregate, factors) -> dict:
             raise TypeError(
                 f"factors[{index}] must be a finite non-bool int or float"
             )
-        if not math.isfinite(factor):
-            raise ValueError(f"factors[{index}] must be finite")
+        _check_finite(factor, f"factors[{index}]")
         if factor <= 0:
             raise ValueError(f"factors[{index}] must be positive")
     for index in range(1, len(factors)):
         if factors[index] <= factors[index - 1]:
             raise ValueError("factors must be strictly increasing")
 
-    def _bound(value: float, where: str) -> float:
-        if not math.isfinite(value):
+    def _bound(mean: float, factor, uncertainty: float, sign: int, where: str) -> float:
+        try:
+            value = mean + sign * factor * uncertainty
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
             raise ValueError(f"{where} must be finite")
         return _round_output(value)
 
@@ -11135,14 +11198,20 @@ def region_summary_intervals(aggregate, factors) -> dict:
                 out_uncertainty = uncertainty
                 lower = [
                     _bound(
-                        mean - factor * uncertainty,
+                        mean,
+                        factor,
+                        uncertainty,
+                        -1,
                         f"{row_where}.lower[{index}]",
                     )
                     for index, factor in enumerate(factors)
                 ]
                 upper = [
                     _bound(
-                        mean + factor * uncertainty,
+                        mean,
+                        factor,
+                        uncertainty,
+                        1,
                         f"{row_where}.upper[{index}]",
                     )
                     for index, factor in enumerate(factors)
@@ -11170,5 +11239,427 @@ def region_summary_intervals(aggregate, factors) -> dict:
         "windows": windows,
         "regions": list(regions),
         "factors": list(factors),
+        "data": result_rows,
+    }
+
+
+def _validate_interval_factors(factors: Any, *, where: str = "intervals.factors"):
+    if not isinstance(factors, list):
+        raise TypeError(f"{where} must be a list")
+    if len(factors) == 0:
+        raise ValueError(f"{where} must be non-empty")
+    for index, factor in enumerate(factors):
+        target = f"{where}[{index}]"
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+            raise TypeError(f"{target} must be a finite non-bool int or float")
+        _check_finite(factor, target)
+        if factor <= 0:
+            raise ValueError(f"{target} must be positive")
+    for index in range(1, len(factors)):
+        if factors[index] <= factors[index - 1]:
+            raise ValueError(f"{where} must be strictly increasing")
+    return factors
+
+
+def _validate_region_intervals(
+    intervals: Any, *, where: str = "intervals"
+) -> tuple[list, str, str, list[str], list[str], list, list[str], list, list]:
+    if not isinstance(intervals, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(intervals.keys()) != _REGION_REPORT_INTERVAL_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "baseline, scenarios, elements, windows, regions, factors, data "
+            "in order"
+        )
+
+    schema = intervals["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_REPORT_INTERVAL_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_REPORT_INTERVAL_SCHEMA!r}"
+        )
+
+    years = intervals["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = intervals["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    baseline = intervals["baseline"]
+    if not isinstance(baseline, str):
+        raise TypeError(f"{where}.baseline must be a str")
+    if baseline == "":
+        raise ValueError(f"{where}.baseline must be non-empty")
+
+    scenarios = _validate_string_list(
+        intervals["scenarios"], f"{where}.scenarios"
+    )
+    if baseline in scenarios:
+        raise ValueError(
+            f"{where}.baseline must not appear in {where}.scenarios"
+        )
+    elements = _validate_string_list(
+        intervals["elements"], f"{where}.elements"
+    )
+
+    windows = intervals["windows"]
+    if not isinstance(windows, list):
+        raise TypeError(f"{where}.windows must be a list")
+    if len(windows) == 0:
+        raise ValueError(f"{where}.windows must be non-empty")
+    seen_windows: set[str] = set()
+    for index, window in enumerate(windows):
+        window_where = f"{where}.windows[{index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{window_where} must be a dict")
+        if list(window.keys()) != ["name", "start", "end"]:
+            raise ValueError(
+                f"{window_where} must have exactly the keys name, start, "
+                "end in order"
+            )
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{window_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{window_where}.name must be non-empty")
+        if name in seen_windows:
+            raise ValueError(f"duplicate {where}.windows name: {name!r}")
+        seen_windows.add(name)
+        start_day = _parse_date(window["start"], f"{window_where}.start")
+        end_day = _parse_date(window["end"], f"{window_where}.end")
+        if start_day > end_day:
+            raise ValueError(
+                f"{window_where}.start must be on or before "
+                f"{window_where}.end"
+            )
+
+    regions = _validate_string_list(intervals["regions"], f"{where}.regions")
+    factors = _validate_interval_factors(intervals["factors"], where=f"{where}.factors")
+
+    data = intervals["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(regions) * len(elements):
+        raise ValueError(
+            f"{where}.data must have one row per region/element pair "
+            f"({len(regions) * len(elements)})"
+        )
+
+    n_scenarios = len(scenarios)
+    n_windows = len(windows)
+    n_factors = len(factors)
+    row_index = 0
+    for region in regions:
+        for element in elements:
+            row_where = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _REGION_REPORT_INTERVAL_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys region, "
+                    "element, window_count, count, center, uncertainty, "
+                    "lower, upper in order"
+                )
+
+            row_region = row["region"]
+            if not isinstance(row_region, str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row_region != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its "
+                    "region-then-element position"
+                )
+            row_element = row["element"]
+            if not isinstance(row_element, str):
+                raise TypeError(f"{row_where}.element must be a str")
+            if row_element != element:
+                raise ValueError(
+                    f"{row_where}.element must be {element!r} for its "
+                    "region-then-element position"
+                )
+
+            window_count = row["window_count"]
+            if not isinstance(window_count, int) or isinstance(
+                window_count, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.window_count must be a non-bool int"
+                )
+            if window_count < 0 or window_count > n_windows:
+                raise ValueError(
+                    f"{row_where}.window_count must be between 0 and the "
+                    f"number of windows ({n_windows})"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if count < 0 or count > n_scenarios * n_windows:
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and the number "
+                    "of scenario/window combinations "
+                    f"({n_scenarios * n_windows})"
+                )
+
+            center = row["center"]
+            uncertainty = row["uncertainty"]
+            _validate_number(center, f"{row_where}.center", nullable=True)
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=True
+            )
+
+            lower = row["lower"]
+            upper = row["upper"]
+            for side, bounds in (("lower", lower), ("upper", upper)):
+                side_where = f"{row_where}.{side}"
+                if not isinstance(bounds, list):
+                    raise TypeError(f"{side_where} must be a list")
+                if len(bounds) != n_factors:
+                    raise ValueError(
+                        f"{side_where} must have {n_factors} entries "
+                        "(one per factor)"
+                    )
+                for f_index, bound in enumerate(bounds):
+                    _validate_number(
+                        bound, f"{side_where}[{f_index}]", nullable=True
+                    )
+
+            center_present = center is not None
+            uncertainty_present = uncertainty is not None
+            lower_present = [bound is not None for bound in lower]
+            upper_present = [bound is not None for bound in upper]
+            if center_present != uncertainty_present:
+                raise ValueError(
+                    f"{row_where}: center and uncertainty must be both "
+                    "None or both present"
+                )
+            if any(lower_present) != all(lower_present):
+                raise ValueError(
+                    f"{row_where}.lower entries must be all None or all "
+                    "present"
+                )
+            if any(upper_present) != all(upper_present):
+                raise ValueError(
+                    f"{row_where}.upper entries must be all None or all "
+                    "present"
+                )
+            if lower_present and (
+                lower_present[0] != center_present
+                or upper_present[0] != center_present
+            ):
+                raise ValueError(
+                    f"{row_where}: lower/upper entries must be present "
+                    "exactly when center and uncertainty are present"
+                )
+            if uncertainty is not None and uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+
+            row_index += 1
+
+    return years, reference, baseline, scenarios, elements, windows, regions, factors, data
+
+
+def _validate_interval_pairs(
+    pairs: Any, regions: list[str]
+) -> list[dict]:
+    if not isinstance(pairs, list):
+        raise TypeError("pairs must be a list")
+    if len(pairs) == 0:
+        raise ValueError("pairs must be non-empty")
+
+    region_names = set(regions)
+    seen_names: set[str] = set()
+    validated: list[dict] = []
+    for p_index, pair in enumerate(pairs):
+        where = f"pairs[{p_index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(pair.keys()) != _PAIR_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, left, right "
+                "in order"
+            )
+
+        name = pair["name"]
+        left = pair["left"]
+        right = pair["right"]
+        for label, value in (("name", name), ("left", left), ("right", right)):
+            if not isinstance(value, str):
+                raise TypeError(f"{where}.{label} must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate pairs name: {name!r}")
+        seen_names.add(name)
+        if left == "":
+            raise ValueError(f"{where}.left must be non-empty")
+        if right == "":
+            raise ValueError(f"{where}.right must be non-empty")
+        if left not in region_names:
+            raise ValueError(
+                f"{where}.left must name a region in intervals.regions"
+            )
+        if right not in region_names:
+            raise ValueError(
+                f"{where}.right must name a region in intervals.regions"
+            )
+        if left == right:
+            raise ValueError(
+                f"{where}.left and {where}.right must name different regions"
+            )
+        validated.append(pair)
+
+    return validated
+
+
+def compare_region_intervals(intervals, pairs) -> dict:
+    """Compare region intervals pairwise, flattened by element and factor.
+
+    ``intervals`` must be a complete :func:`region_summary_intervals`
+    result (schema ``climate-grid/rr-interval-v1``) with exactly the keys
+    ``schema, years, reference, baseline, scenarios, elements, windows,
+    regions, factors, data`` in that order; every member is validated
+    against that contract, including the flat ``data`` rows (key order
+    ``region, element, window_count, count, center, uncertainty, lower,
+    upper``) and their invariants.
+
+    ``pairs`` must be a non-empty list whose items, in order, contain
+    exactly the keys ``name, left, right``.  Each value must be a
+    non-empty ``str``; pair ``name`` values must be unique, and ``left``
+    and ``right`` must name two different regions in
+    ``intervals.regions``.  A wrong container/item type raises
+    ``TypeError`` and any other violation raises ``ValueError``.
+
+    Rows are emitted flattened in pair, then element, then factor order.
+    When either region's interval for an element is missing its
+    statistics, the row reports ``center_delta``, ``lower_delta``,
+    ``upper_delta`` all ``None`` and ``overlap`` ``None``.  Otherwise,
+    writing ``L``/``R`` for the left/right region intervals at the
+    factor, the three deltas are ``R.center - L.center``,
+    ``R.lower - L.upper`` and ``R.upper - L.lower``, and ``overlap``
+    tells whether the closed intervals intersect.  A non-finite computed
+    value raises ``ValueError``.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    baseline, scenarios, elements, windows, regions, factors, pairs,
+    data``; ``schema`` is ``climate-grid/rr-interval-compare-v1`` and the
+    other metadata members echo the input in their original order.  Each
+    row uses the key order ``pair, left, right, element, factor,
+    center_delta, lower_delta, upper_delta, overlap``.  Every computed
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        years,
+        reference,
+        baseline,
+        scenarios,
+        elements,
+        windows,
+        regions,
+        factors,
+        interval_data,
+    ) = _validate_region_intervals(intervals)
+    validated_pairs = _validate_interval_pairs(pairs, regions)
+
+    n_elements = len(elements)
+    region_index = {region: index for index, region in enumerate(regions)}
+
+    def _delta(value: float, where: str) -> float:
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(f"{where} must be finite")
+        return _round_output(value)
+
+    result_rows: list[dict] = []
+    for pair in validated_pairs:
+        pair_name = pair["name"]
+        left_name = pair["left"]
+        right_name = pair["right"]
+        for e_index, element in enumerate(elements):
+            l_row = interval_data[
+                region_index[left_name] * n_elements + e_index
+            ]
+            r_row = interval_data[
+                region_index[right_name] * n_elements + e_index
+            ]
+            row_where = (
+                f"pairs[{pair_name!r}].data[{element!r}]"
+            )
+            for f_index, factor in enumerate(factors):
+                if (
+                    l_row["center"] is None
+                    or r_row["center"] is None
+                ):
+                    center_delta = None
+                    lower_delta = None
+                    upper_delta = None
+                    overlap = None
+                else:
+                    center_delta = _delta(
+                        r_row["center"] - l_row["center"],
+                        f"{row_where}.center_delta[{f_index}]",
+                    )
+                    l_lower = l_row["lower"][f_index]
+                    l_upper = l_row["upper"][f_index]
+                    r_lower = r_row["lower"][f_index]
+                    r_upper = r_row["upper"][f_index]
+                    lower_delta = _delta(
+                        r_lower - l_upper,
+                        f"{row_where}.lower_delta[{f_index}]",
+                    )
+                    upper_delta = _delta(
+                        r_upper - l_lower,
+                        f"{row_where}.upper_delta[{f_index}]",
+                    )
+                    overlap = l_lower <= r_upper and r_lower <= l_upper
+                result_rows.append(
+                    {
+                        "pair": pair_name,
+                        "left": left_name,
+                        "right": right_name,
+                        "element": element,
+                        "factor": factor,
+                        "center_delta": center_delta,
+                        "lower_delta": lower_delta,
+                        "upper_delta": upper_delta,
+                        "overlap": overlap,
+                    }
+                )
+
+    return {
+        "schema": _REGION_REPORT_INTERVAL_COMPARE_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "baseline": baseline,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
+        "factors": list(factors),
+        "pairs": validated_pairs,
         "data": result_rows,
     }
