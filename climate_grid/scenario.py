@@ -12699,3 +12699,260 @@ def window_rank(rs, *, minimum: int = 1) -> dict:
         "schema": _REGION_WINDOW_RANK_SCHEMA,
         "data": result_rows,
     }
+
+
+_REGION_WINDOW_RANK_CHANGE_SCHEMA = "climate-grid/wrc-v1"
+
+
+def _validate_window_rank(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list]:
+    """Validate a complete :func:`window_rank` result.
+
+    Returns the window names (in data order), the shared scenario order
+    and, per window, the scenario means (floats or ``None``).
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_WINDOW_RANK_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WINDOW_RANK_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WINDOW_RANK_SCHEMA!r}"
+        )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) == 0:
+        raise ValueError(f"{where}.data must be non-empty")
+
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _REGION_WINDOW_RANK_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys window, scenario, "
+                "total, valid, missing_rate, mean, best, worst, stddev "
+                "in order"
+            )
+
+        window = row["window"]
+        if not isinstance(window, str):
+            raise TypeError(f"{row_where}.window must be a str")
+        if window == "":
+            raise ValueError(f"{row_where}.window must be non-empty")
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario == "":
+            raise ValueError(f"{row_where}.scenario must be non-empty")
+
+        total = row["total"]
+        if not isinstance(total, int) or isinstance(total, bool):
+            raise TypeError(f"{row_where}.total must be a non-bool int")
+        if total < 1:
+            raise ValueError(f"{row_where}.total must be positive")
+        valid = row["valid"]
+        if not isinstance(valid, int) or isinstance(valid, bool):
+            raise TypeError(f"{row_where}.valid must be a non-bool int")
+        if valid < 0:
+            raise ValueError(f"{row_where}.valid must be non-negative")
+        if valid > total:
+            raise ValueError(
+                f"{row_where}.valid must not exceed {row_where}.total"
+            )
+
+        _validate_number(
+            row["missing_rate"], f"{row_where}.missing_rate", nullable=False
+        )
+        if row["missing_rate"] != _round_output((total - valid) / total):
+            raise ValueError(
+                f"{row_where}.missing_rate must equal "
+                "(total - valid) / total"
+            )
+
+        stat_fields = ("mean", "best", "worst", "stddev")
+        _validate_number(row["mean"], f"{row_where}.mean", nullable=True)
+        _validate_number(row["stddev"], f"{row_where}.stddev", nullable=True)
+        for name in ("best", "worst"):
+            value = row[name]
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{row_where}.{name} must be a non-bool int")
+            if value < 1:
+                raise ValueError(f"{row_where}.{name} must be positive")
+
+        none_flags = [row[name] is None for name in stat_fields]
+        if any(none_flags) and not all(none_flags):
+            raise ValueError(
+                f"{row_where}: mean, best, worst and stddev must be all "
+                "None or all present"
+            )
+        if valid == 0 and not all(none_flags):
+            raise ValueError(
+                f"{row_where}: mean, best, worst and stddev must be None "
+                "when valid is zero"
+            )
+        if not any(none_flags):
+            if row["best"] > row["worst"]:
+                raise ValueError(
+                    f"{row_where}.best must not exceed {row_where}.worst"
+                )
+            if not (row["best"] <= row["mean"] <= row["worst"]):
+                raise ValueError(
+                    f"{row_where}.mean must lie between best and worst"
+                )
+            if row["stddev"] < 0:
+                raise ValueError(f"{row_where}.stddev must be non-negative")
+
+    windows: list[str] = []
+    scenario_order: list[str] | None = None
+    means: list[list] = []
+    seen_windows: set[str] = set()
+    index = 0
+    n_rows = len(data)
+    while index < n_rows:
+        window = data[index]["window"]
+        if window in seen_windows:
+            raise ValueError(
+                f"{where}.data rows for window {window!r} must form a "
+                "single contiguous block"
+            )
+        seen_windows.add(window)
+        block_scenarios = []
+        block_means = []
+        while index < n_rows and data[index]["window"] == window:
+            block_scenarios.append(data[index]["scenario"])
+            block_means.append(data[index]["mean"])
+            index += 1
+        if len(set(block_scenarios)) != len(block_scenarios):
+            raise ValueError(
+                f"{where}.data window {window!r} lists a scenario more "
+                "than once"
+            )
+        if scenario_order is None:
+            scenario_order = block_scenarios
+        elif block_scenarios != scenario_order:
+            raise ValueError(
+                f"{where}.data window {window!r} must list the same "
+                "scenarios in the same order as the first window"
+            )
+        windows.append(window)
+        means.append(block_means)
+
+    return windows, scenario_order, means
+
+
+def rank_change(result, *, min_windows: int = 2) -> dict:
+    """Measure per-scenario rank-mean changes across ordered windows.
+
+    ``result`` must be a complete :func:`window_rank` result (schema
+    ``climate-grid/wr-v1``) whose ``data`` spans at least two windows,
+    arranged window-then-scenario with distinct window names and the
+    same scenario order in every window.  ``min_windows`` must be a
+    non-bool positive int.
+
+    For each scenario (in scenario order) the per-window ``mean`` values
+    form a series over the windows (in data order).  ``changes`` holds,
+    for each adjacent window pair, the later mean minus the earlier one,
+    or ``None`` when either mean is ``None``.  ``valid`` and ``count``
+    are the numbers of non-``None`` means and non-``None`` changes.
+    When ``valid < min_windows`` or ``count == 0``, ``mean_abs`` and
+    ``max`` are both ``None``; otherwise they are the mean and the
+    maximum of the absolute changes.  ``slope`` is the OLS slope of the
+    non-``None`` means against their window positions (0-based); it is
+    ``None`` when ``valid < max(min_windows, 2)``.
+
+    The returned mapping uses the key order ``schema, windows,
+    scenarios, data``; ``schema`` is ``climate-grid/wrc-v1`` and both
+    axes follow the input order.  ``data`` follows the scenario order;
+    each row uses the key order ``scenario, valid, count, changes,
+    mean_abs, max, slope`` and ``changes`` has ``len(windows) - 1``
+    members.  ``valid`` and ``count`` are ints; the ``changes`` members
+    and the three statistics are floats or ``None``; every output float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    windows, scenarios, means = _validate_window_rank(result)
+    if len(windows) < 2:
+        raise ValueError("result.data must span at least two windows")
+
+    if not isinstance(min_windows, int) or isinstance(min_windows, bool):
+        raise TypeError("min_windows must be a non-bool int")
+    if min_windows < 1:
+        raise ValueError("min_windows must be positive")
+
+    n_windows = len(windows)
+    slope_threshold = max(min_windows, 2)
+    result_rows = []
+    for s_index, scenario in enumerate(scenarios):
+        series = [means[w_index][s_index] for w_index in range(n_windows)]
+        valid = sum(1 for mean in series if mean is not None)
+
+        changes = []
+        for w_index in range(n_windows - 1):
+            left = series[w_index]
+            right = series[w_index + 1]
+            if left is None or right is None:
+                changes.append(None)
+            else:
+                changes.append(_round_output(right - left))
+
+        present = [change for change in changes if change is not None]
+        count = len(present)
+        if valid < min_windows or count == 0:
+            mean_abs = None
+            maximum = None
+        else:
+            mean_abs = _round_output(
+                sum(abs(change) for change in present) / count
+            )
+            maximum = _round_output(max(abs(change) for change in present))
+
+        if valid < slope_threshold:
+            slope = None
+        else:
+            xs = [
+                w_index
+                for w_index in range(n_windows)
+                if series[w_index] is not None
+            ]
+            ys = [series[w_index] for w_index in xs]
+            x_mean = sum(xs) / valid
+            y_mean = sum(ys) / valid
+            denominator = sum((x - x_mean) ** 2 for x in xs)
+            numerator = sum(
+                (x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)
+            )
+            slope = _round_output(numerator / denominator)
+
+        result_rows.append(
+            {
+                "scenario": scenario,
+                "valid": valid,
+                "count": count,
+                "changes": changes,
+                "mean_abs": mean_abs,
+                "max": maximum,
+                "slope": slope,
+            }
+        )
+
+    return {
+        "schema": _REGION_WINDOW_RANK_CHANGE_SCHEMA,
+        "windows": list(windows),
+        "scenarios": list(scenarios),
+        "data": result_rows,
+    }
