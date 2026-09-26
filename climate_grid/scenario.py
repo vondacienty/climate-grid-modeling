@@ -13221,3 +13221,276 @@ def rank_change_stability(result, *, min_changes: int = 1) -> dict:
         "scenarios": list(scenarios),
         "data": result_rows,
     }
+
+
+_STABILITY_SUM_SCHEMA = "climate-grid/ws-v1"
+_STABILITY_SUM_ITEM_KEYS = ("name", "result")
+_STABILITY_SUM_ROW_KEYS = (
+    "scenario",
+    "count",
+    "reversals",
+    "longest_run",
+    "stable_rate",
+    "level",
+)
+_STABILITY_LEVELS = ("stable", "low", "medium", "high")
+
+
+def _validate_rank_change_stability(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list]:
+    """Validate a complete :func:`rank_change_stability` result.
+
+    Returns the window names, the scenario order and the ``data`` rows.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_WINDOW_RANK_CHANGE_STABILITY_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, windows, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WINDOW_RANK_CHANGE_STABILITY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be "
+            f"{_REGION_WINDOW_RANK_CHANGE_STABILITY_SCHEMA!r}"
+        )
+
+    windows = _validate_string_list(
+        result["windows"], f"{where}.windows", minimum=2
+    )
+    scenarios = _validate_string_list(result["scenarios"], f"{where}.scenarios")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must have {len(scenarios)} rows (one per "
+            "scenario, in scenario order)"
+        )
+
+    max_count = len(windows) - 1
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _STABILITY_SUM_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, count, "
+                "reversals, longest_run, stable_rate, level in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario != scenarios[index]:
+            raise ValueError(
+                f"{row_where}.scenario must be {scenarios[index]!r} for its "
+                "scenario-order position"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if not 0 <= count <= max_count:
+            raise ValueError(
+                f"{row_where}.count must be between 0 and the number of "
+                "adjacent window pairs"
+            )
+
+        reversals = row["reversals"]
+        longest_run = row["longest_run"]
+        stable_rate = row["stable_rate"]
+        level = row["level"]
+        members = (reversals, longest_run, stable_rate, level)
+        if any(member is None for member in members):
+            if not all(member is None for member in members):
+                raise ValueError(
+                    f"{row_where}: reversals, longest_run, stable_rate and "
+                    "level must be all None or all present"
+                )
+            if count != 0:
+                raise ValueError(
+                    f"{row_where}: reversals, longest_run, stable_rate and "
+                    "level must be present when count is positive"
+                )
+            continue
+
+        if count < 1:
+            raise ValueError(
+                f"{row_where}: reversals, longest_run, stable_rate and "
+                "level must be None when count is zero"
+            )
+        if not isinstance(reversals, int) or isinstance(reversals, bool):
+            raise TypeError(f"{row_where}.reversals must be a non-bool int")
+        if not 0 <= reversals <= max(count - 1, 0):
+            raise ValueError(
+                f"{row_where}.reversals must be between 0 and "
+                f"{row_where}.count - 1"
+            )
+        if not isinstance(longest_run, int) or isinstance(longest_run, bool):
+            raise TypeError(f"{row_where}.longest_run must be a non-bool int")
+        if not 0 <= longest_run <= count:
+            raise ValueError(
+                f"{row_where}.longest_run must be between 0 and "
+                f"{row_where}.count"
+            )
+        _validate_number(stable_rate, f"{row_where}.stable_rate", nullable=False)
+        if not 0 <= stable_rate <= 1:
+            raise ValueError(
+                f"{row_where}.stable_rate must be between 0 and 1"
+            )
+        if not isinstance(level, str):
+            raise TypeError(f"{row_where}.level must be a str")
+        if level not in _STABILITY_LEVELS:
+            raise ValueError(
+                f"{row_where}.level must be one of stable, low, medium, high"
+            )
+
+    return windows, scenarios, data
+
+
+def stability_sum(items, *, min_items: int = 1) -> dict:
+    """Aggregate rank-change stability across named scenario runs.
+
+    ``items`` must be a non-empty list of mappings, each with exactly the
+    keys ``name, result`` in that order.  ``name`` is a unique non-empty
+    str and ``result`` is a complete :func:`rank_change_stability` result
+    (schema ``climate-grid/wrc-stability-v1``) with exactly the keys
+    ``schema, windows, scenarios, data`` in that order; every member is
+    validated against that contract, including each row's key order
+    ``scenario, count, reversals, longest_run, stable_rate, level`` and
+    the row invariants.  Every item's result must share the same
+    ``windows`` and ``scenarios`` in the same order; both are taken from
+    the first item.  ``min_items`` must be a non-bool positive int.
+
+    For every scenario (in scenario order) the rows whose ``level`` is
+    not ``None`` are collected across items: ``total`` is ``len(items)``,
+    ``valid`` is the number of collected rows, ``missing`` is
+    ``(total - valid) / total`` and ``levels`` counts the collected rows
+    at each of the levels ``stable, low, medium, high`` in that order.
+    When ``valid < min_items``, ``rate`` and ``uncertainty`` are both
+    ``None``; otherwise, with ``W`` the sum of the collected rows'
+    ``count``, ``rate`` is ``sum(count * stable_rate) / W`` and
+    ``uncertainty`` is
+    ``sqrt(sum(count * (stable_rate - rate) ** 2) / W)``.
+
+    The returned mapping uses the key order ``schema, windows, scenarios,
+    items, data``; ``schema`` is ``climate-grid/ws-v1``, both axes echo
+    the first item's result and ``items`` lists the item names in item
+    order.  ``data`` follows the scenario order; each row uses the key
+    order ``scenario, total, valid, missing, levels, rate, uncertainty``.
+    ``total``, ``valid`` and the ``levels`` counts are ints and every
+    output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    names: list[str] = []
+    validated: list[list] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _STABILITY_SUM_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        windows, scenarios, data = _validate_rank_change_stability(
+            item["result"], where=f"{where}.result"
+        )
+        if not validated:
+            first_windows = windows
+            first_scenarios = scenarios
+        else:
+            if windows != first_windows:
+                raise ValueError(
+                    "all items must share the same result windows in the "
+                    "same order, taken from the first item"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same result scenarios in the "
+                    "same order, taken from the first item"
+                )
+
+        names.append(name)
+        validated.append(data)
+
+    if not isinstance(min_items, int) or isinstance(min_items, bool):
+        raise TypeError("min_items must be a non-bool int")
+    if min_items < 1:
+        raise ValueError("min_items must be positive")
+
+    total = len(items)
+    result_rows = []
+    for s_index, scenario in enumerate(first_scenarios):
+        rows = [data[s_index] for data in validated]
+        present = [row for row in rows if row["level"] is not None]
+        valid = len(present)
+        missing = _round_output((total - valid) / total)
+        levels = [
+            sum(1 for row in present if row["level"] == level)
+            for level in _STABILITY_LEVELS
+        ]
+
+        if valid < min_items:
+            rate = None
+            uncertainty = None
+        else:
+            weight = sum(row["count"] for row in present)
+            rate_value = (
+                sum(row["count"] * row["stable_rate"] for row in present)
+                / weight
+            )
+            uncertainty_value = math.sqrt(
+                sum(
+                    row["count"] * (row["stable_rate"] - rate_value) ** 2
+                    for row in present
+                )
+                / weight
+            )
+            rate = _round_output(rate_value)
+            uncertainty = _round_output(uncertainty_value)
+
+        result_rows.append(
+            {
+                "scenario": scenario,
+                "total": total,
+                "valid": valid,
+                "missing": missing,
+                "levels": levels,
+                "rate": rate,
+                "uncertainty": uncertainty,
+            }
+        )
+
+    return {
+        "schema": _STABILITY_SUM_SCHEMA,
+        "windows": list(first_windows),
+        "scenarios": list(first_scenarios),
+        "items": names,
+        "data": result_rows,
+    }
