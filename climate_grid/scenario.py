@@ -15789,7 +15789,8 @@ def _validate_consensus_result(
     flat ``data`` row list.  ``data`` must hold one row per scenario in
     scenario order and every row must follow the ``climate-grid/mc-v1``
     contract, including the all-``None`` or all-present ``rates, agree,
-    entropy, band, spread, mean, abs, std`` group.
+    entropy, band, spread, mean, abs, std`` group; a present ``rates``
+    list must sum to ``1.0`` after ``round(x, 12)``.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -15892,6 +15893,10 @@ def _validate_consensus_result(
                 raise ValueError(
                     f"{row_where}.rates[{r_index}] must be between 0 and 1"
                 )
+        if round(sum(rates), 12) != 1.0:
+            raise ValueError(
+                f"{row_where}.rates must sum to 1.0"
+            )
         if sum(moves) <= 0:
             raise ValueError(
                 f"{row_where}.moves must have a positive total when "
@@ -15967,7 +15972,8 @@ def region_consensus(items, *, minimum: int = 1) -> dict:
     member is validated against that contract, including the flat
     per-scenario ``data`` row order, each row's key order
     ``scenario, n, moves, rates, agree, entropy, band, spread, mean,
-    abs, std`` and the all-``None`` or all-present optional group.
+    abs, std`` and the all-``None`` or all-present optional group; a
+    present ``rates`` list must sum to ``1.0`` after ``round(x, 12)``.
     Every result must share the same ``models`` and ``scenarios`` in
     the same order; both are taken from the first item.  ``minimum``
     must be a non-bool positive int.
@@ -16138,5 +16144,282 @@ def region_consensus(items, *, minimum: int = 1) -> dict:
         "scenarios": list(first_scenarios),
         "windows": windows,
         "regions": regions,
+        "data": rows,
+    }
+
+
+_REGION_CONSENSUS_OUTPUT_KEYS = (
+    "schema",
+    "scenarios",
+    "windows",
+    "regions",
+    "data",
+)
+_REGION_CONSENSUS_ROW_KEYS = ("region", "scenario", "count", "moves", "stats")
+_REGION_DELTA_SCHEMA = "climate-grid/rc-delta-v1"
+_REGION_DELTA_ITEM_KEYS = ("name", "result")
+
+
+def _validate_region_consensus_result(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`region_consensus` result.
+
+    Returns the ``scenarios`` and ``regions`` axes and the flat ``data``
+    row list.  ``data`` must hold one row per ``(region, scenario)`` pair
+    in region-then-scenario order and every row must follow the
+    ``climate-grid/rc-v1`` contract, including the all-``None`` or
+    all-present ``stats`` triple.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_CONSENSUS_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scenarios, "
+            "windows, regions, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_CONSENSUS_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_CONSENSUS_SCHEMA!r}"
+        )
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    windows = _validate_string_list(result["windows"], f"{where}.windows")
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(regions) * len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(region, scenario) pair"
+        )
+
+    for r_index, region in enumerate(regions):
+        for s_index, scenario in enumerate(scenarios):
+            row_index = r_index * len(scenarios) + s_index
+            row_where = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _REGION_CONSENSUS_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys region, "
+                    "scenario, count, moves, stats in order"
+                )
+
+            if not isinstance(row["region"], str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row["region"] != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its "
+                    "position"
+                )
+            if not isinstance(row["scenario"], str):
+                raise TypeError(f"{row_where}.scenario must be a str")
+            if row["scenario"] != scenario:
+                raise ValueError(
+                    f"{row_where}.scenario must be {scenario!r} for its "
+                    "position"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if not 0 <= count <= len(windows):
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and "
+                    f"{len(windows)}"
+                )
+
+            moves = row["moves"]
+            if not isinstance(moves, list):
+                raise TypeError(f"{row_where}.moves must be a list")
+            if len(moves) != 9:
+                raise ValueError(
+                    f"{row_where}.moves must have exactly 9 counts"
+                )
+            for m_index, m_count in enumerate(moves):
+                if not isinstance(m_count, int) or isinstance(m_count, bool):
+                    raise TypeError(
+                        f"{row_where}.moves[{m_index}] must be a non-bool "
+                        "int"
+                    )
+                if m_count < 0:
+                    raise ValueError(
+                        f"{row_where}.moves[{m_index}] must be non-negative"
+                    )
+
+            stats = row["stats"]
+            if not isinstance(stats, list):
+                raise TypeError(f"{row_where}.stats must be a list")
+            if len(stats) != 3:
+                raise ValueError(
+                    f"{row_where}.stats must have exactly 3 values"
+                )
+            presence = [value is not None for value in stats]
+            if not all(presence) and any(presence):
+                raise ValueError(
+                    f"{row_where}.stats must be all None or all present"
+                )
+            if not any(presence):
+                continue
+            for st_index, value in enumerate(stats):
+                _validate_number(
+                    value, f"{row_where}.stats[{st_index}]", nullable=False
+                )
+                if value < 0:
+                    raise ValueError(
+                        f"{row_where}.stats[{st_index}] must be "
+                        "non-negative"
+                    )
+            if count < 1:
+                raise ValueError(
+                    f"{row_where}.count must be positive when stats is "
+                    "present"
+                )
+            if sum(moves) <= 0:
+                raise ValueError(
+                    f"{row_where}.moves must have a positive total when "
+                    "stats is present"
+                )
+
+    return scenarios, regions, data
+
+
+def region_delta(items) -> dict:
+    """Compute per-region/per-scenario deltas between adjacent results.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a non-empty
+    str and every name must be unique.  ``result`` is a complete
+    :func:`region_consensus` result (schema ``climate-grid/rc-v1``)
+    with exactly the keys ``schema, scenarios, windows, regions, data``
+    in that order; every member is validated against that contract,
+    including the flat region-then-scenario ``data`` row order, each
+    row's key order ``region, scenario, count, moves, stats`` and the
+    all-``None`` or all-present ``stats`` triple.  Every result must
+    share the same ``scenarios`` and ``regions`` in the same order;
+    both are taken from the first item.
+
+    For each adjacent item pair (in item order), each region (in region
+    order) and each scenario (in scenario order) a delta row is
+    generated: ``count_delta`` is the right ``count`` minus the left
+    ``count``, ``moves_delta`` is the nine ``moves`` entries of the
+    right row minus those of the left row and ``stats_delta`` is the
+    three ``stats`` entries of the right row minus those of the left
+    row when neither side contains ``None``, otherwise three ``None``.
+
+    The returned mapping uses the key order ``schema, names, scenarios,
+    regions, data``; ``schema`` is ``climate-grid/rc-delta-v1``,
+    ``names`` echoes the input names in order and ``scenarios`` and
+    ``regions`` are taken from the first item.  ``data`` is a flat list
+    in adjacent-pair-then-region-then-scenario order; each row uses the
+    key order ``left, right, region, scenario, count_delta,
+    moves_delta, stats_delta`` where ``left`` and ``right`` are the
+    adjacent item names.  ``count_delta`` and the ``moves_delta``
+    entries are ints, the ``stats_delta`` entries are floats or
+    ``None`` and every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names: list[str] = []
+    validated: list[list] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _REGION_DELTA_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in "
+                "order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in names:
+            raise ValueError(f"duplicate name: {name!r}")
+        names.append(name)
+
+        scenarios, regions, result_rows = (
+            _validate_region_consensus_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated:
+            first_scenarios = scenarios
+            first_regions = regions
+        else:
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all results must share the same scenarios in the "
+                    "same order, taken from the first item"
+                )
+            if regions != first_regions:
+                raise ValueError(
+                    "all results must share the same regions in the "
+                    "same order, taken from the first item"
+                )
+        validated.append(result_rows)
+
+    rows = []
+    for pair_index in range(len(validated) - 1):
+        left_rows = validated[pair_index]
+        right_rows = validated[pair_index + 1]
+        for r_index, region in enumerate(first_regions):
+            for s_index, scenario in enumerate(first_scenarios):
+                row_index = r_index * len(first_scenarios) + s_index
+                left_row = left_rows[row_index]
+                right_row = right_rows[row_index]
+                left_stats = left_row["stats"]
+                right_stats = right_row["stats"]
+                if all(value is not None for value in left_stats) and all(
+                    value is not None for value in right_stats
+                ):
+                    stats_delta = [
+                        _round_output(right_stats[k] - left_stats[k])
+                        for k in range(3)
+                    ]
+                else:
+                    stats_delta = [None, None, None]
+                rows.append(
+                    {
+                        "left": names[pair_index],
+                        "right": names[pair_index + 1],
+                        "region": region,
+                        "scenario": scenario,
+                        "count_delta": (
+                            right_row["count"] - left_row["count"]
+                        ),
+                        "moves_delta": [
+                            right_row["moves"][k] - left_row["moves"][k]
+                            for k in range(9)
+                        ],
+                        "stats_delta": stats_delta,
+                    }
+                )
+
+    return {
+        "schema": _REGION_DELTA_SCHEMA,
+        "names": list(names),
+        "scenarios": list(first_scenarios),
+        "regions": list(first_regions),
         "data": rows,
     }
