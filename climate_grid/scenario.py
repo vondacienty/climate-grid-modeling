@@ -14576,3 +14576,339 @@ def converge_matrix(items, *, minimum: int = 1) -> dict:
         "layers": layers,
         "data": rows,
     }
+
+
+_CONVERGE_MATRIX_OUTPUT_KEYS = ("schema", "tolerance", "layers", "data")
+_CONVERGE_MATRIX_LAYER_KEYS = ("element", "region")
+_CONVERGE_MATRIX_ROW_KEYS = (
+    "scenario",
+    "count",
+    "states",
+    "interval",
+    "state",
+    "rank",
+)
+_CONVERGE_MATRIX_STATE_KEYS = ("stable", "uncertain", "divergent")
+_COMPARE_MATRIX_SCHEMA = "climate-grid/cmc-v1"
+_COMPARE_MATRIX_ITEM_KEYS = ("name", "matrix")
+
+
+def _validate_converge_matrix(
+    result: Any, *, where: str = "matrix"
+) -> tuple[float, list, list]:
+    """Validate a complete :func:`converge_matrix` result.
+
+    Returns the tolerance, the ``layers`` rows and the ``data`` rows.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _CONVERGE_MATRIX_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, tolerance, layers, "
+            "data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _CONVERGE_MATRIX_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_CONVERGE_MATRIX_SCHEMA!r}")
+
+    tolerance = result["tolerance"]
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
+        raise TypeError(f"{where}.tolerance must be a non-bool number")
+    if not _is_finite(tolerance):
+        raise ValueError(f"{where}.tolerance must be finite")
+    if tolerance < 0:
+        raise ValueError(f"{where}.tolerance must be non-negative")
+
+    layers = result["layers"]
+    if not isinstance(layers, list):
+        raise TypeError(f"{where}.layers must be a list")
+    if len(layers) == 0:
+        raise ValueError(f"{where}.layers must be non-empty")
+    seen_combinations: set[tuple[str, str]] = set()
+    validated_layers = []
+    for index, layer in enumerate(layers):
+        layer_where = f"{where}.layers[{index}]"
+        if not isinstance(layer, dict):
+            raise TypeError(f"{layer_where} must be a dict")
+        if tuple(layer.keys()) != _CONVERGE_MATRIX_LAYER_KEYS:
+            raise ValueError(
+                f"{layer_where} must have exactly the keys element, region "
+                "in order"
+            )
+        element = layer["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{layer_where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{layer_where}.element must be non-empty")
+        region = layer["region"]
+        if not isinstance(region, str):
+            raise TypeError(f"{layer_where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{layer_where}.region must be non-empty")
+        combination = (element, region)
+        if combination in seen_combinations:
+            raise ValueError(
+                f"duplicate {where}.layers element/region combination: "
+                f"{element!r}, {region!r}"
+            )
+        seen_combinations.add(combination)
+        validated_layers.append({"element": element, "region": region})
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) == 0:
+        raise ValueError(f"{where}.data must be non-empty")
+
+    seen_scenarios: set[str] = set()
+    ranks: list[int] = []
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _CONVERGE_MATRIX_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, count, "
+                "states, interval, state, rank in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario == "":
+            raise ValueError(f"{row_where}.scenario must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where}.data scenario: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if not 0 <= count <= len(validated_layers):
+            raise ValueError(
+                f"{row_where}.count must be between 0 and "
+                f"{len(validated_layers)}"
+            )
+
+        states = row["states"]
+        if not isinstance(states, dict):
+            raise TypeError(f"{row_where}.states must be a dict")
+        if tuple(states.keys()) != _CONVERGE_MATRIX_STATE_KEYS:
+            raise ValueError(
+                f"{row_where}.states must have exactly the keys stable, "
+                "uncertain, divergent in order"
+            )
+        for state_name, state_count in states.items():
+            if not isinstance(state_count, int) or isinstance(
+                state_count, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.states[{state_name!r}] must be a non-bool "
+                    "int"
+                )
+            if state_count < 0:
+                raise ValueError(
+                    f"{row_where}.states[{state_name!r}] must be "
+                    "non-negative"
+                )
+        if sum(states.values()) != count:
+            raise ValueError(
+                f"{row_where}.states counts must sum to {row_where}.count"
+            )
+
+        interval = row["interval"]
+        state = row["state"]
+        rank = row["rank"]
+        if interval is None or state is None or rank is None:
+            if interval is not None or state is not None or rank is not None:
+                raise ValueError(
+                    f"{row_where}: interval, state and rank must be all "
+                    "None or all present"
+                )
+            continue
+
+        if count == 0:
+            raise ValueError(
+                f"{row_where}: interval, state and rank must be None when "
+                "count is zero"
+            )
+
+        if not isinstance(interval, list):
+            raise TypeError(f"{row_where}.interval must be a list")
+        if len(interval) != 2:
+            raise ValueError(
+                f"{row_where}.interval must have exactly 2 bounds"
+            )
+        for bound_index, bound in enumerate(interval):
+            _validate_number(
+                bound, f"{row_where}.interval[{bound_index}]", nullable=False
+            )
+        if interval[0] < 0:
+            raise ValueError(f"{row_where}.interval[0] must be non-negative")
+        if interval[0] > interval[1]:
+            raise ValueError(
+                f"{row_where}.interval lower bound must not exceed the "
+                "upper bound"
+            )
+
+        if not isinstance(state, str):
+            raise TypeError(f"{row_where}.state must be a str")
+        if state not in _CONVERGE_STATES:
+            raise ValueError(
+                f"{row_where}.state must be one of stable, uncertain, "
+                "divergent"
+            )
+
+        if not isinstance(rank, int) or isinstance(rank, bool):
+            raise TypeError(f"{row_where}.rank must be a non-bool int")
+        if rank < 1:
+            raise ValueError(f"{row_where}.rank must be positive")
+        ranks.append(rank)
+
+    if sorted(ranks) != list(range(1, len(ranks) + 1)):
+        raise ValueError(
+            f"{where}.data ranks must be exactly 1..{len(ranks)} over the "
+            "rows with an interval"
+        )
+
+    return tolerance, validated_layers, data
+
+
+def compare_matrix(items) -> dict:
+    """Compare per-item :func:`converge_matrix` results against a baseline.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, matrix`` in that order.  ``name`` is a non-empty str
+    that is unique across items and ``matrix`` is a complete
+    :func:`converge_matrix` result (schema ``climate-grid/cvm-v1``); every
+    matrix is validated against that contract.  All matrices must share
+    the same ``tolerance``, the same ``layers`` and the same scenario
+    order, taken from the first item.
+
+    The first item is the baseline.  For every remaining item and every
+    scenario (in the shared scenario order) the row ``count`` is the
+    current ``count`` minus the baseline ``count`` and ``states`` lists
+    the three count differences at the states ``stable, uncertain,
+    divergent`` in that order.  When both rows have an ``interval``,
+    ``interval`` is ``[current lo − baseline lo, current hi − baseline
+    hi]``; otherwise it is ``None``.  ``from`` and ``to`` are the
+    baseline and current ``state`` and ``rank`` is the current ``rank``
+    minus the baseline ``rank`` when both are present, else ``None``.
+
+    The returned mapping uses the key order ``schema, reference, names,
+    tolerance, layers, scenarios, data``; ``schema`` is
+    ``climate-grid/cmc-v1``, ``reference`` is the first item's ``name``,
+    ``names`` lists the remaining names in item order and ``tolerance``,
+    ``layers`` and ``scenarios`` echo the first item's matrix.  ``data``
+    iterates the remaining items in order and then the scenarios in
+    order; each row uses the key order ``name, scenario, count, states,
+    interval, from, to, rank``.  ``count``, the ``states`` differences
+    and ``rank`` are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names = []
+    validated: list[dict] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _COMPARE_MATRIX_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, matrix in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        tolerance, layers, data = _validate_converge_matrix(
+            item["matrix"], where=f"{where}.matrix"
+        )
+        scenarios = [row["scenario"] for row in data]
+        if not validated:
+            first_tolerance = tolerance
+            first_layers = layers
+            first_scenarios = scenarios
+        else:
+            if tolerance != first_tolerance:
+                raise ValueError(
+                    "all items must share the same matrix tolerance, "
+                    "taken from the first item"
+                )
+            if layers != first_layers:
+                raise ValueError(
+                    "all items must share the same matrix layers, "
+                    "taken from the first item"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same matrix scenario order, "
+                    "taken from the first item"
+                )
+
+        names.append(name)
+        validated.append({row["scenario"]: row for row in data})
+
+    baseline = validated[0]
+    rows = []
+    for name, lookup in zip(names[1:], validated[1:]):
+        for scenario in first_scenarios:
+            current = lookup[scenario]
+            base = baseline[scenario]
+            if current["interval"] is not None and base["interval"] is not None:
+                interval = [
+                    _round_output(
+                        current["interval"][0] - base["interval"][0]
+                    ),
+                    _round_output(
+                        current["interval"][1] - base["interval"][1]
+                    ),
+                ]
+            else:
+                interval = None
+            if current["rank"] is not None and base["rank"] is not None:
+                rank = current["rank"] - base["rank"]
+            else:
+                rank = None
+            rows.append(
+                {
+                    "name": name,
+                    "scenario": scenario,
+                    "count": current["count"] - base["count"],
+                    "states": [
+                        current["states"][state] - base["states"][state]
+                        for state in _CONVERGE_MATRIX_STATE_KEYS
+                    ],
+                    "interval": interval,
+                    "from": base["state"],
+                    "to": current["state"],
+                    "rank": rank,
+                }
+            )
+
+    return {
+        "schema": _COMPARE_MATRIX_SCHEMA,
+        "reference": names[0],
+        "names": list(names[1:]),
+        "tolerance": first_tolerance,
+        "layers": [dict(layer) for layer in first_layers],
+        "scenarios": list(first_scenarios),
+        "data": rows,
+    }
