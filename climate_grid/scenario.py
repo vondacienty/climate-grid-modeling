@@ -10503,11 +10503,21 @@ _REGION_REPORT_SUMMARY_ROW_KEYS = (
     "max",
     "uncertainty",
 )
+_REGION_REPORT_AGGREGATE_ROW_KEYS = (
+    "region",
+    "element",
+    "window_count",
+    "count",
+    "mean",
+    "min",
+    "max",
+    "uncertainty",
+)
 
 
-def _validate_region_summary(
-    summary: Any, *, where: str = "summary"
-) -> tuple[list, str, str, list[str], list[str], list, list[str], list]:
+def _validate_region_report_metadata(
+    summary: Any, schema: str, *, where: str
+) -> tuple[list, str, str, list[str], list[str], list, list[str]]:
     if not isinstance(summary, dict):
         raise TypeError(f"{where} must be a dict")
     if tuple(summary.keys()) != _REGION_REPORT_SUMMARY_RESULT_KEYS:
@@ -10516,13 +10526,11 @@ def _validate_region_summary(
             "baseline, scenarios, elements, windows, regions, data in order"
         )
 
-    schema = summary["schema"]
-    if not isinstance(schema, str):
+    report_schema = summary["schema"]
+    if not isinstance(report_schema, str):
         raise TypeError(f"{where}.schema must be a str")
-    if schema != _REGION_REPORT_SUMMARY_SCHEMA:
-        raise ValueError(
-            f"{where}.schema must be {_REGION_REPORT_SUMMARY_SCHEMA!r}"
-        )
+    if report_schema != schema:
+        raise ValueError(f"{where}.schema must be {schema!r}")
 
     years = summary["years"]
     if not isinstance(years, list):
@@ -10591,6 +10599,18 @@ def _validate_region_summary(
             )
 
     regions = _validate_string_list(summary["regions"], f"{where}.regions")
+
+    return years, reference, baseline, scenarios, elements, windows, regions
+
+
+def _validate_region_summary(
+    summary: Any, *, where: str = "summary"
+) -> tuple[list, str, str, list[str], list[str], list, list[str], list]:
+    years, reference, baseline, scenarios, elements, windows, regions = (
+        _validate_region_report_metadata(
+            summary, _REGION_REPORT_SUMMARY_SCHEMA, where=where
+        )
+    )
 
     data = summary["data"]
     if not isinstance(data, list):
@@ -10686,8 +10706,133 @@ def _validate_region_summary(
                     raise ValueError(
                         f"{row_where}.uncertainty must be non-negative"
                     )
+                if mean is not None and not (minimum <= mean <= maximum):
+                    raise ValueError(
+                        f"{row_where}: non-null statistics must satisfy "
+                        "min <= mean <= max"
+                    )
 
                 row_index += 1
+
+    return years, reference, baseline, scenarios, elements, windows, regions, data
+
+
+def _validate_region_aggregate(
+    aggregate: Any, *, where: str = "aggregate"
+) -> tuple[list, str, str, list[str], list[str], list, list[str], dict]:
+    years, reference, baseline, scenarios, elements, windows, regions = (
+        _validate_region_report_metadata(
+            aggregate, _REGION_REPORT_AGGREGATE_SCHEMA, where=where
+        )
+    )
+
+    data = aggregate["data"]
+    if not isinstance(data, dict):
+        raise TypeError(f"{where}.data must be a dict")
+    if tuple(data.keys()) != tuple(regions):
+        raise ValueError(
+            f"{where}.data must be keyed by region in {where}.regions order"
+        )
+
+    n_windows = len(windows)
+    for region in regions:
+        region_map = data[region]
+        region_where = f"{where}.data[{region!r}]"
+        if not isinstance(region_map, dict):
+            raise TypeError(f"{region_where} must be a dict")
+        if tuple(region_map.keys()) != tuple(elements):
+            raise ValueError(
+                f"{region_where} must be keyed by element in "
+                f"{where}.elements order"
+            )
+        for element in elements:
+            row_where = f"{region_where}[{element!r}]"
+            row = region_map[element]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _REGION_REPORT_AGGREGATE_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys region, "
+                    "element, window_count, count, mean, min, max, "
+                    "uncertainty in order"
+                )
+
+            row_region = row["region"]
+            if not isinstance(row_region, str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row_region != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its region "
+                    "position"
+                )
+            row_element = row["element"]
+            if not isinstance(row_element, str):
+                raise TypeError(f"{row_where}.element must be a str")
+            if row_element != element:
+                raise ValueError(
+                    f"{row_where}.element must be {element!r} for its "
+                    "element position"
+                )
+
+            window_count = row["window_count"]
+            if not isinstance(window_count, int) or isinstance(
+                window_count, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.window_count must be a non-bool int"
+                )
+            if not 0 <= window_count <= n_windows:
+                raise ValueError(
+                    f"{row_where}.window_count must be between 0 and the "
+                    f"number of windows ({n_windows})"
+                )
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if count < 0:
+                raise ValueError(f"{row_where}.count must be non-negative")
+
+            mean = row["mean"]
+            minimum = row["min"]
+            maximum = row["max"]
+            uncertainty = row["uncertainty"]
+            _validate_number(mean, f"{row_where}.mean", nullable=True)
+            _validate_number(minimum, f"{row_where}.min", nullable=True)
+            _validate_number(maximum, f"{row_where}.max", nullable=True)
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=True
+            )
+            stats_present = (
+                mean is not None,
+                minimum is not None,
+                maximum is not None,
+                uncertainty is not None,
+            )
+            if not (all(stats_present) or not any(stats_present)):
+                raise ValueError(
+                    f"{row_where}: mean, min, max and uncertainty must be "
+                    "all None or all present"
+                )
+            if any(stats_present):
+                if window_count == 0:
+                    raise ValueError(
+                        f"{row_where}.window_count must be positive when "
+                        "mean, min, max and uncertainty are present"
+                    )
+                if count == 0:
+                    raise ValueError(
+                        f"{row_where}.count must be positive when mean, min, "
+                        "max and uncertainty are present"
+                    )
+                if uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+                if not (minimum <= mean <= maximum):
+                    raise ValueError(
+                        f"{row_where}: non-null statistics must satisfy "
+                        "min <= mean <= max"
+                    )
 
     return years, reference, baseline, scenarios, elements, windows, regions, data
 
@@ -10728,7 +10873,10 @@ def aggregate_region_summary(
     row uses the key order ``region, element, window_count, count, mean,
     min, max, uncertainty``.  ``window_count`` and ``count`` are
     ``int`` values (``k`` and ``N``) and every output float is
-    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  When
+    present, the statistics satisfy ``min <= mean <= max`` (every
+    collected input row satisfies the same invariant and the reported
+    ``mean`` is a convex combination of the input means).  The
     input is not modified.
 
     Raises ``TypeError`` for wrong container/item types and
@@ -10822,5 +10970,141 @@ def aggregate_region_summary(
         "elements": list(elements),
         "windows": windows,
         "regions": list(regions),
+        "data": result_data,
+    }
+
+
+_REGION_REPORT_INTERVAL_SCHEMA = "climate-grid/rr-interval-v1"
+_REGION_REPORT_INTERVAL_ROW_KEYS = (
+    "region",
+    "element",
+    "window_count",
+    "count",
+    "center",
+    "uncertainty",
+    "lower",
+    "upper",
+)
+
+
+def region_summary_intervals(aggregate, factors) -> dict:
+    """Build factor-scaled uncertainty intervals from an aggregate summary.
+
+    ``aggregate`` must be a complete :func:`aggregate_region_summary`
+    result (schema ``climate-grid/rr-aggregate-v1``) with exactly the
+    keys ``schema, years, reference, baseline, scenarios, elements,
+    windows, regions, data`` in that order; every member is validated
+    against that contract, including the nested ``data`` rows (key
+    order ``region, element, window_count, count, mean, min, max,
+    uncertainty``) and their invariants.
+
+    ``factors`` must be a non-empty ``list`` of finite non-bool positive
+    numbers in strictly increasing order; a wrong container or item
+    type raises ``TypeError`` and any other violation (including a
+    non-finite or non-positive factor, or a non-increasing sequence)
+    raises ``ValueError``.
+
+    ``data`` is flattened in region-then-element order; each row uses
+    the key order ``region, element, window_count, count, center,
+    uncertainty, lower, upper``.  Writing ``U`` for the row's
+    ``uncertainty``: when either ``mean`` or ``U`` is ``None``,
+    ``center`` and ``uncertainty`` are both ``None`` and ``lower`` and
+    ``upper`` are lists of ``None`` with one entry per factor.
+    Otherwise ``center`` is ``mean`` and, for each factor ``f`` in
+    order, ``lower`` and ``upper`` contain ``mean - f * U`` and
+    ``mean + f * U``.  Every computed float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``; a non-finite computed result
+    raises ``ValueError``.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    baseline, scenarios, elements, windows, regions, factors, data``;
+    ``schema`` is ``climate-grid/rr-interval-v1`` and the other metadata
+    members echo the input in their original order.  The input is not
+    modified.
+
+    Raises ``TypeError`` for wrong container/item types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        years,
+        reference,
+        baseline,
+        scenarios,
+        elements,
+        windows,
+        regions,
+        data,
+    ) = _validate_region_aggregate(aggregate)
+
+    if not isinstance(factors, list):
+        raise TypeError("factors must be a list")
+    if len(factors) == 0:
+        raise ValueError("factors must be non-empty")
+    for index, factor in enumerate(factors):
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+            raise TypeError(
+                f"factors[{index}] must be a finite non-bool positive "
+                "number"
+            )
+        if not math.isfinite(factor) or factor <= 0:
+            raise ValueError(
+                f"factors[{index}] must be finite and positive"
+            )
+    for index in range(1, len(factors)):
+        if factors[index] <= factors[index - 1]:
+            raise ValueError("factors must be strictly increasing")
+
+    result_data = []
+    for region in regions:
+        for element in elements:
+            row = data[region][element]
+            mean = row["mean"]
+            uncertainty = row["uncertainty"]
+            if mean is None or uncertainty is None:
+                center = None
+                row_uncertainty = None
+                lower = [None] * len(factors)
+                upper = [None] * len(factors)
+            else:
+                center = _round_output(mean)
+                row_uncertainty = _round_output(uncertainty)
+                lower = []
+                upper = []
+                for factor in factors:
+                    lower_bound = _round_output(mean - factor * uncertainty)
+                    upper_bound = _round_output(mean + factor * uncertainty)
+                    if not (
+                        math.isfinite(lower_bound)
+                        and math.isfinite(upper_bound)
+                    ):
+                        raise ValueError(
+                            "computed interval bounds must be finite"
+                        )
+                    lower.append(lower_bound)
+                    upper.append(upper_bound)
+
+            result_data.append(
+                {
+                    "region": region,
+                    "element": element,
+                    "window_count": row["window_count"],
+                    "count": row["count"],
+                    "center": center,
+                    "uncertainty": row_uncertainty,
+                    "lower": lower,
+                    "upper": upper,
+                }
+            )
+
+    return {
+        "schema": _REGION_REPORT_INTERVAL_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "baseline": baseline,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
+        "factors": list(factors),
         "data": result_data,
     }
