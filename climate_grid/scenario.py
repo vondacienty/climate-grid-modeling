@@ -6822,3 +6822,258 @@ def aggregate_attribute_layers(result, *, min_layers: int = 1) -> dict:
         "drivers": list(drivers),
         "data": result_data,
     }
+
+
+_RANK_ATTRIBUTE_SCENARIO_SCHEMA = "climate-grid/ra-scenario-v1"
+_RANK_ATTRIBUTE_SCENARIO_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "count",
+    "difference",
+    "uncertainty",
+)
+
+
+def _validate_rank_attribute_layer_summary(
+    summary: Any, *, where: str = "summary"
+) -> tuple[dict, list, list[str], list[str], list[str], list]:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _RANK_ATTRIBUTE_LAYER_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, layers, "
+            "scenarios, elements, drivers, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _RANK_ATTRIBUTE_LAYER_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_RANK_ATTRIBUTE_LAYER_SUMMARY_SCHEMA!r}"
+        )
+
+    reference = _validate_rank_attribute_layer_ref(
+        summary["reference"], f"{where}.reference"
+    )
+    layers = summary["layers"]
+    if not isinstance(layers, list):
+        raise TypeError(f"{where}.layers must be a list")
+    if len(layers) == 0:
+        raise ValueError(f"{where}.layers must be non-empty")
+    seen_pairs = {(reference["period"], reference["region"])}
+    for index, layer in enumerate(layers):
+        _validate_rank_attribute_layer_ref(layer, f"{where}.layers[{index}]")
+        pair = (layer["period"], layer["region"])
+        if pair in seen_pairs:
+            raise ValueError(
+                f"duplicate period/region pair: {pair!r}"
+            )
+        seen_pairs.add(pair)
+
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        summary["elements"], f"{where}.elements"
+    )
+    drivers = _validate_string_list(summary["drivers"], f"{where}.drivers")
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(scenarios) * len(elements) * len(drivers)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/element/driver combination, in "
+            "scenario-then-element-then-driver order)"
+        )
+
+    n_layers = len(layers)
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for driver in drivers:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _RANK_ATTRIBUTE_LAYER_SUMMARY_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, driver, count, mean, min, max, uncertainty "
+                        "in order"
+                    )
+
+                row_scenario = row["scenario"]
+                if not isinstance(row_scenario, str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row_scenario != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_driver = row["driver"]
+                if not isinstance(row_driver, str):
+                    raise TypeError(f"{row_where}.driver must be a str")
+                if row_driver != driver:
+                    raise ValueError(
+                        f"{row_where}.driver must be {driver!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{row_where}.count must be a non-bool int")
+                if count < 0 or count > n_layers:
+                    raise ValueError(
+                        f"{row_where}.count must be between 0 and the "
+                        "number of layers"
+                    )
+
+                mean = row["mean"]
+                minimum = row["min"]
+                maximum = row["max"]
+                uncertainty = row["uncertainty"]
+                _validate_number(mean, f"{row_where}.mean", nullable=True)
+                _validate_number(minimum, f"{row_where}.min", nullable=True)
+                _validate_number(maximum, f"{row_where}.max", nullable=True)
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                present = [mean is not None, minimum is not None,
+                           maximum is not None, uncertainty is not None]
+                if any(present) and not all(present):
+                    raise ValueError(
+                        f"{row_where}: mean, min, max and uncertainty must "
+                        "be all None or all present"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                row_index += 1
+
+    return reference, layers, scenarios, elements, drivers, data
+
+
+def compare_layer_scenarios(summary, *, min_layers: int = 1) -> dict:
+    """Compare per-scenario layer aggregates against the first scenario.
+
+    ``summary`` must be a complete :func:`aggregate_attribute_layers` result
+    (schema ``climate-grid/ra-layer-summary-v1``) with exactly the keys
+    ``schema, reference, layers, scenarios, elements, drivers, data`` in that
+    order; every member is validated against that contract, including the
+    ``reference`` and ``layers`` dicts (exactly the keys ``period, region``
+    in that order, both non-empty str, with the ``(period, region)`` pairs
+    unique across the reference and all layers), the flat
+    scenario-then-element-then-driver ``data`` row order, each row's key
+    order ``scenario, element, driver, count, mean, min, max, uncertainty``
+    and the row invariants (``count`` a non-bool int between 0 and the
+    number of layers; ``mean``, ``min``, ``max`` and ``uncertainty`` all
+    ``None`` or all finite numbers, with ``uncertainty`` non-negative).
+    ``scenarios`` must contain at least 2 items and ``min_layers`` must be
+    a non-bool positive int.
+
+    The first scenario is the reference.  For every remaining scenario (in
+    scenario order), element (in element order) and driver (in driver
+    order), its row is paired with the reference scenario's row for the
+    same element and driver and ``count`` is the smaller of the two row
+    counts.  When either row's ``count`` is below ``min_layers`` or either
+    row's ``mean``/``uncertainty`` is ``None``, ``difference`` and
+    ``uncertainty`` are both ``None``; otherwise they are
+    ``mean - reference_mean`` and ``sqrt(u0 ** 2 + u1 ** 2)`` respectively.
+
+    The returned mapping uses the key order ``schema, reference, scenarios,
+    elements, drivers, data``; ``schema`` is ``climate-grid/ra-scenario-v1``,
+    ``reference`` is the first scenario and ``scenarios`` lists the
+    remaining scenarios, with ``elements`` and ``drivers`` echoing the
+    input axes in their original order.  ``data`` is a flat list in
+    scenario-then-element-then-driver order; each row uses the key order
+    ``scenario, element, driver, count, difference, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        _reference,
+        _layers,
+        scenarios,
+        elements,
+        drivers,
+        data,
+    ) = _validate_rank_attribute_layer_summary(summary)
+
+    if not isinstance(min_layers, int) or isinstance(min_layers, bool):
+        raise TypeError("min_layers must be a non-bool int")
+    if min_layers < 1:
+        raise ValueError("min_layers must be positive")
+    if len(scenarios) < 2:
+        raise ValueError("summary.scenarios must contain at least 2 items")
+
+    n_elements = len(elements)
+    n_drivers = len(drivers)
+
+    result_data = []
+    for s_index, scenario in enumerate(scenarios[1:], start=1):
+        for e_index, element in enumerate(elements):
+            for d_index, driver in enumerate(drivers):
+                reference_row = data[(0 * n_elements + e_index) * n_drivers + d_index]
+                row = data[(s_index * n_elements + e_index) * n_drivers + d_index]
+
+                count = min(reference_row["count"], row["count"])
+                reference_mean = reference_row["mean"]
+                mean = row["mean"]
+                reference_uncertainty = reference_row["uncertainty"]
+                uncertainty = row["uncertainty"]
+                if (
+                    reference_row["count"] < min_layers
+                    or row["count"] < min_layers
+                    or reference_mean is None
+                    or mean is None
+                    or reference_uncertainty is None
+                    or uncertainty is None
+                ):
+                    difference = None
+                    combined = None
+                else:
+                    difference = _round_output(mean - reference_mean)
+                    combined = _round_output(
+                        math.sqrt(
+                            reference_uncertainty * reference_uncertainty
+                            + uncertainty * uncertainty
+                        )
+                    )
+
+                result_data.append(
+                    {
+                        "scenario": scenario,
+                        "element": element,
+                        "driver": driver,
+                        "count": count,
+                        "difference": difference,
+                        "uncertainty": combined,
+                    }
+                )
+
+    return {
+        "schema": _RANK_ATTRIBUTE_SCENARIO_SCHEMA,
+        "reference": scenarios[0],
+        "scenarios": list(scenarios[1:]),
+        "elements": list(elements),
+        "drivers": list(drivers),
+        "data": result_data,
+    }
