@@ -5757,9 +5757,10 @@ def _validate_rank_attribute_batch(
                         "(one per config)"
                     )
                 for index, value in enumerate(values):
-                    _validate_number(
-                        value, f"{member_where}[{index}]", nullable=True
-                    )
+                    target = f"{member_where}[{index}]"
+                    _validate_number(value, target, nullable=True)
+                    if member == "uncertainty" and value is not None and value < 0:
+                        raise ValueError(f"{target} must be non-negative")
                 none_patterns.append([value is None for value in values])
 
             if none_patterns[0] != none_patterns[1]:
@@ -5797,8 +5798,9 @@ def compare_batch_rank_attribute(items) -> dict:
     including the flat element-then-driver ``data`` row order, each row's
     key order ``element, driver, count, contribution, uncertainty`` and the
     per-config ``contribution``/``uncertainty`` lists (``None`` at the same
-    positions in both, present at exactly ``count`` positions or none, and
-    all ``None`` when ``count`` is below 2).  Every item's attribution must
+    positions in both, present at exactly ``count`` positions or none, all
+    ``None`` when ``count`` is below 2 and non-``None`` uncertainties
+    non-negative).  Every item's attribution must
     share the same ``reference``, ``configs``, ``elements`` and ``drivers``
     in the same order; all four are taken from the first item.
 
@@ -5936,6 +5938,292 @@ def compare_batch_rank_attribute(items) -> dict:
         "schema": _RANK_ATTRIBUTE_COMPARE_SCHEMA,
         "reference": names[0],
         "scenarios": names[1:],
+        "elements": list(first_elements),
+        "drivers": list(first_drivers),
+        "data": result_data,
+    }
+
+
+_RANK_ATTRIBUTE_GROUP_SUMMARY_SCHEMA = "climate-grid/ra-group-summary-v1"
+_RANK_ATTRIBUTE_COMPARE_KEYS = (
+    "schema",
+    "reference",
+    "scenarios",
+    "elements",
+    "drivers",
+    "data",
+)
+_RANK_ATTRIBUTE_COMPARE_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "count",
+    "contribution",
+    "uncertainty",
+)
+_RANK_ATTRIBUTE_GROUP_ITEM_KEYS = ("name", "comparison")
+
+
+def _validate_rank_attribute_compare(
+    comparison: Any, *, where: str = "comparison"
+) -> tuple[str, list[str], list[str], list[str], dict]:
+    if not isinstance(comparison, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(comparison.keys()) != _RANK_ATTRIBUTE_COMPARE_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, scenarios, "
+            "elements, drivers, data in order"
+        )
+
+    schema = comparison["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _RANK_ATTRIBUTE_COMPARE_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_RANK_ATTRIBUTE_COMPARE_SCHEMA!r}")
+
+    reference = comparison["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(comparison["scenarios"], f"{where}.scenarios")
+    if reference in scenarios:
+        raise ValueError(
+            f"{where}.scenarios must not contain the reference {reference!r}"
+        )
+    elements = _validate_string_list(comparison["elements"], f"{where}.elements")
+    drivers = _validate_string_list(comparison["drivers"], f"{where}.drivers")
+
+    data = comparison["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(scenarios) * len(elements) * len(drivers)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/element/driver combination, in "
+            "scenario-then-element-then-driver order)"
+        )
+
+    rows: dict[tuple[str, str, str], dict] = {}
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for driver in drivers:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _RANK_ATTRIBUTE_COMPARE_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, driver, count, contribution, uncertainty "
+                        "in order"
+                    )
+
+                row_scenario = row["scenario"]
+                if not isinstance(row_scenario, str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row_scenario != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_driver = row["driver"]
+                if not isinstance(row_driver, str):
+                    raise TypeError(f"{row_where}.driver must be a str")
+                if row_driver != driver:
+                    raise ValueError(
+                        f"{row_where}.driver must be {driver!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{row_where}.count must be a non-bool int")
+                if count < 0:
+                    raise ValueError(f"{row_where}.count must be non-negative")
+
+                contribution = row["contribution"]
+                uncertainty = row["uncertainty"]
+                _validate_number(
+                    contribution, f"{row_where}.contribution", nullable=True
+                )
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                if (contribution is None) != (uncertainty is None):
+                    raise ValueError(
+                        f"{row_where}: contribution and uncertainty must be "
+                        "both None or both present"
+                    )
+                if (count == 0) != (contribution is None):
+                    raise ValueError(
+                        f"{row_where}: contribution and uncertainty must be "
+                        "None exactly when count is zero"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                rows[(scenario, element, driver)] = row
+                row_index += 1
+
+    return reference, scenarios, elements, drivers, rows
+
+
+def summarize_rank_attribute_groups(items) -> dict:
+    """Pool grouped rank-attribution comparisons per scenario/element/driver.
+
+    ``items`` must be a list of at least two mappings, each with exactly the
+    keys ``name, comparison`` in that order.  ``name`` is a unique non-empty
+    str and ``comparison`` is a complete :func:`compare_batch_rank_attribute`
+    result (schema ``climate-grid/ra-compare-v1``) with exactly the keys
+    ``schema, reference, scenarios, elements, drivers, data`` in that order;
+    every member is validated against that contract, including the flat
+    scenario-then-element-then-driver ``data`` row order, each row's key
+    order ``scenario, element, driver, count, contribution, uncertainty``
+    and the row invariants (``count`` a non-negative non-bool int;
+    ``contribution`` and ``uncertainty`` both ``None`` exactly when
+    ``count`` is zero and both finite numbers otherwise, with
+    ``uncertainty`` non-negative).  The items' ``reference`` values may
+    differ, but every item's comparison must share the same ``scenarios``,
+    ``elements`` and ``drivers`` in the same order; all three are taken
+    from the first item.
+
+    For every scenario (in scenario order), element (in element order) and
+    driver (in driver order), the rows with ``count > 0`` across all items
+    are pooled as ``(n, c, u)`` triples.  ``group_count`` is the number of
+    retained rows and ``count`` is ``N = Σn``.  When ``N`` is zero,
+    ``contribution`` and ``uncertainty`` are both ``None``; otherwise they
+    are the count-weighted pool ``C = Σ(n c) / N`` and
+    ``U = √(Σ(n u)²) / N``.
+
+    The returned mapping uses the key order ``schema, groups, scenarios,
+    elements, drivers, data``; ``schema`` is
+    ``climate-grid/ra-group-summary-v1``, ``groups`` lists the item names
+    in item order and ``scenarios``/``elements``/``drivers`` are taken from
+    the first item's comparison.  ``data`` is a flat list of rows in
+    scenario-then-element-then-driver order; each row uses the key order
+    ``scenario, element, driver, group_count, count, contribution,
+    uncertainty``.  ``group_count`` and ``count`` are ints and every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names: list[str] = []
+    validated_rows: list[dict] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _RANK_ATTRIBUTE_GROUP_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, comparison in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate item name: {name!r}")
+        seen_names.add(name)
+
+        _reference, scenarios, elements, drivers, rows = (
+            _validate_rank_attribute_compare(
+                item["comparison"], where=f"{where}.comparison"
+            )
+        )
+        if not validated_rows:
+            first_scenarios = scenarios
+            first_elements = elements
+            first_drivers = drivers
+        else:
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same comparison scenarios in "
+                    "the same order, taken from the first item"
+                )
+            if elements != first_elements:
+                raise ValueError(
+                    "all items must share the same comparison elements in "
+                    "the same order, taken from the first item"
+                )
+            if drivers != first_drivers:
+                raise ValueError(
+                    "all items must share the same comparison drivers in "
+                    "the same order, taken from the first item"
+                )
+
+        names.append(name)
+        validated_rows.append(rows)
+
+    result_data = []
+    for scenario in first_scenarios:
+        for element in first_elements:
+            for driver in first_drivers:
+                key = (scenario, element, driver)
+                retained = [
+                    rows[key] for rows in validated_rows if rows[key]["count"] > 0
+                ]
+                group_count = len(retained)
+                total = sum(row["count"] for row in retained)
+                if total == 0:
+                    contribution = None
+                    uncertainty = None
+                else:
+                    contribution = _round_output(
+                        sum(
+                            row["count"] * row["contribution"] for row in retained
+                        )
+                        / total
+                    )
+                    uncertainty = _round_output(
+                        math.sqrt(
+                            sum(
+                                (row["count"] * row["uncertainty"]) ** 2
+                                for row in retained
+                            )
+                        )
+                        / total
+                    )
+
+                result_data.append(
+                    {
+                        "scenario": scenario,
+                        "element": element,
+                        "driver": driver,
+                        "group_count": group_count,
+                        "count": total,
+                        "contribution": contribution,
+                        "uncertainty": uncertainty,
+                    }
+                )
+
+    return {
+        "schema": _RANK_ATTRIBUTE_GROUP_SUMMARY_SCHEMA,
+        "groups": names,
+        "scenarios": list(first_scenarios),
         "elements": list(first_elements),
         "drivers": list(first_drivers),
         "data": result_data,
