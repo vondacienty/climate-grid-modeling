@@ -16423,3 +16423,292 @@ def region_delta(items) -> dict:
         "regions": list(first_regions),
         "data": rows,
     }
+
+
+_REGION_DELTA_OUTPUT_KEYS = ("schema", "names", "scenarios", "regions", "data")
+_REGION_DELTA_ROW_KEYS = (
+    "left",
+    "right",
+    "region",
+    "scenario",
+    "count_delta",
+    "moves_delta",
+    "stats_delta",
+)
+_REGION_DELTA_SUMMARY_SCHEMA = "climate-grid/rc-delta-summary-v1"
+
+
+def _validate_region_delta_result(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`region_delta` result.
+
+    Returns the ``names``, ``scenarios`` and ``regions`` axes and the
+    flat ``data`` row list.  ``data`` must hold one row per
+    ``(pair, region, scenario)`` triple in adjacent-pair-then-region-
+    then-scenario order and every row must follow the
+    ``climate-grid/rc-delta-v1`` contract, including the all-``None``
+    or all-present ``stats_delta`` triple.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_DELTA_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, names, "
+            "scenarios, regions, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_DELTA_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_REGION_DELTA_SCHEMA!r}")
+
+    names = _validate_string_list(result["names"], f"{where}.names", minimum=2)
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != (len(names) - 1) * len(regions) * len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(pair, region, scenario) triple"
+        )
+
+    for pair_index in range(len(names) - 1):
+        left_name = names[pair_index]
+        right_name = names[pair_index + 1]
+        for r_index, region in enumerate(regions):
+            for s_index, scenario in enumerate(scenarios):
+                row_index = (
+                    pair_index * len(regions) * len(scenarios)
+                    + r_index * len(scenarios)
+                    + s_index
+                )
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _REGION_DELTA_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys left, "
+                        "right, region, scenario, count_delta, "
+                        "moves_delta, stats_delta in order"
+                    )
+
+                if not isinstance(row["left"], str):
+                    raise TypeError(f"{row_where}.left must be a str")
+                if row["left"] != left_name:
+                    raise ValueError(
+                        f"{row_where}.left must be {left_name!r} for its "
+                        "position"
+                    )
+                if not isinstance(row["right"], str):
+                    raise TypeError(f"{row_where}.right must be a str")
+                if row["right"] != right_name:
+                    raise ValueError(
+                        f"{row_where}.right must be {right_name!r} for its "
+                        "position"
+                    )
+                if not isinstance(row["region"], str):
+                    raise TypeError(f"{row_where}.region must be a str")
+                if row["region"] != region:
+                    raise ValueError(
+                        f"{row_where}.region must be {region!r} for its "
+                        "position"
+                    )
+                if not isinstance(row["scenario"], str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row["scenario"] != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for "
+                        "its position"
+                    )
+
+                count_delta = row["count_delta"]
+                if not isinstance(count_delta, int) or isinstance(
+                    count_delta, bool
+                ):
+                    raise TypeError(
+                        f"{row_where}.count_delta must be a non-bool int"
+                    )
+
+                moves_delta = row["moves_delta"]
+                if not isinstance(moves_delta, list):
+                    raise TypeError(f"{row_where}.moves_delta must be a list")
+                if len(moves_delta) != 9:
+                    raise ValueError(
+                        f"{row_where}.moves_delta must have exactly 9 "
+                        "counts"
+                    )
+                for m_index, m_delta in enumerate(moves_delta):
+                    if not isinstance(m_delta, int) or isinstance(
+                        m_delta, bool
+                    ):
+                        raise TypeError(
+                            f"{row_where}.moves_delta[{m_index}] must be a "
+                            "non-bool int"
+                        )
+
+                stats_delta = row["stats_delta"]
+                if not isinstance(stats_delta, list):
+                    raise TypeError(
+                        f"{row_where}.stats_delta must be a list"
+                    )
+                if len(stats_delta) != 3:
+                    raise ValueError(
+                        f"{row_where}.stats_delta must have exactly 3 "
+                        "values"
+                    )
+                presence = [value is not None for value in stats_delta]
+                if not all(presence) and any(presence):
+                    raise ValueError(
+                        f"{row_where}.stats_delta must be all None or all "
+                        "present"
+                    )
+                for st_index, value in enumerate(stats_delta):
+                    if value is None:
+                        continue
+                    _validate_number(
+                        value,
+                        f"{row_where}.stats_delta[{st_index}]",
+                        nullable=False,
+                    )
+
+    return names, scenarios, regions, data
+
+
+def region_delta_summary(result, *, minimum: int = 1) -> dict:
+    """Summarize per-scenario/per-region stats deltas across pairs.
+
+    ``result`` must be a complete :func:`region_delta` result (schema
+    ``climate-grid/rc-delta-v1``), validated against that contract
+    exactly as produced by :func:`region_delta`.  ``minimum`` must be a
+    non-bool positive int.
+
+    For each scenario (in scenario order) and each region (in region
+    order) the row's contributing vectors ``d`` are the ``stats_delta``
+    triples without ``None`` gathered across the adjacent pairs and
+    ``n`` is their number.  When ``n < minimum``, ``delta`` is
+    ``[None, None, None]`` and ``magnitude``, ``dispersion`` and
+    ``rank`` are ``None``; otherwise ``delta[j]`` is the sum of the
+    ``d[j]`` and, with ``m = hypot(d[0], d[1], d[2])`` per vector,
+    ``magnitude = sum(m) / n`` and
+    ``dispersion = sqrt(sum((m - magnitude) ** 2) / n)``.
+
+    Within each scenario the regions are ranked by unrounded
+    ``magnitude`` descending, ties keeping the ``regions`` order;
+    regions below ``minimum`` keep their ``regions`` order after the
+    ranked ones and get ``rank`` ``None``.
+
+    The returned mapping uses the key order ``schema, names, scenarios,
+    regions, data``; ``schema`` is ``climate-grid/rc-delta-summary-v1``
+    and the axes echo the input.  ``data`` is flattened in scenario
+    then rank order; each row uses the key order ``scenario, region,
+    count, delta, magnitude, dispersion, rank`` where ``count`` is an
+    int, ``delta`` holds three floats or ``None`` and ``rank`` is an
+    int or ``None``.  Every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/row/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite values.
+    """
+    names, scenarios, regions, data = _validate_region_delta_result(result)
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_scenarios = len(scenarios)
+    block = len(regions) * n_scenarios
+
+    rows = []
+    for s_index, scenario in enumerate(scenarios):
+        entries = []
+        for r_index, region in enumerate(regions):
+            vectors = []
+            for pair_index in range(len(names) - 1):
+                row = data[
+                    pair_index * block + r_index * n_scenarios + s_index
+                ]
+                stats_delta = row["stats_delta"]
+                if all(value is not None for value in stats_delta):
+                    vectors.append(stats_delta)
+            count = len(vectors)
+            if count < minimum:
+                entries.append(
+                    {
+                        "region": region,
+                        "count": count,
+                        "delta": None,
+                        "magnitude": None,
+                        "dispersion": None,
+                    }
+                )
+            else:
+                delta = [
+                    sum(vector[j] for vector in vectors) for j in range(3)
+                ]
+                magnitudes = [
+                    math.hypot(vector[0], vector[1], vector[2])
+                    for vector in vectors
+                ]
+                magnitude = sum(magnitudes) / count
+                dispersion = math.sqrt(
+                    sum((m - magnitude) ** 2 for m in magnitudes) / count
+                )
+                entries.append(
+                    {
+                        "region": region,
+                        "count": count,
+                        "delta": delta,
+                        "magnitude": magnitude,
+                        "dispersion": dispersion,
+                    }
+                )
+
+        valid = [entry for entry in entries if entry["magnitude"] is not None]
+        # Stable sort: ties keep the regions order.
+        valid.sort(key=lambda entry: -entry["magnitude"])
+        invalid = [entry for entry in entries if entry["magnitude"] is None]
+        for rank, entry in enumerate(valid, 1):
+            entry["rank"] = rank
+
+        for entry in valid + invalid:
+            delta = entry["delta"]
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "region": entry["region"],
+                    "count": entry["count"],
+                    "delta": (
+                        [None, None, None]
+                        if delta is None
+                        else [_round_output(value) for value in delta]
+                    ),
+                    "magnitude": (
+                        None
+                        if entry["magnitude"] is None
+                        else _round_output(entry["magnitude"])
+                    ),
+                    "dispersion": (
+                        None
+                        if entry["dispersion"] is None
+                        else _round_output(entry["dispersion"])
+                    ),
+                    "rank": entry.get("rank"),
+                }
+            )
+
+    return {
+        "schema": _REGION_DELTA_SUMMARY_SCHEMA,
+        "names": list(names),
+        "scenarios": list(scenarios),
+        "regions": list(regions),
+        "data": rows,
+    }
