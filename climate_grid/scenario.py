@@ -7560,6 +7560,11 @@ def _validate_layer_sum_result(
                         f"{row_where}: mean, min, max and uncertainty must be "
                         "all None or all present"
                     )
+                if count == 0 and mean is not None:
+                    raise ValueError(
+                        f"{row_where}: mean, min, max and uncertainty must be "
+                        "all None when count is 0"
+                    )
                 if uncertainty is not None and uncertainty < 0:
                     raise ValueError(
                         f"{row_where}.uncertainty must be non-negative"
@@ -7582,7 +7587,8 @@ def layer_trend(summaries, years, *, min_points: int = 2) -> dict:
     order ``scenario, element, driver, count, mean, min, max,
     uncertainty`` and the row invariants (``count`` a non-negative
     non-bool int; ``mean``, ``min``, ``max`` and ``uncertainty`` all
-    ``None`` or all finite numbers, with ``uncertainty`` non-negative).
+    ``None`` or all finite numbers, all ``None`` whenever ``count`` is
+    0, with ``uncertainty`` non-negative).
     Every summary must share the same ``reference`` and the same
     ``scenarios``, ``elements`` and ``drivers`` in the same order; all
     four are taken from the first summary.  ``years`` must be a list
@@ -7729,5 +7735,257 @@ def layer_trend(summaries, years, *, min_points: int = 2) -> dict:
         "scenarios": list(first_scenarios),
         "elements": list(first_elements),
         "drivers": list(first_drivers),
+        "data": result_data,
+    }
+
+
+_LAYER_TREND_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "scenarios",
+    "elements",
+    "drivers",
+    "data",
+)
+_LAYER_TREND_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "count",
+    "slope",
+    "uncertainty",
+)
+_LAYER_TREND_COMPARE_SCHEMA = "climate-grid/ltc-v1"
+
+
+def _validate_layer_trend_result(
+    trend: Any, *, where: str = "trend"
+) -> tuple[list, str, list[str], list[str], list[str], list]:
+    if not isinstance(trend, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(trend.keys()) != _LAYER_TREND_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "scenarios, elements, drivers, data in order"
+        )
+
+    schema = trend["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _LAYER_TREND_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_LAYER_TREND_SCHEMA!r}")
+
+    years = trend["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = trend["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        trend["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        trend["elements"], f"{where}.elements"
+    )
+    drivers = _validate_string_list(trend["drivers"], f"{where}.drivers")
+
+    data = trend["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(scenarios) * len(elements) * len(drivers)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/element/driver combination, in "
+            "scenario-then-element-then-driver order)"
+        )
+
+    n_years = len(years)
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for driver in drivers:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _LAYER_TREND_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, driver, count, slope, uncertainty "
+                        "in order"
+                    )
+
+                row_scenario = row["scenario"]
+                if not isinstance(row_scenario, str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row_scenario != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_driver = row["driver"]
+                if not isinstance(row_driver, str):
+                    raise TypeError(f"{row_where}.driver must be a str")
+                if row_driver != driver:
+                    raise ValueError(
+                        f"{row_where}.driver must be {driver!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{row_where}.count must be a non-bool int")
+                if count < 0 or count > n_years:
+                    raise ValueError(
+                        f"{row_where}.count must be between 0 and the "
+                        "number of years"
+                    )
+
+                slope = row["slope"]
+                uncertainty = row["uncertainty"]
+                _validate_number(slope, f"{row_where}.slope", nullable=True)
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                if (slope is None) != (uncertainty is None):
+                    raise ValueError(
+                        f"{row_where}: slope and uncertainty must be "
+                        "both None or both present"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                row_index += 1
+
+    return years, reference, scenarios, elements, drivers, data
+
+
+def compare_trends(trend) -> dict:
+    """Compare per-scenario layer trends against the first scenario.
+
+    ``trend`` must be a complete :func:`layer_trend` result (schema
+    ``climate-grid/lt-v1``) with exactly the keys ``schema, years,
+    reference, scenarios, elements, drivers, data`` in that order; every
+    member is validated against that contract, including the non-empty
+    strictly increasing non-bool int ``years``, the non-empty str
+    ``reference``, the flat scenario-then-element-then-driver ``data``
+    row order, each row's key order ``scenario, element, driver, count,
+    slope, uncertainty`` and the row invariants (``count`` a non-bool
+    int between 0 and the number of years; ``slope`` and ``uncertainty``
+    both ``None`` or both finite numbers, with ``uncertainty``
+    non-negative).  ``scenarios`` must contain at least 2 items.
+
+    The first scenario is the reference.  For every remaining scenario
+    (in scenario order), element (in element order) and driver (in
+    driver order), its row is paired with the reference scenario's row
+    for the same element and driver and ``count`` is the smaller of the
+    two row counts.  When either row's ``count`` is below 2 or either
+    row's ``slope``/``uncertainty`` is ``None``, ``difference`` and
+    ``uncertainty`` are both ``None``; otherwise they are
+    ``slope - reference_slope`` and ``sqrt(u0 ** 2 + u1 ** 2)``
+    respectively.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    scenarios, elements, drivers, data``; ``schema`` is
+    ``climate-grid/ltc-v1``, ``years`` echoes the input years,
+    ``reference`` is the first scenario and ``scenarios`` lists the
+    remaining scenarios, with ``elements`` and ``drivers`` echoing the
+    input axes in their original order.  ``data`` is a flat list in
+    scenario-then-element-then-driver order; each row uses the key order
+    ``scenario, element, driver, count, difference, uncertainty``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        years,
+        _reference,
+        scenarios,
+        elements,
+        drivers,
+        data,
+    ) = _validate_layer_trend_result(trend)
+
+    if len(scenarios) < 2:
+        raise ValueError("trend.scenarios must contain at least 2 items")
+
+    n_elements = len(elements)
+    n_drivers = len(drivers)
+
+    result_data = []
+    for s_index, scenario in enumerate(scenarios[1:], start=1):
+        for e_index, element in enumerate(elements):
+            for d_index, driver in enumerate(drivers):
+                reference_row = data[(0 * n_elements + e_index) * n_drivers + d_index]
+                row = data[(s_index * n_elements + e_index) * n_drivers + d_index]
+
+                count = min(reference_row["count"], row["count"])
+                reference_slope = reference_row["slope"]
+                slope = row["slope"]
+                reference_uncertainty = reference_row["uncertainty"]
+                uncertainty = row["uncertainty"]
+                if (
+                    reference_row["count"] < 2
+                    or row["count"] < 2
+                    or reference_slope is None
+                    or slope is None
+                    or reference_uncertainty is None
+                    or uncertainty is None
+                ):
+                    difference = None
+                    combined = None
+                else:
+                    difference = _round_output(slope - reference_slope)
+                    combined = _round_output(
+                        math.sqrt(
+                            reference_uncertainty * reference_uncertainty
+                            + uncertainty * uncertainty
+                        )
+                    )
+
+                result_data.append(
+                    {
+                        "scenario": scenario,
+                        "element": element,
+                        "driver": driver,
+                        "count": count,
+                        "difference": difference,
+                        "uncertainty": combined,
+                    }
+                )
+
+    return {
+        "schema": _LAYER_TREND_COMPARE_SCHEMA,
+        "years": list(years),
+        "reference": scenarios[0],
+        "scenarios": list(scenarios[1:]),
+        "elements": list(elements),
+        "drivers": list(drivers),
         "data": result_data,
     }
