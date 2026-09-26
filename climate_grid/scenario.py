@@ -13235,6 +13235,151 @@ _STABILITY_SUM_ROW_KEYS = (
 )
 _STABILITY_LEVELS = ("stable", "low", "medium", "high")
 
+_SCALE_DELTA_SCHEMA = "climate-grid/wsd-v1"
+_SCALE_DELTA_ITEM_KEYS = ("name", "result")
+_SCALE_DELTA_RESULT_KEYS = (
+    "schema",
+    "windows",
+    "scenarios",
+    "items",
+    "data",
+)
+_SCALE_DELTA_ROW_KEYS = (
+    "left",
+    "right",
+    "scenario",
+    "missing_delta",
+    "level_deltas",
+    "rate_delta",
+    "uncertainty",
+)
+
+
+def _validate_scale_delta_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list[str], list]:
+    """Validate a complete :func:`stability_sum` result.
+
+    Returns the window names, the scenario order, the item names and the
+    ``data`` rows.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _SCALE_DELTA_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, windows, "
+            "scenarios, items, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _STABILITY_SUM_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_STABILITY_SUM_SCHEMA!r}")
+
+    windows = _validate_string_list(
+        result["windows"], f"{where}.windows", minimum=2
+    )
+    scenarios = _validate_string_list(result["scenarios"], f"{where}.scenarios")
+    scale_items = _validate_string_list(result["items"], f"{where}.items")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must have {len(scenarios)} rows (one per "
+            "scenario, in scenario order)"
+        )
+
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != (
+            "scenario",
+            "total",
+            "valid",
+            "missing",
+            "levels",
+            "rate",
+            "uncertainty",
+        ):
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, total, "
+                "valid, missing, levels, rate, uncertainty in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario != scenarios[index]:
+            raise ValueError(
+                f"{row_where}.scenario must be {scenarios[index]!r} for its "
+                "scenario-order position"
+            )
+
+        total = row["total"]
+        valid = row["valid"]
+        if not isinstance(total, int) or isinstance(total, bool):
+            raise TypeError(f"{row_where}.total must be a non-bool int")
+        if total < 1:
+            raise ValueError(f"{row_where}.total must be positive")
+        if not isinstance(valid, int) or isinstance(valid, bool):
+            raise TypeError(f"{row_where}.valid must be a non-bool int")
+        if not 0 <= valid <= total:
+            raise ValueError(
+                f"{row_where}.valid must be between 0 and {row_where}.total"
+            )
+
+        missing = row["missing"]
+        _validate_number(missing, f"{row_where}.missing", nullable=False)
+        if not 0.0 <= missing <= 1.0:
+            raise ValueError(
+                f"{row_where}.missing must be between 0 and 1"
+            )
+
+        levels = row["levels"]
+        if not isinstance(levels, list):
+            raise TypeError(f"{row_where}.levels must be a list")
+        if len(levels) != len(_STABILITY_LEVELS):
+            raise ValueError(
+                f"{row_where}.levels must have {len(_STABILITY_LEVELS)} "
+                "counts (stable, low, medium, high)"
+            )
+        for level_index, level_count in enumerate(levels):
+            level_where = f"{row_where}.levels[{level_index}]"
+            if not isinstance(level_count, int) or isinstance(
+                level_count, bool
+            ):
+                raise TypeError(f"{level_where} must be a non-bool int")
+            if level_count < 0:
+                raise ValueError(f"{level_where} must be non-negative")
+        if sum(levels) != valid:
+            raise ValueError(
+                f"{row_where}.levels counts must sum to {row_where}.valid"
+            )
+
+        rate = row["rate"]
+        uncertainty = row["uncertainty"]
+        if rate is None or uncertainty is None:
+            if rate is not None or uncertainty is not None:
+                raise ValueError(
+                    f"{row_where}: rate and uncertainty must be both None or "
+                    "both present"
+                )
+        else:
+            _validate_number(rate, f"{row_where}.rate", nullable=False)
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=False
+            )
+            if uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+
+    return windows, scenarios, scale_items, data
+
 
 def _validate_rank_change_stability(
     result: Any, *, where: str = "result"
@@ -13492,5 +13637,153 @@ def stability_sum(items, *, min_items: int = 1) -> dict:
         "windows": list(first_windows),
         "scenarios": list(first_scenarios),
         "items": names,
+        "data": result_rows,
+    }
+
+
+def scale_delta(items) -> dict:
+    """Compare adjacent-scale :func:`stability_sum` results.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a unique
+    non-empty str naming the scale and ``result`` is a complete
+    :func:`stability_sum` result (schema ``climate-grid/ws-v1``) with
+    exactly the keys ``schema, windows, scenarios, items, data`` in that
+    order; every member is validated against that contract, including
+    each row's key order ``scenario, total, valid, missing, levels, rate,
+    uncertainty`` and the row invariants.  Every item's result must share
+    the same ``windows``, ``scenarios`` and ``items`` in the same order;
+    the axes are taken from the first item.
+
+    For every pair of adjacent scales (in item order) and every scenario
+    (in scenario order), a row compares the later scale's data row
+    against the earlier one: ``missing_delta`` is later ``missing`` minus
+    earlier ``missing`` and ``level_deltas`` is the four-int list of
+    later ``levels`` counts minus earlier counts (stable, low, medium,
+    high, in that order).  Only when both rows have ``rate`` and
+    ``uncertainty`` present (neither ``None``) are ``rate_delta`` (later
+    ``rate`` minus earlier ``rate``) and ``uncertainty``
+    (``hypot(earlier uncertainty, later uncertainty)``) emitted;
+    otherwise both are ``None``.
+
+    The returned mapping uses the key order ``schema, scales, scenarios,
+    data``; ``schema`` is ``climate-grid/wsd-v1``, ``scales`` lists the
+    item names in item order and ``scenarios`` echoes the first item's
+    result.  ``data`` follows adjacent-scale-pair then scenario order;
+    each row uses the key order ``left, right, scenario, missing_delta,
+    level_deltas, rate_delta, uncertainty`` with ``left``/``right`` the
+    earlier/later scale names.  The ``level_deltas`` entries are ints and
+    every output float is ``round(x, 12)`` with negative zero normalized
+    to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two entries")
+
+    names: list[str] = []
+    validated: list[list] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _SCALE_DELTA_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        windows, scenarios, result_items, data = _validate_scale_delta_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not validated:
+            first_windows = windows
+            first_scenarios = scenarios
+            first_items = result_items
+        else:
+            if windows != first_windows:
+                raise ValueError(
+                    "all items must share the same result windows in the "
+                    "same order, taken from the first item"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same result scenarios in the "
+                    "same order, taken from the first item"
+                )
+            if result_items != first_items:
+                raise ValueError(
+                    "all items must share the same result items in the "
+                    "same order, taken from the first item"
+                )
+
+        names.append(name)
+        validated.append(data)
+
+    result_rows = []
+    for pair_index in range(len(items) - 1):
+        left_rows = validated[pair_index]
+        right_rows = validated[pair_index + 1]
+        left_name = names[pair_index]
+        right_name = names[pair_index + 1]
+        for s_index, scenario in enumerate(first_scenarios):
+            left_row = left_rows[s_index]
+            right_row = right_rows[s_index]
+
+            missing_delta = _round_output(
+                right_row["missing"] - left_row["missing"]
+            )
+            level_deltas = [
+                right_row["levels"][level_index]
+                - left_row["levels"][level_index]
+                for level_index in range(len(_STABILITY_LEVELS))
+            ]
+
+            left_rate = left_row["rate"]
+            right_rate = right_row["rate"]
+            left_uncertainty = left_row["uncertainty"]
+            right_uncertainty = right_row["uncertainty"]
+            if (
+                left_rate is not None
+                and right_rate is not None
+                and left_uncertainty is not None
+                and right_uncertainty is not None
+            ):
+                rate_delta = _round_output(right_rate - left_rate)
+                uncertainty = _round_output(
+                    math.hypot(left_uncertainty, right_uncertainty)
+                )
+            else:
+                rate_delta = None
+                uncertainty = None
+
+            result_rows.append(
+                {
+                    "left": left_name,
+                    "right": right_name,
+                    "scenario": scenario,
+                    "missing_delta": missing_delta,
+                    "level_deltas": level_deltas,
+                    "rate_delta": rate_delta,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _SCALE_DELTA_SCHEMA,
+        "scales": names,
+        "scenarios": list(first_scenarios),
         "data": result_rows,
     }
