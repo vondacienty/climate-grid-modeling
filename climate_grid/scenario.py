@@ -10686,6 +10686,11 @@ def _validate_region_summary(
                     raise ValueError(
                         f"{row_where}.uncertainty must be non-negative"
                     )
+                if mean is not None and not minimum <= mean <= maximum:
+                    raise ValueError(
+                        f"{row_where} must satisfy min <= mean <= max when "
+                        "mean, min and max are present"
+                    )
 
                 row_index += 1
 
@@ -10703,7 +10708,8 @@ def aggregate_region_summary(
     regions, data`` in that order; every member is validated against that
     contract, including the flat ``data`` rows (key order ``window,
     region, element, count, mean, min, max, uncertainty``) and their
-    invariants.
+    invariants (in particular, rows with statistics present must satisfy
+    ``min <= mean <= max``).
 
     ``min_windows`` must be a non-bool positive ``int``; a wrong type
     raises ``TypeError`` and a non-positive value raises ``ValueError``.
@@ -10823,4 +10829,346 @@ def aggregate_region_summary(
         "windows": windows,
         "regions": list(regions),
         "data": result_data,
+    }
+
+
+_REGION_REPORT_INTERVAL_SCHEMA = "climate-grid/rr-interval-v1"
+_REGION_REPORT_AGGREGATE_ROW_KEYS = (
+    "region",
+    "element",
+    "window_count",
+    "count",
+    "mean",
+    "min",
+    "max",
+    "uncertainty",
+)
+
+
+def _validate_region_aggregate(
+    aggregate: Any, *, where: str = "aggregate"
+) -> tuple[list, str, str, list[str], list[str], list, list[str], dict]:
+    if not isinstance(aggregate, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(aggregate.keys()) != _REGION_REPORT_SUMMARY_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "baseline, scenarios, elements, windows, regions, data in order"
+        )
+
+    schema = aggregate["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_REPORT_AGGREGATE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_REPORT_AGGREGATE_SCHEMA!r}"
+        )
+
+    years = aggregate["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = aggregate["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    baseline = aggregate["baseline"]
+    if not isinstance(baseline, str):
+        raise TypeError(f"{where}.baseline must be a str")
+    if baseline == "":
+        raise ValueError(f"{where}.baseline must be non-empty")
+
+    scenarios = _validate_string_list(
+        aggregate["scenarios"], f"{where}.scenarios"
+    )
+    if baseline in scenarios:
+        raise ValueError(
+            f"{where}.baseline must not appear in {where}.scenarios"
+        )
+    elements = _validate_string_list(
+        aggregate["elements"], f"{where}.elements"
+    )
+
+    windows = aggregate["windows"]
+    if not isinstance(windows, list):
+        raise TypeError(f"{where}.windows must be a list")
+    if len(windows) == 0:
+        raise ValueError(f"{where}.windows must be non-empty")
+    seen_windows: set[str] = set()
+    for index, window in enumerate(windows):
+        window_where = f"{where}.windows[{index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{window_where} must be a dict")
+        if list(window.keys()) != ["name", "start", "end"]:
+            raise ValueError(
+                f"{window_where} must have exactly the keys name, start, "
+                "end in order"
+            )
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{window_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{window_where}.name must be non-empty")
+        if name in seen_windows:
+            raise ValueError(f"duplicate {where}.windows name: {name!r}")
+        seen_windows.add(name)
+        start_day = _parse_date(window["start"], f"{window_where}.start")
+        end_day = _parse_date(window["end"], f"{window_where}.end")
+        if start_day > end_day:
+            raise ValueError(
+                f"{window_where}.start must be on or before "
+                f"{window_where}.end"
+            )
+
+    regions = _validate_string_list(aggregate["regions"], f"{where}.regions")
+
+    data = aggregate["data"]
+    if not isinstance(data, dict):
+        raise TypeError(f"{where}.data must be a dict")
+    if tuple(data.keys()) != tuple(regions):
+        raise ValueError(
+            f"{where}.data must be keyed by region, in {where}.regions "
+            "order"
+        )
+    n_scenarios = len(scenarios)
+    n_windows = len(windows)
+    for region in regions:
+        region_where = f"{where}.data[{region!r}]"
+        by_element = data[region]
+        if not isinstance(by_element, dict):
+            raise TypeError(f"{region_where} must be a dict")
+        if tuple(by_element.keys()) != tuple(elements):
+            raise ValueError(
+                f"{region_where} must be keyed by element, in "
+                f"{where}.elements order"
+            )
+        for element in elements:
+            row_where = f"{region_where}[{element!r}]"
+            row = by_element[element]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _REGION_REPORT_AGGREGATE_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys region, "
+                    "element, window_count, count, mean, min, max, "
+                    "uncertainty in order"
+                )
+
+            row_region = row["region"]
+            if not isinstance(row_region, str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row_region != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its "
+                    "region-then-element position"
+                )
+            row_element = row["element"]
+            if not isinstance(row_element, str):
+                raise TypeError(f"{row_where}.element must be a str")
+            if row_element != element:
+                raise ValueError(
+                    f"{row_where}.element must be {element!r} for its "
+                    "region-then-element position"
+                )
+
+            window_count = row["window_count"]
+            if not isinstance(window_count, int) or isinstance(
+                window_count, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.window_count must be a non-bool int"
+                )
+            if window_count < 0 or window_count > n_windows:
+                raise ValueError(
+                    f"{row_where}.window_count must be between 0 and the "
+                    f"number of windows ({n_windows})"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if count < 0 or count > n_scenarios * n_windows:
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and the number "
+                    "of scenario/window combinations "
+                    f"({n_scenarios * n_windows})"
+                )
+
+            mean = row["mean"]
+            minimum = row["min"]
+            maximum = row["max"]
+            uncertainty = row["uncertainty"]
+            _validate_number(mean, f"{row_where}.mean", nullable=True)
+            _validate_number(minimum, f"{row_where}.min", nullable=True)
+            _validate_number(maximum, f"{row_where}.max", nullable=True)
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=True
+            )
+            stats_present = (
+                mean is not None,
+                minimum is not None,
+                maximum is not None,
+                uncertainty is not None,
+            )
+            if not (all(stats_present) or not any(stats_present)):
+                raise ValueError(
+                    f"{row_where}: mean, min, max and uncertainty must "
+                    "be all None or all present"
+                )
+            if any(stats_present):
+                if window_count == 0:
+                    raise ValueError(
+                        f"{row_where}.window_count must be positive when "
+                        "mean, min, max and uncertainty are present"
+                    )
+                if count == 0:
+                    raise ValueError(
+                        f"{row_where}.count must be positive when mean, "
+                        "min, max and uncertainty are present"
+                    )
+            if uncertainty is not None and uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+            if mean is not None and not minimum <= mean <= maximum:
+                raise ValueError(
+                    f"{row_where} must satisfy min <= mean <= max when "
+                    "mean, min and max are present"
+                )
+
+    return years, reference, baseline, scenarios, elements, windows, regions, data
+
+
+def region_summary_intervals(aggregate, factors) -> dict:
+    """Expand an :func:`aggregate_region_summary` result into intervals.
+
+    ``aggregate`` must be a complete :func:`aggregate_region_summary`
+    result (schema ``climate-grid/rr-aggregate-v1``) with exactly the
+    keys ``schema, years, reference, baseline, scenarios, elements,
+    windows, regions, data`` in that order; every member is validated
+    against that contract, including the nested ``data`` rows (key order
+    ``region, element, window_count, count, mean, min, max,
+    uncertainty``) and their invariants.
+
+    ``factors`` must be a non-empty, strictly increasing list of finite,
+    non-bool, positive ``int``/``float`` values; a wrong item type raises
+    ``TypeError`` and any other violation raises ``ValueError``.
+
+    For each region (in region order) and element (in element order) one
+    flat row is emitted with the key order ``region, element,
+    window_count, count, center, uncertainty, lower, upper``.  Writing
+    ``U`` for the row's ``uncertainty``: when ``mean`` or ``U`` is
+    ``None`` the row reports ``center`` and ``uncertainty`` as ``None``
+    and ``lower``/``upper`` as all-``None`` lists with one entry per
+    factor; otherwise ``center`` is ``mean``, ``uncertainty`` is ``U``
+    and, for each factor ``f``, ``lower``/``upper`` are ``mean - f * U``
+    and ``mean + f * U``.  A non-finite computed bound raises
+    ``ValueError``.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    baseline, scenarios, elements, windows, regions, factors, data``;
+    ``schema`` is ``climate-grid/rr-interval-v1`` and the other metadata
+    members echo the input in their original order.  Every computed
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        years,
+        reference,
+        baseline,
+        scenarios,
+        elements,
+        windows,
+        regions,
+        data,
+    ) = _validate_region_aggregate(aggregate)
+
+    if not isinstance(factors, list):
+        raise TypeError("factors must be a list")
+    if len(factors) == 0:
+        raise ValueError("factors must be non-empty")
+    for index, factor in enumerate(factors):
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+            raise TypeError(
+                f"factors[{index}] must be a finite non-bool int or float"
+            )
+        if not math.isfinite(factor):
+            raise ValueError(f"factors[{index}] must be finite")
+        if factor <= 0:
+            raise ValueError(f"factors[{index}] must be positive")
+    for index in range(1, len(factors)):
+        if factors[index] <= factors[index - 1]:
+            raise ValueError("factors must be strictly increasing")
+
+    def _bound(value: float, where: str) -> float:
+        if not math.isfinite(value):
+            raise ValueError(f"{where} must be finite")
+        return _round_output(value)
+
+    result_rows = []
+    for region in regions:
+        for element in elements:
+            row = data[region][element]
+            row_where = f"aggregate.data[{region!r}][{element!r}]"
+            mean = row["mean"]
+            uncertainty = row["uncertainty"]
+            if mean is None or uncertainty is None:
+                center = None
+                out_uncertainty = None
+                lower = [None] * len(factors)
+                upper = [None] * len(factors)
+            else:
+                center = mean
+                out_uncertainty = uncertainty
+                lower = [
+                    _bound(
+                        mean - factor * uncertainty,
+                        f"{row_where}.lower[{index}]",
+                    )
+                    for index, factor in enumerate(factors)
+                ]
+                upper = [
+                    _bound(
+                        mean + factor * uncertainty,
+                        f"{row_where}.upper[{index}]",
+                    )
+                    for index, factor in enumerate(factors)
+                ]
+            result_rows.append(
+                {
+                    "region": region,
+                    "element": element,
+                    "window_count": row["window_count"],
+                    "count": row["count"],
+                    "center": center,
+                    "uncertainty": out_uncertainty,
+                    "lower": lower,
+                    "upper": upper,
+                }
+            )
+
+    return {
+        "schema": _REGION_REPORT_INTERVAL_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "baseline": baseline,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
+        "factors": list(factors),
+        "data": result_rows,
     }
