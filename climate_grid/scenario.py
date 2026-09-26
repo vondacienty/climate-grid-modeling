@@ -12382,6 +12382,17 @@ def _validate_region_interval_ranking(
                             raise ValueError(
                                 f"{row_where}.rank must run consecutively from 1"
                             )
+                        if (
+                            center_delta is None
+                            or lower_delta is None
+                            or upper_delta is None
+                            or overlap is None
+                        ):
+                            raise ValueError(
+                                f"{row_where}: center_delta, lower_delta, "
+                                "upper_delta and overlap must be present when "
+                                "rank is not None"
+                            )
                         _validate_number(
                             center_delta, f"{row_where}.center_delta",
                             nullable=True,
@@ -12396,16 +12407,6 @@ def _validate_region_interval_ranking(
                         )
                         if not isinstance(overlap, bool):
                             raise TypeError(f"{row_where}.overlap must be a bool")
-                        if (
-                            center_delta is None
-                            or lower_delta is None
-                            or upper_delta is None
-                        ):
-                            raise ValueError(
-                                f"{row_where}: center_delta, lower_delta and "
-                                "upper_delta must be present when rank is not "
-                                "None"
-                            )
                         if (
                             previous_center is not None
                             and center_delta > previous_center
@@ -12527,5 +12528,174 @@ def rank_region_stability(ranking, *, min_ranks: int = 1) -> dict:
     return {
         "schema": _REGION_RANK_STABILITY_SCHEMA,
         "scenarios": list(scenarios),
+        "data": result_rows,
+    }
+
+
+_REGION_WINDOW_RANK_SCHEMA = "climate-grid/wr-v1"
+_REGION_WINDOW_RANK_RESULT_KEYS = ("schema", "data")
+_REGION_WINDOW_RANK_ROW_KEYS = (
+    "window",
+    "scenario",
+    "total",
+    "valid",
+    "missing_rate",
+    "mean",
+    "best",
+    "worst",
+    "stddev",
+)
+
+
+def window_rank(rs, *, minimum: int = 1) -> dict:
+    """Aggregate scenario ranks per window across several rankings.
+
+    ``rs`` must be a non-empty list whose items are complete
+    :func:`rank_region_intervals` results (schema
+    ``climate-grid/rr-interval-rank-v1``), each validated against that
+    contract exactly as :func:`rank_region_stability` validates its
+    ``ranking``.  Every item's ``windows`` must contain exactly one
+    window and the window names must be distinct across the items.
+    All items must share the same ``scenarios``, ``elements``,
+    ``regions``, ``factors`` and ``pairs`` in the same order.
+    ``minimum`` must be a non-bool positive int.
+
+    Let ``total = len(pairs) * len(elements) * len(factors)``.  For each
+    item (in ``rs`` order) and each scenario (in scenario order), the
+    scenario's non-``None`` ranks are gathered across pairs, elements
+    and factors; their number is ``valid`` and
+    ``missing_rate = (total - valid) / total``.  When
+    ``valid < minimum``, ``mean``, ``best``, ``worst`` and ``stddev``
+    are all ``None``; otherwise they are the mean, minimum and maximum
+    of the gathered ranks and
+    ``stddev = sqrt(sum((rank - mean) ** 2) / valid)``.
+
+    The returned mapping uses the key order ``schema, data``; ``schema``
+    is ``climate-grid/wr-v1``.  ``data`` follows the ``rs`` order and,
+    within each item, the scenario order; each row uses the key order
+    ``window, scenario, total, valid, missing_rate, mean, best, worst,
+    stddev`` where ``window`` is the item's single window name.
+    ``total`` and ``valid`` are ints, ``best`` and ``worst`` are
+    positive non-bool ints or ``None``, and the other statistics are
+    floats or ``None``; every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(rs, list):
+        raise TypeError("rs must be a list")
+    if len(rs) == 0:
+        raise ValueError("rs must be non-empty")
+
+    window_names: list[str] = []
+    grids: list[tuple[list[str], list[str], list, list, list]] = []
+    seen_windows: set[str] = set()
+    for index, item in enumerate(rs):
+        where = f"rs[{index}]"
+        scenarios, elements, factors, pairs, data = (
+            _validate_region_interval_ranking(item, where=where)
+        )
+        windows = item["windows"]
+        if len(windows) != 1:
+            raise ValueError(
+                f"{where}.windows must contain exactly one window"
+            )
+        window_name = windows[0]["name"]
+        if window_name in seen_windows:
+            raise ValueError(f"duplicate window name: {window_name!r}")
+        seen_windows.add(window_name)
+
+        regions = item["regions"]
+        if not grids:
+            first_scenarios = scenarios
+            first_elements = elements
+            first_regions = regions
+            first_factors = factors
+            first_pairs = pairs
+        else:
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same scenarios in the same "
+                    "order, taken from the first item"
+                )
+            if elements != first_elements:
+                raise ValueError(
+                    "all items must share the same elements in the same "
+                    "order, taken from the first item"
+                )
+            if regions != first_regions:
+                raise ValueError(
+                    "all items must share the same regions in the same "
+                    "order, taken from the first item"
+                )
+            if factors != first_factors:
+                raise ValueError(
+                    "all items must share the same factors in the same "
+                    "order, taken from the first item"
+                )
+            if pairs != first_pairs:
+                raise ValueError(
+                    "all items must share the same pairs in the same "
+                    "order, taken from the first item"
+                )
+
+        window_names.append(window_name)
+        grids.append((scenarios, elements, factors, pairs, data))
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    result_rows = []
+    for window_name, (scenarios, _elements, factors, pairs, data) in zip(
+        window_names, grids
+    ):
+        n_scenarios = len(scenarios)
+        total = len(pairs) * len(_elements) * len(factors)
+
+        scenario_index = {
+            scenario: index for index, scenario in enumerate(scenarios)
+        }
+        ranks_by_scenario: list[list[int]] = [[] for _ in range(n_scenarios)]
+        for row in data:
+            rank = row["rank"]
+            if rank is not None:
+                ranks_by_scenario[scenario_index[row["scenario"]]].append(rank)
+
+        for s_index, scenario in enumerate(scenarios):
+            ranks = ranks_by_scenario[s_index]
+            valid = len(ranks)
+            missing_rate = _round_output((total - valid) / total)
+            if valid < minimum:
+                mean = None
+                best = None
+                worst = None
+                stddev = None
+            else:
+                mean_value = sum(ranks) / valid
+                mean = _round_output(mean_value)
+                best = min(ranks)
+                worst = max(ranks)
+                variance = sum((rank - mean_value) ** 2 for rank in ranks) / valid
+                stddev = _round_output(math.sqrt(variance))
+
+            result_rows.append(
+                {
+                    "window": window_name,
+                    "scenario": scenario,
+                    "total": total,
+                    "valid": valid,
+                    "missing_rate": missing_rate,
+                    "mean": mean,
+                    "best": best,
+                    "worst": worst,
+                    "stddev": stddev,
+                }
+            )
+
+    return {
+        "schema": _REGION_WINDOW_RANK_SCHEMA,
         "data": result_rows,
     }
