@@ -14228,3 +14228,336 @@ def converge(summary, *, tolerance: float = 0.1, factor: float = 2, minimum: int
         "factor": _round_output(factor),
         "data": rows,
     }
+
+
+_CONVERGE_OUTPUT_KEYS = ("schema", "scales", "tolerance", "factor", "data")
+_CONVERGE_OUTPUT_ROW_KEYS = (
+    "scenario",
+    "count",
+    "pair",
+    "peak",
+    "interval",
+    "state",
+    "rank",
+)
+_CONVERGE_STATES = ("stable", "uncertain", "divergent")
+_CONVERGE_MATRIX_SCHEMA = "climate-grid/cvm-v1"
+_CONVERGE_MATRIX_ITEM_KEYS = ("element", "region", "result")
+
+
+def _validate_converge(result: Any, *, where: str = "result") -> tuple[list[str], Any, Any, list]:
+    """Validate a complete :func:`converge` result.
+
+    Returns the scale names, the tolerance, the factor and the ``data``
+    rows.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _CONVERGE_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scales, tolerance, "
+            "factor, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _CONVERGE_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_CONVERGE_SCHEMA!r}")
+
+    scales = _validate_string_list(
+        result["scales"], f"{where}.scales", minimum=2
+    )
+
+    tolerance = result["tolerance"]
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
+        raise TypeError(f"{where}.tolerance must be a non-bool number")
+    if not _is_finite(tolerance):
+        raise ValueError(f"{where}.tolerance must be finite")
+    if tolerance < 0:
+        raise ValueError(f"{where}.tolerance must be non-negative")
+
+    factor = result["factor"]
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+        raise TypeError(f"{where}.factor must be a non-bool number")
+    if not _is_finite(factor):
+        raise ValueError(f"{where}.factor must be finite")
+    if factor <= 0:
+        raise ValueError(f"{where}.factor must be positive")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) == 0:
+        raise ValueError(f"{where}.data must be non-empty")
+
+    adjacent_pairs = {
+        (scales[index], scales[index + 1]) for index in range(len(scales) - 1)
+    }
+    seen_scenarios: set[str] = set()
+    present_ranks = []
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _CONVERGE_OUTPUT_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, count, "
+                "pair, peak, interval, state, rank in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario == "":
+            raise ValueError(f"{row_where}.scenario must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where}.data scenario: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if not 0 <= count <= len(scales) - 1:
+            raise ValueError(
+                f"{row_where}.count must be between 0 and {len(scales) - 1}"
+            )
+
+        pair = row["pair"]
+        peak = row["peak"]
+        interval = row["interval"]
+        state = row["state"]
+        rank = row["rank"]
+        if (
+            pair is None
+            or peak is None
+            or interval is None
+            or state is None
+            or rank is None
+        ):
+            if not (
+                pair is None
+                and peak is None
+                and interval is None
+                and state is None
+                and rank is None
+            ):
+                raise ValueError(
+                    f"{row_where}: pair, peak, interval, state and rank "
+                    "must be all None or all present"
+                )
+            continue
+
+        if count == 0:
+            raise ValueError(
+                f"{row_where}: pair, peak, interval, state and rank must be "
+                "None when count is zero"
+            )
+
+        if not isinstance(pair, list):
+            raise TypeError(f"{row_where}.pair must be a list")
+        if len(pair) != 2:
+            raise ValueError(f"{row_where}.pair must have exactly 2 names")
+        for pair_index, name in enumerate(pair):
+            if not isinstance(name, str):
+                raise TypeError(f"{row_where}.pair[{pair_index}] must be a str")
+        if (pair[0], pair[1]) not in adjacent_pairs:
+            raise ValueError(
+                f"{row_where}.pair must be an adjacent pair of scales"
+            )
+
+        _validate_number(peak, f"{row_where}.peak", nullable=False)
+        if not 0 <= peak <= 1:
+            raise ValueError(f"{row_where}.peak must be between 0 and 1")
+
+        if not isinstance(interval, list):
+            raise TypeError(f"{row_where}.interval must be a list")
+        if len(interval) != 2:
+            raise ValueError(
+                f"{row_where}.interval must have exactly 2 numbers"
+            )
+        for bound_index, bound in enumerate(interval):
+            _validate_number(
+                bound, f"{row_where}.interval[{bound_index}]", nullable=False
+            )
+        if not 0 <= interval[0] <= interval[1]:
+            raise ValueError(
+                f"{row_where}.interval must satisfy 0 <= lo <= hi"
+            )
+
+        if not isinstance(state, str):
+            raise TypeError(f"{row_where}.state must be a str")
+        if state not in _CONVERGE_STATES:
+            raise ValueError(
+                f"{row_where}.state must be one of "
+                + ", ".join(repr(name) for name in _CONVERGE_STATES)
+            )
+
+        if not isinstance(rank, int) or isinstance(rank, bool):
+            raise TypeError(f"{row_where}.rank must be a non-bool int")
+        if rank < 1:
+            raise ValueError(f"{row_where}.rank must be positive")
+        present_ranks.append(rank)
+
+    if sorted(present_ranks) != list(range(1, len(present_ranks) + 1)):
+        raise ValueError(
+            f"{where}.data ranks must be a permutation of 1..{len(present_ranks)}"
+        )
+
+    return scales, tolerance, factor, data
+
+
+def converge_matrix(items, *, minimum: int = 1) -> dict:
+    """Combine per-layer :func:`converge` results into a scenario matrix.
+
+    ``items`` must be a non-empty list; each item must be a mapping with
+    exactly the keys ``element, region, result`` in order, where
+    ``element`` and ``region`` are non-empty strings whose combination is
+    unique across the items and ``result`` is a complete :func:`converge`
+    result (schema ``climate-grid/cv1``).  Every result must share the
+    first result's ``tolerance`` and ``factor`` and cover the same
+    scenario set; the scenario order is taken from the first result's
+    ``data``.  ``minimum`` must be a non-bool positive int.
+
+    For every scenario (in that order) the layers whose ``state`` and
+    ``interval`` are both not ``None`` are collected and ``count`` is
+    their number ``n``; ``states`` counts the collected layers' states
+    under the keys ``stable, uncertain, divergent``.  When ``n`` is below
+    ``minimum``, ``interval``, ``state`` and ``rank`` are all ``None``;
+    otherwise ``interval`` is ``[sum(lo) / n, sum(hi) / n]`` over the
+    collected layers and the ``state`` follows the :func:`converge` rule
+    against the shared tolerance: ``stable`` when ``hi`` is at most the
+    tolerance, ``divergent`` when ``lo`` exceeds it and ``uncertain``
+    otherwise.  Valid scenarios are ranked from 1 by ascending ``hi``
+    with ties keeping the scenario order.
+
+    The returned mapping uses the key order ``schema, tolerance, layers,
+    data``; ``schema`` is ``climate-grid/cvm-v1`` and ``layers`` copies
+    each item's ``element`` and ``region`` in item order.  ``data``
+    follows the scenario order; each row uses the key order ``scenario,
+    count, states, interval, state, rank``.  ``count`` and ``rank`` are
+    ints and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    layers = []
+    results = []
+    seen_combinations: set[tuple[str, str]] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _CONVERGE_MATRIX_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys element, region, "
+                "result in order"
+            )
+
+        element = item["element"]
+        region = item["region"]
+        for name, value in (("element", element), ("region", region)):
+            if not isinstance(value, str):
+                raise TypeError(f"{where}.{name} must be a str")
+            if value == "":
+                raise ValueError(f"{where}.{name} must be non-empty")
+        combination = (element, region)
+        if combination in seen_combinations:
+            raise ValueError(
+                f"duplicate items element/region combination: "
+                f"{element!r}, {region!r}"
+            )
+        seen_combinations.add(combination)
+
+        _, tolerance, factor, data = _validate_converge(
+            item["result"], where=f"{where}.result"
+        )
+        layers.append({"element": element, "region": region})
+        results.append((tolerance, factor, data))
+
+    tolerance = results[0][0]
+    factor = results[0][1]
+    scenarios = [row["scenario"] for row in results[0][2]]
+    scenario_set = set(scenarios)
+    by_scenario = []
+    for index, (item_tolerance, item_factor, data) in enumerate(results):
+        if item_tolerance != tolerance or item_factor != factor:
+            raise ValueError(
+                f"items[{index}].result must share the first item's "
+                "tolerance and factor"
+            )
+        rows_by_scenario = {row["scenario"]: row for row in data}
+        if set(rows_by_scenario) != scenario_set:
+            raise ValueError(
+                f"items[{index}].result must cover the same scenarios as "
+                "the first item"
+            )
+        by_scenario.append(rows_by_scenario)
+
+    collected = []
+    for scenario in scenarios:
+        states = {"stable": 0, "uncertain": 0, "divergent": 0}
+        lo_sum = 0.0
+        hi_sum = 0.0
+        n = 0
+        for rows_by_scenario in by_scenario:
+            row = rows_by_scenario[scenario]
+            if row["state"] is None or row["interval"] is None:
+                continue
+            n += 1
+            states[row["state"]] += 1
+            lo_sum += row["interval"][0]
+            hi_sum += row["interval"][1]
+        collected.append((scenario, n, states, lo_sum, hi_sum))
+
+    ranked = sorted(
+        (entry for entry in enumerate(collected) if entry[1][1] >= minimum),
+        key=lambda entry: (entry[1][4] / entry[1][1], entry[0]),
+    )
+    ranks = {index: rank for rank, (index, _) in enumerate(ranked, 1)}
+
+    rows = []
+    for index, (scenario, n, states, lo_sum, hi_sum) in enumerate(collected):
+        if n < minimum:
+            interval = None
+            state = None
+            rank = None
+        else:
+            lo = lo_sum / n
+            hi = hi_sum / n
+            interval = [_round_output(lo), _round_output(hi)]
+            if hi <= tolerance:
+                state = "stable"
+            elif lo > tolerance:
+                state = "divergent"
+            else:
+                state = "uncertain"
+            rank = ranks[index]
+        rows.append(
+            {
+                "scenario": scenario,
+                "count": n,
+                "states": states,
+                "interval": interval,
+                "state": state,
+                "rank": rank,
+            }
+        )
+
+    return {
+        "schema": _CONVERGE_MATRIX_SCHEMA,
+        "tolerance": _round_output(tolerance),
+        "layers": layers,
+        "data": rows,
+    }
