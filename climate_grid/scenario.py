@@ -15093,3 +15093,339 @@ def matrix_evolution(items) -> dict:
         "scenarios": list(first_scenarios),
         "data": rows,
     }
+
+
+_MATRIX_EVOLUTION_OUTPUT_KEYS = (
+    "schema",
+    "periods",
+    "models",
+    "scenarios",
+    "data",
+)
+_MATRIX_EVOLUTION_ROW_KEYS = (
+    "left",
+    "right",
+    "model",
+    "scenario",
+    "from",
+    "to",
+    "interval",
+    "rank",
+)
+_MATRIX_EVOLUTION_SUMMARY_SCHEMA = "climate-grid/cme-summary-v1"
+_MATRIX_EVOLUTION_SUMMARY_KEYS = (
+    "schema",
+    "periods",
+    "models",
+    "scenarios",
+    "data",
+)
+_MATRIX_EVOLUTION_SUMMARY_ROW_KEYS = (
+    "model",
+    "scenario",
+    "total",
+    "count",
+    "transitions",
+    "interval",
+    "rank_mean",
+    "rank_abs",
+)
+
+
+def _validate_matrix_evolution(result: Any, *, where: str = "result") -> tuple:
+    """Validate a complete :func:`matrix_evolution` result.
+
+    Returns the ``periods``, ``models`` and ``scenarios`` axes and the
+    ``data`` rows.  Rows must follow the flat adjacent-pair-then-model-
+    then-scenario order of the ``climate-grid/cme-v1`` contract.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _MATRIX_EVOLUTION_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, periods, models, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MATRIX_EVOLUTION_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_MATRIX_EVOLUTION_SCHEMA!r}")
+
+    periods = result["periods"]
+    if not isinstance(periods, list):
+        raise TypeError(f"{where}.periods must be a list")
+    if len(periods) < 2:
+        raise ValueError(f"{where}.periods must contain at least 2 entries")
+    seen_periods: set[str] = set()
+    for index, period in enumerate(periods):
+        if not isinstance(period, str):
+            raise TypeError(f"{where}.periods[{index}] must be a str")
+        if period == "":
+            raise ValueError(f"{where}.periods[{index}] must be non-empty")
+        if period in seen_periods:
+            raise ValueError(f"duplicate {where}.periods entry: {period!r}")
+        seen_periods.add(period)
+
+    models = result["models"]
+    if not isinstance(models, list):
+        raise TypeError(f"{where}.models must be a list")
+    if len(models) == 0:
+        raise ValueError(f"{where}.models must be non-empty")
+    seen_models: set[str] = set()
+    for index, model in enumerate(models):
+        if not isinstance(model, str):
+            raise TypeError(f"{where}.models[{index}] must be a str")
+        if model == "":
+            raise ValueError(f"{where}.models[{index}] must be non-empty")
+        if model in seen_models:
+            raise ValueError(f"duplicate {where}.models entry: {model!r}")
+        seen_models.add(model)
+
+    scenarios = result["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where}.scenarios[{index}] must be a str")
+        if scenario == "":
+            raise ValueError(f"{where}.scenarios[{index}] must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where}.scenarios entry: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_pairs = len(periods) - 1
+    n_models = len(models)
+    n_scenarios = len(scenarios)
+    expected_rows = n_pairs * n_models * n_scenarios
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per adjacent "
+            "period pair/model/scenario combination, in pair-then-model-then-"
+            "scenario order)"
+        )
+
+    row_index = 0
+    for pair_index in range(n_pairs):
+        for model in models:
+            for scenario in scenarios:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _MATRIX_EVOLUTION_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys left, right, "
+                        "model, scenario, from, to, interval, rank in order"
+                    )
+
+                if not isinstance(row["left"], str):
+                    raise TypeError(f"{row_where}.left must be a str")
+                if row["left"] != periods[pair_index]:
+                    raise ValueError(
+                        f"{row_where}.left must be {periods[pair_index]!r} "
+                        "for its pair-then-model-then-scenario position"
+                    )
+                if not isinstance(row["right"], str):
+                    raise TypeError(f"{row_where}.right must be a str")
+                if row["right"] != periods[pair_index + 1]:
+                    raise ValueError(
+                        f"{row_where}.right must be "
+                        f"{periods[pair_index + 1]!r} for its "
+                        "pair-then-model-then-scenario position"
+                    )
+                if not isinstance(row["model"], str):
+                    raise TypeError(f"{row_where}.model must be a str")
+                if row["model"] != model:
+                    raise ValueError(
+                        f"{row_where}.model must be {model!r} for its "
+                        "pair-then-model-then-scenario position"
+                    )
+                if not isinstance(row["scenario"], str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row["scenario"] != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "pair-then-model-then-scenario position"
+                    )
+
+                for end_name in ("from", "to"):
+                    end = row[end_name]
+                    if end is not None and not isinstance(end, str):
+                        raise TypeError(
+                            f"{row_where}.{end_name} must be a str or None"
+                        )
+                    if end is not None and end not in _CONVERGE_STATES:
+                        raise ValueError(
+                            f"{row_where}.{end_name} must be one of stable, "
+                            "uncertain, divergent or None"
+                        )
+
+                interval = row["interval"]
+                if interval is not None:
+                    if not isinstance(interval, list):
+                        raise TypeError(f"{row_where}.interval must be a list")
+                    if len(interval) != 2:
+                        raise ValueError(
+                            f"{row_where}.interval must have exactly 2 bounds"
+                        )
+                    for bound_index, bound in enumerate(interval):
+                        _validate_number(
+                            bound,
+                            f"{row_where}.interval[{bound_index}]",
+                            nullable=False,
+                        )
+
+                rank = row["rank"]
+                if rank is not None and (
+                    not isinstance(rank, int) or isinstance(rank, bool)
+                ):
+                    raise TypeError(
+                        f"{row_where}.rank must be a non-bool int or None"
+                    )
+
+                ends_present = (
+                    row["from"] is not None and row["to"] is not None
+                )
+                if interval is not None and not ends_present:
+                    raise ValueError(
+                        f"{row_where}.interval must be None when either "
+                        f"{row_where}.from or {row_where}.to is None"
+                    )
+                if ends_present and interval is None:
+                    raise ValueError(
+                        f"{row_where}.interval must be present when "
+                        f"{row_where}.from and {row_where}.to are"
+                    )
+                if rank is not None and not ends_present:
+                    raise ValueError(
+                        f"{row_where}.rank must be None when either "
+                        f"{row_where}.from or {row_where}.to is None"
+                    )
+                if ends_present and rank is None:
+                    raise ValueError(
+                        f"{row_where}.rank must be present when "
+                        f"{row_where}.from and {row_where}.to are"
+                    )
+
+                row_index += 1
+
+    return periods, models, scenarios, data
+
+
+def summarize_matrix_evolution(result, *, min_transitions: int = 1) -> dict:
+    """Summarize state transitions of a :func:`matrix_evolution` result.
+
+    ``result`` must be a complete :func:`matrix_evolution` result (schema
+    ``climate-grid/cme-v1``) with exactly the keys ``schema, periods,
+    models, scenarios, data`` in that order; every member is validated
+    against that contract, including the flat adjacent-pair-then-model-
+    then-scenario ``data`` row order, each row's key order ``left, right,
+    model, scenario, from, to, interval, rank`` and the period/model/
+    scenario labels at every row position.  ``min_transitions`` must be a
+    non-bool positive int.
+
+    Rows are aggregated per model (in model order) and scenario (in
+    scenario order): ``total`` is ``len(periods) - 1`` and ``count`` is
+    the number of rows whose ``from`` and ``to`` are both not ``None``.
+    ``transitions`` is a list of nine ints counting the collected rows by
+    the cartesian product of ``from`` then ``to`` over ``stable,
+    uncertain, divergent`` in that order.  When ``count`` is below
+    ``min_transitions``, ``interval``, ``rank_mean`` and ``rank_abs`` are
+    all ``None``; otherwise ``interval`` is ``[mean lo, mean hi]`` over
+    the collected rows' intervals, ``rank_mean`` is the mean of their
+    ``rank`` values and ``rank_abs`` is the mean of their absolute rank
+    differences.
+
+    The returned mapping uses the key order ``schema, periods, models,
+    scenarios, data``; ``schema`` is ``climate-grid/cme-summary-v1`` and
+    the three axes echo the input.  ``data`` is a nested mapping keyed by
+    model then scenario; each row uses the key order ``model, scenario,
+    total, count, transitions, interval, rank_mean, rank_abs``.  Counts
+    are ints and every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    periods, models, scenarios, data = _validate_matrix_evolution(result)
+
+    if not isinstance(min_transitions, int) or isinstance(
+        min_transitions, bool
+    ):
+        raise TypeError("min_transitions must be a non-bool int")
+    if min_transitions < 1:
+        raise ValueError("min_transitions must be positive")
+
+    n_models = len(models)
+    n_scenarios = len(scenarios)
+    stride = n_models * n_scenarios
+
+    summary_data = {}
+    for m_index, model in enumerate(models):
+        model_rows = {}
+        for s_index, scenario in enumerate(scenarios):
+            collected = [
+                data[pair_index * stride + m_index * n_scenarios + s_index]
+                for pair_index in range(len(periods) - 1)
+            ]
+            valid = [
+                row
+                for row in collected
+                if row["from"] is not None and row["to"] is not None
+            ]
+            count = len(valid)
+            transitions = [
+                sum(
+                    1
+                    for row in valid
+                    if row["from"] == from_state and row["to"] == to_state
+                )
+                for from_state in _CONVERGE_MATRIX_STATE_KEYS
+                for to_state in _CONVERGE_MATRIX_STATE_KEYS
+            ]
+            if count < min_transitions:
+                interval = None
+                rank_mean = None
+                rank_abs = None
+            else:
+                interval = [
+                    _round_output(
+                        sum(row["interval"][0] for row in valid) / count
+                    ),
+                    _round_output(
+                        sum(row["interval"][1] for row in valid) / count
+                    ),
+                ]
+                rank_mean = _round_output(
+                    sum(row["rank"] for row in valid) / count
+                )
+                rank_abs = _round_output(
+                    sum(abs(row["rank"]) for row in valid) / count
+                )
+            model_rows[scenario] = {
+                "model": model,
+                "scenario": scenario,
+                "total": len(periods) - 1,
+                "count": count,
+                "transitions": transitions,
+                "interval": interval,
+                "rank_mean": rank_mean,
+                "rank_abs": rank_abs,
+            }
+        summary_data[model] = model_rows
+
+    return {
+        "schema": _MATRIX_EVOLUTION_SUMMARY_SCHEMA,
+        "periods": list(periods),
+        "models": list(models),
+        "scenarios": list(scenarios),
+        "data": summary_data,
+    }
