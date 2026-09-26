@@ -12956,3 +12956,268 @@ def rank_change(result, *, min_windows: int = 2) -> dict:
         "scenarios": list(scenarios),
         "data": result_rows,
     }
+
+
+_REGION_WINDOW_RANK_CHANGE_STABILITY_SCHEMA = "climate-grid/wrc-stability-v1"
+_REGION_WINDOW_RANK_CHANGE_STABILITY_RESULT_KEYS = (
+    "schema",
+    "windows",
+    "scenarios",
+    "data",
+)
+_REGION_WINDOW_RANK_CHANGE_STABILITY_ROW_KEYS = (
+    "scenario",
+    "valid",
+    "count",
+    "changes",
+    "mean_abs",
+    "max",
+    "slope",
+)
+
+
+def _validate_rank_change(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list]:
+    """Validate a complete :func:`rank_change` result.
+
+    Returns the window names, the scenario order and the ``data`` rows.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_WINDOW_RANK_CHANGE_STABILITY_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, windows, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WINDOW_RANK_CHANGE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WINDOW_RANK_CHANGE_SCHEMA!r}"
+        )
+
+    windows = _validate_string_list(
+        result["windows"], f"{where}.windows", minimum=2
+    )
+    scenarios = _validate_string_list(result["scenarios"], f"{where}.scenarios")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must have {len(scenarios)} rows (one per "
+            "scenario, in scenario order)"
+        )
+
+    n_changes = len(windows) - 1
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _REGION_WINDOW_RANK_CHANGE_STABILITY_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, valid, "
+                "count, changes, mean_abs, max, slope in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario != scenarios[index]:
+            raise ValueError(
+                f"{row_where}.scenario must be {scenarios[index]!r} for its "
+                "scenario-order position"
+            )
+
+        valid = row["valid"]
+        if not isinstance(valid, int) or isinstance(valid, bool):
+            raise TypeError(f"{row_where}.valid must be a non-bool int")
+        if not 0 <= valid <= len(windows):
+            raise ValueError(
+                f"{row_where}.valid must be between 0 and the number of "
+                "windows"
+            )
+
+        changes = row["changes"]
+        if not isinstance(changes, list):
+            raise TypeError(f"{row_where}.changes must be a list")
+        if len(changes) != n_changes:
+            raise ValueError(
+                f"{row_where}.changes must have {n_changes} members "
+                "(one per adjacent window pair)"
+            )
+        for c_index, change in enumerate(changes):
+            _validate_number(
+                change, f"{row_where}.changes[{c_index}]", nullable=True
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        present = [change for change in changes if change is not None]
+        if count != len(present):
+            raise ValueError(
+                f"{row_where}.count must equal the number of non-None "
+                f"{row_where}.changes members"
+            )
+        if count > max(valid - 1, 0):
+            raise ValueError(
+                f"{row_where}.count must not exceed {row_where}.valid - 1"
+            )
+
+        mean_abs = row["mean_abs"]
+        maximum = row["max"]
+        _validate_number(mean_abs, f"{row_where}.mean_abs", nullable=True)
+        _validate_number(maximum, f"{row_where}.max", nullable=True)
+        if (mean_abs is None) != (maximum is None):
+            raise ValueError(
+                f"{row_where}: mean_abs and max must be both None or both "
+                "present"
+            )
+        if count == 0 and mean_abs is not None:
+            raise ValueError(
+                f"{row_where}: mean_abs and max must be None when count "
+                "is zero"
+            )
+        if count > 0 and mean_abs is not None:
+            expected_mean_abs = _round_output(
+                sum(abs(change) for change in present) / count
+            )
+            expected_max = _round_output(
+                max(abs(change) for change in present)
+            )
+            if mean_abs != expected_mean_abs:
+                raise ValueError(
+                    f"{row_where}.mean_abs must equal the mean of the "
+                    "absolute non-None changes"
+                )
+            if maximum != expected_max:
+                raise ValueError(
+                    f"{row_where}.max must equal the maximum of the "
+                    "absolute non-None changes"
+                )
+
+        slope = row["slope"]
+        _validate_number(slope, f"{row_where}.slope", nullable=True)
+        if valid < 2 and slope is not None:
+            raise ValueError(
+                f"{row_where}.slope must be None when valid is below two"
+            )
+
+    return windows, scenarios, data
+
+
+def rank_change_stability(result, *, min_changes: int = 1) -> dict:
+    """Summarize per-scenario rank-change stability across ordered windows.
+
+    ``result`` must be a complete :func:`rank_change` result (schema
+    ``climate-grid/wrc-v1``) with exactly the keys ``schema, windows,
+    scenarios, data`` in that order; every member is validated against
+    that contract, including each row's key order ``scenario, valid,
+    count, changes, mean_abs, max, slope`` and the count / mean_abs /
+    max / slope invariants.  ``min_changes`` must be a non-bool positive
+    int.
+
+    For each scenario (in scenario order) ``count`` is the number of
+    non-``None`` members of ``changes``.  ``reversals`` counts adjacent
+    ``changes`` pairs that are both non-``None`` and non-zero with
+    opposite signs.  ``longest_run`` is the length of the longest run of
+    consecutive non-zero same-sign changes; ``None`` and zero members
+    interrupt a run.
+
+    When ``count < min_changes``, ``reversals``, ``longest_run``,
+    ``stable_rate`` and ``level`` are all ``None``.  Otherwise
+    ``stable_rate`` is the number of zero changes divided by ``count``
+    and the score is
+    ``S = mean(abs(changes)) * (1 + reversals / max(count - 1, 1))``;
+    ``level`` is ``stable`` for ``S == 0``, ``low`` for
+    ``0 < S <= 1``, ``medium`` for ``1 < S <= 2`` and ``high`` for
+    ``S > 2``.
+
+    The returned mapping uses the key order ``schema, windows,
+    scenarios, data``; ``schema`` is ``climate-grid/wrc-stability-v1``
+    and both axes echo the input order.  ``data`` follows the scenario
+    order; each row uses the key order ``scenario, count, reversals,
+    longest_run, stable_rate, level``.  ``count``, ``reversals`` and
+    ``longest_run`` are ints (or ``None``) and ``stable_rate`` is a
+    float or ``None``; every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    windows, scenarios, data = _validate_rank_change(result)
+
+    if not isinstance(min_changes, int) or isinstance(min_changes, bool):
+        raise TypeError("min_changes must be a non-bool int")
+    if min_changes < 1:
+        raise ValueError("min_changes must be positive")
+
+    result_rows = []
+    for row in data:
+        changes = row["changes"]
+        present = [change for change in changes if change is not None]
+        count = len(present)
+
+        if count < min_changes:
+            reversals = None
+            longest_run = None
+            stable_rate = None
+            level = None
+        else:
+            reversals = 0
+            longest_run = 0
+            run = 0
+            previous = None
+            for change in changes:
+                if change is None or change == 0:
+                    run = 0
+                elif (
+                    previous is not None
+                    and previous != 0
+                    and (previous > 0) != (change > 0)
+                ):
+                    reversals += 1
+                    run = 1
+                    if run > longest_run:
+                        longest_run = run
+                else:
+                    run += 1
+                    if run > longest_run:
+                        longest_run = run
+                previous = change
+
+            zeros = sum(1 for change in present if change == 0)
+            stable_rate = _round_output(zeros / count)
+            mean_abs = sum(abs(change) for change in present) / count
+            score = mean_abs * (1 + reversals / max(count - 1, 1))
+            if score == 0:
+                level = "stable"
+            elif score <= 1:
+                level = "low"
+            elif score <= 2:
+                level = "medium"
+            else:
+                level = "high"
+
+        result_rows.append(
+            {
+                "scenario": row["scenario"],
+                "count": count,
+                "reversals": reversals,
+                "longest_run": longest_run,
+                "stable_rate": stable_rate,
+                "level": level,
+            }
+        )
+
+    return {
+        "schema": _REGION_WINDOW_RANK_CHANGE_STABILITY_SCHEMA,
+        "windows": list(windows),
+        "scenarios": list(scenarios),
+        "data": result_rows,
+    }
