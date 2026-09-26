@@ -6228,3 +6228,315 @@ def summarize_rank_attribute_groups(items) -> dict:
         "drivers": list(first_drivers),
         "data": result_data,
     }
+
+
+_RANK_ATTRIBUTE_LAYER_SCHEMA = "climate-grid/ra-layer-v1"
+_RANK_ATTRIBUTE_LAYER_ITEM_KEYS = ("period", "region", "summary")
+_RANK_ATTRIBUTE_GROUP_SUMMARY_KEYS = (
+    "schema",
+    "groups",
+    "scenarios",
+    "elements",
+    "drivers",
+    "data",
+)
+_RANK_ATTRIBUTE_GROUP_SUMMARY_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "group_count",
+    "count",
+    "contribution",
+    "uncertainty",
+)
+_RANK_ATTRIBUTE_LAYER_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "difference",
+    "uncertainty",
+)
+
+
+def _validate_rank_attribute_group_summary(
+    summary: Any, *, where: str
+) -> tuple[list[str], list[str], list[str], dict]:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _RANK_ATTRIBUTE_GROUP_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, groups, scenarios, "
+            "elements, drivers, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _RANK_ATTRIBUTE_GROUP_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_RANK_ATTRIBUTE_GROUP_SUMMARY_SCHEMA!r}"
+        )
+
+    groups = _validate_string_list(
+        summary["groups"], f"{where}.groups", minimum=2
+    )
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        summary["elements"], f"{where}.elements"
+    )
+    drivers = _validate_string_list(summary["drivers"], f"{where}.drivers")
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(scenarios) * len(elements) * len(drivers)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/element/driver combination, in "
+            "scenario-then-element-then-driver order)"
+        )
+
+    n_groups = len(groups)
+    rows: dict[tuple[str, str, str], dict] = {}
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for driver in drivers:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _RANK_ATTRIBUTE_GROUP_SUMMARY_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, driver, group_count, count, contribution, "
+                        "uncertainty in order"
+                    )
+
+                row_scenario = row["scenario"]
+                if not isinstance(row_scenario, str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row_scenario != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_driver = row["driver"]
+                if not isinstance(row_driver, str):
+                    raise TypeError(f"{row_where}.driver must be a str")
+                if row_driver != driver:
+                    raise ValueError(
+                        f"{row_where}.driver must be {driver!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+
+                for count_name in ("group_count", "count"):
+                    count = row[count_name]
+                    if not isinstance(count, int) or isinstance(count, bool):
+                        raise TypeError(
+                            f"{row_where}.{count_name} must be a non-bool int"
+                        )
+                    if count < 0:
+                        raise ValueError(
+                            f"{row_where}.{count_name} must be non-negative"
+                        )
+                if row["group_count"] > n_groups:
+                    raise ValueError(
+                        f"{row_where}.group_count must not exceed the number of "
+                        f"groups ({n_groups})"
+                    )
+                if (row["group_count"] == 0) != (row["count"] == 0):
+                    raise ValueError(
+                        f"{row_where}: group_count and count must be zero at "
+                        "the same time"
+                    )
+
+                contribution = row["contribution"]
+                uncertainty = row["uncertainty"]
+                _validate_number(
+                    contribution, f"{row_where}.contribution", nullable=True
+                )
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                if (contribution is None) != (uncertainty is None):
+                    raise ValueError(
+                        f"{row_where}: contribution and uncertainty must be "
+                        "both None or both present"
+                    )
+                if (row["count"] == 0) != (contribution is None):
+                    raise ValueError(
+                        f"{row_where}: contribution and uncertainty must be "
+                        "None exactly when count is zero"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                rows[(scenario, element, driver)] = row
+                row_index += 1
+
+    return scenarios, elements, drivers, rows
+
+
+def compare_attribute_layers(items) -> dict:
+    """Compare pooled rank-attribution layers across period/region pairs.
+
+    ``items`` must be a list of at least two mappings, each with exactly the
+    keys ``period, region, summary`` in that order.  ``period`` and
+    ``region`` are non-empty str and every ``(period, region)`` pair must be
+    unique.  ``summary`` is a complete :func:`summarize_rank_attribute_groups`
+    result (schema ``climate-grid/ra-group-summary-v1``) with exactly the
+    keys ``schema, groups, scenarios, elements, drivers, data`` in that
+    order; every member is validated against that contract, including the
+    flat scenario-then-element-then-driver ``data`` row order, each row's key
+    order ``scenario, element, driver, group_count, count, contribution,
+    uncertainty`` and the row invariants (``group_count`` and ``count``
+    non-negative non-bool ints, ``group_count`` no larger than the number of
+    groups; ``contribution`` and ``uncertainty`` both ``None`` exactly when
+    ``count`` is zero and both finite numbers otherwise, with
+    ``uncertainty`` non-negative).  Every item's summary must share the same
+    ``scenarios``, ``elements`` and ``drivers`` in the same order; all three
+    are taken from the first item.
+
+    The first item is the reference layer.  For every other item (in item
+    order), scenario (in scenario order), element (in element order) and
+    driver (in driver order), the current row's ``contribution`` ``c`` and
+    ``uncertainty`` ``u`` are paired with the reference row's ``c0`` and
+    ``u0``: when all four values are not ``None``, ``difference`` is
+    ``c - c0`` and ``uncertainty`` is ``sqrt(u ** 2 + u0 ** 2)``; otherwise
+    both are ``None``.
+
+    The returned mapping uses the key order ``schema, reference, layers,
+    scenarios, elements, drivers, data``; ``schema`` is
+    ``climate-grid/ra-layer-v1``, ``reference`` is the first item's
+    ``{"period": ..., "region": ...}`` dict and ``layers`` lists the same
+    dicts for the remaining items in item order.  ``scenarios``,
+    ``elements`` and ``drivers`` echo the first item's summary axes.
+    ``data`` is a flat list of rows in layer-then-scenario-then-element-
+    then-driver order; each row uses the key order ``scenario, element,
+    driver, difference, uncertainty``.  Every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  Inputs are
+    not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    layer_refs: list[dict] = []
+    validated_rows: list[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _RANK_ATTRIBUTE_LAYER_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys period, region, "
+                "summary in order"
+            )
+
+        period = item["period"]
+        region = item["region"]
+        if not isinstance(period, str):
+            raise TypeError(f"{where}.period must be a str")
+        if period == "":
+            raise ValueError(f"{where}.period must be non-empty")
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{where}.region must be non-empty")
+        if (period, region) in seen_pairs:
+            raise ValueError(
+                f"duplicate period/region pair: {(period, region)!r}"
+            )
+        seen_pairs.add((period, region))
+
+        scenarios, elements, drivers, rows = (
+            _validate_rank_attribute_group_summary(
+                item["summary"], where=f"{where}.summary"
+            )
+        )
+        if not validated_rows:
+            first_scenarios = scenarios
+            first_elements = elements
+            first_drivers = drivers
+        else:
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same summary scenarios in the "
+                    "same order, taken from the first item"
+                )
+            if elements != first_elements:
+                raise ValueError(
+                    "all items must share the same summary elements in the "
+                    "same order, taken from the first item"
+                )
+            if drivers != first_drivers:
+                raise ValueError(
+                    "all items must share the same summary drivers in the "
+                    "same order, taken from the first item"
+                )
+
+        layer_refs.append({"period": period, "region": region})
+        validated_rows.append(rows)
+
+    baseline_rows = validated_rows[0]
+
+    result_data = []
+    for layer_index in range(1, len(items)):
+        current_rows = validated_rows[layer_index]
+        for scenario in first_scenarios:
+            for element in first_elements:
+                for driver in first_drivers:
+                    key = (scenario, element, driver)
+                    baseline_row = baseline_rows[key]
+                    current_row = current_rows[key]
+                    c0 = baseline_row["contribution"]
+                    u0 = baseline_row["uncertainty"]
+                    c = current_row["contribution"]
+                    u = current_row["uncertainty"]
+                    if c0 is None or u0 is None or c is None or u is None:
+                        difference = None
+                        uncertainty = None
+                    else:
+                        difference = _round_output(c - c0)
+                        uncertainty = _round_output(
+                            math.sqrt(u * u + u0 * u0)
+                        )
+
+                    result_data.append(
+                        {
+                            "scenario": scenario,
+                            "element": element,
+                            "driver": driver,
+                            "difference": difference,
+                            "uncertainty": uncertainty,
+                        }
+                    )
+
+    return {
+        "schema": _RANK_ATTRIBUTE_LAYER_SCHEMA,
+        "reference": layer_refs[0],
+        "layers": layer_refs[1:],
+        "scenarios": list(first_scenarios),
+        "elements": list(first_elements),
+        "drivers": list(first_drivers),
+        "data": result_data,
+    }
