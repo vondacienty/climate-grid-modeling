@@ -15429,3 +15429,338 @@ def summarize_matrix_evolution(result, *, min_transitions: int = 1) -> dict:
         "scenarios": list(scenarios),
         "data": summary_data,
     }
+
+
+_CONSENSUS_SCHEMA = "climate-grid/mc-v1"
+_CONSENSUS_OUTPUT_KEYS = (
+    "schema",
+    "periods",
+    "models",
+    "scenarios",
+    "data",
+)
+_CONSENSUS_ROW_KEYS = (
+    "scenario",
+    "n",
+    "moves",
+    "rates",
+    "agree",
+    "entropy",
+    "band",
+    "spread",
+    "mean",
+    "abs",
+    "std",
+)
+
+
+def _validate_matrix_evolution_summary(
+    summary: Any, *, where: str = "summary"
+) -> tuple:
+    """Validate a complete :func:`summarize_matrix_evolution` result.
+
+    Returns the ``periods``, ``models`` and ``scenarios`` axes and the
+    nested ``data`` mapping.  ``data`` must be keyed by model (in model
+    order) then scenario (in scenario order) and every row must follow
+    the ``climate-grid/cme-summary-v1`` contract.
+    """
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _MATRIX_EVOLUTION_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, periods, models, "
+            "scenarios, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MATRIX_EVOLUTION_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_MATRIX_EVOLUTION_SUMMARY_SCHEMA!r}"
+        )
+
+    periods = _validate_string_list(
+        summary["periods"], f"{where}.periods", minimum=2
+    )
+    models = _validate_string_list(summary["models"], f"{where}.models")
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios"
+    )
+
+    data = summary["data"]
+    if not isinstance(data, dict):
+        raise TypeError(f"{where}.data must be a dict")
+    if tuple(data.keys()) != tuple(models):
+        raise ValueError(
+            f"{where}.data must be keyed by the models axis in model order"
+        )
+
+    total_expected = len(periods) - 1
+    for model in models:
+        model_rows = data[model]
+        model_where = f"{where}.data[{model!r}]"
+        if not isinstance(model_rows, dict):
+            raise TypeError(f"{model_where} must be a dict")
+        if tuple(model_rows.keys()) != tuple(scenarios):
+            raise ValueError(
+                f"{model_where} must be keyed by the scenarios axis in "
+                "scenario order"
+            )
+        for scenario in scenarios:
+            row_where = f"{model_where}[{scenario!r}]"
+            row = model_rows[scenario]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _MATRIX_EVOLUTION_SUMMARY_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys model, "
+                    "scenario, total, count, transitions, interval, "
+                    "rank_mean, rank_abs in order"
+                )
+
+            if not isinstance(row["model"], str):
+                raise TypeError(f"{row_where}.model must be a str")
+            if row["model"] != model:
+                raise ValueError(
+                    f"{row_where}.model must be {model!r} for its position"
+                )
+            if not isinstance(row["scenario"], str):
+                raise TypeError(f"{row_where}.scenario must be a str")
+            if row["scenario"] != scenario:
+                raise ValueError(
+                    f"{row_where}.scenario must be {scenario!r} for its "
+                    "position"
+                )
+
+            total = row["total"]
+            if not isinstance(total, int) or isinstance(total, bool):
+                raise TypeError(f"{row_where}.total must be a non-bool int")
+            if total != total_expected:
+                raise ValueError(
+                    f"{row_where}.total must be {total_expected} "
+                    "(len(periods) - 1)"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if not 0 <= count <= total:
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and {total}"
+                )
+
+            transitions = row["transitions"]
+            if not isinstance(transitions, list):
+                raise TypeError(f"{row_where}.transitions must be a list")
+            if len(transitions) != 9:
+                raise ValueError(
+                    f"{row_where}.transitions must have exactly 9 counts"
+                )
+            for t_index, t_count in enumerate(transitions):
+                if not isinstance(t_count, int) or isinstance(t_count, bool):
+                    raise TypeError(
+                        f"{row_where}.transitions[{t_index}] must be a "
+                        "non-bool int"
+                    )
+                if t_count < 0:
+                    raise ValueError(
+                        f"{row_where}.transitions[{t_index}] must be "
+                        "non-negative"
+                    )
+            if sum(transitions) != count:
+                raise ValueError(
+                    f"{row_where}.transitions must sum to {row_where}.count"
+                )
+
+            interval = row["interval"]
+            rank_mean = row["rank_mean"]
+            rank_abs = row["rank_abs"]
+            if interval is None or rank_mean is None or rank_abs is None:
+                if not (
+                    interval is None
+                    and rank_mean is None
+                    and rank_abs is None
+                ):
+                    raise ValueError(
+                        f"{row_where}: interval, rank_mean and rank_abs "
+                        "must be all None or all present"
+                    )
+                continue
+
+            if count == 0:
+                raise ValueError(
+                    f"{row_where}: interval, rank_mean and rank_abs must "
+                    "be None when count is zero"
+                )
+
+            if not isinstance(interval, list):
+                raise TypeError(f"{row_where}.interval must be a list")
+            if len(interval) != 2:
+                raise ValueError(
+                    f"{row_where}.interval must have exactly 2 bounds"
+                )
+            for bound_index, bound in enumerate(interval):
+                _validate_number(
+                    bound,
+                    f"{row_where}.interval[{bound_index}]",
+                    nullable=False,
+                )
+            _validate_number(
+                rank_mean, f"{row_where}.rank_mean", nullable=False
+            )
+            _validate_number(
+                rank_abs, f"{row_where}.rank_abs", nullable=False
+            )
+            if rank_abs < 0:
+                raise ValueError(f"{row_where}.rank_abs must be non-negative")
+
+    return periods, models, scenarios, data
+
+
+def consensus(summary, *, minimum: int = 2) -> dict:
+    """Aggregate per-scenario consensus of a matrix evolution summary.
+
+    ``summary`` must be a complete :func:`summarize_matrix_evolution`
+    result (schema ``climate-grid/cme-summary-v1``) with exactly the keys
+    ``schema, periods, models, scenarios, data`` in that order; every
+    member is validated against that contract, including the nested
+    model-then-scenario ``data`` mapping order and each row's key order
+    ``model, scenario, total, count, transitions, interval, rank_mean,
+    rank_abs``.  ``minimum`` must be a non-bool positive int.
+
+    For each scenario (in scenario order) the rows whose ``interval``,
+    ``rank_mean`` and ``rank_abs`` are all not ``None`` are collected
+    across models (in model order): ``n`` is the number of collected
+    rows and ``moves`` is the column-wise sum of their ``transitions``
+    lists (nine ints).  When ``n`` is below ``minimum``, ``rates``
+    through ``std`` are all ``None``; otherwise ``rates`` is each
+    ``moves`` entry divided by the total moves, ``agree`` is the maximum
+    rate, ``entropy`` is ``-sum(p * log2(p))`` over the positive rates,
+    ``band`` is ``[mean lo, mean hi]`` over the collected rows'
+    intervals, ``spread`` is the root mean square of the interval
+    bounds' deviations from those means (``sqrt(sum((lo - lo_mean)**2 +
+    (hi - hi_mean)**2) / (2 * n))``), ``mean`` is the mean of the
+    ``rank_mean`` values, ``abs`` is the mean of the ``rank_abs`` values
+    and ``std`` is the population standard deviation of the ``rank_mean``
+    values.
+
+    The returned mapping uses the key order ``schema, periods, models,
+    scenarios, data``; ``schema`` is ``climate-grid/mc-v1`` and the
+    three axes echo the input.  ``data`` is a list in scenario order;
+    each row uses the key order ``scenario, n, moves, rates, agree,
+    entropy, band, spread, mean, abs, std``.  ``n`` and the ``moves``
+    entries are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    periods, models, scenarios, data = _validate_matrix_evolution_summary(
+        summary
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    rows = []
+    for scenario in scenarios:
+        valid = [
+            data[model][scenario]
+            for model in models
+            if data[model][scenario]["interval"] is not None
+            and data[model][scenario]["rank_mean"] is not None
+            and data[model][scenario]["rank_abs"] is not None
+        ]
+        n = len(valid)
+        moves = [
+            sum(row["transitions"][index] for row in valid)
+            for index in range(9)
+        ]
+        if n < minimum:
+            rates = None
+            agree = None
+            entropy = None
+            band = None
+            spread = None
+            mean = None
+            abs_mean = None
+            std = None
+        else:
+            try:
+                total_moves = sum(moves)
+                probabilities = [move / total_moves for move in moves]
+                agree_value = max(probabilities)
+                entropy_value = -sum(
+                    p * math.log2(p) for p in probabilities if p > 0
+                )
+                lo_mean = sum(row["interval"][0] for row in valid) / n
+                hi_mean = sum(row["interval"][1] for row in valid) / n
+                spread_value = math.sqrt(
+                    sum(
+                        (row["interval"][0] - lo_mean) ** 2
+                        + (row["interval"][1] - hi_mean) ** 2
+                        for row in valid
+                    )
+                    / (2 * n)
+                )
+                rank_means = [row["rank_mean"] for row in valid]
+                mean_value = sum(rank_means) / n
+                abs_value = sum(row["rank_abs"] for row in valid) / n
+                std_value = math.sqrt(
+                    sum((value - mean_value) ** 2 for value in rank_means)
+                    / n
+                )
+            except OverflowError:
+                raise ValueError(
+                    f"data[{scenario!r}] results must be finite"
+                ) from None
+            computed = [
+                *probabilities,
+                agree_value,
+                entropy_value,
+                lo_mean,
+                hi_mean,
+                spread_value,
+                mean_value,
+                abs_value,
+                std_value,
+            ]
+            if not all(_is_finite(value) for value in computed):
+                raise ValueError(
+                    f"data[{scenario!r}] results must be finite"
+                )
+            rates = [_round_output(p) for p in probabilities]
+            agree = _round_output(agree_value)
+            entropy = _round_output(entropy_value)
+            band = [_round_output(lo_mean), _round_output(hi_mean)]
+            spread = _round_output(spread_value)
+            mean = _round_output(mean_value)
+            abs_mean = _round_output(abs_value)
+            std = _round_output(std_value)
+        rows.append(
+            {
+                "scenario": scenario,
+                "n": n,
+                "moves": moves,
+                "rates": rates,
+                "agree": agree,
+                "entropy": entropy,
+                "band": band,
+                "spread": spread,
+                "mean": mean,
+                "abs": abs_mean,
+                "std": std,
+            }
+        )
+
+    return {
+        "schema": _CONSENSUS_SCHEMA,
+        "periods": list(periods),
+        "models": list(models),
+        "scenarios": list(scenarios),
+        "data": rows,
+    }
