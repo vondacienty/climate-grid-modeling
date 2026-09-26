@@ -7395,3 +7395,330 @@ def layer_sum(items, *, min_count: int = 1) -> dict:
         "drivers": list(first_drivers),
         "data": result_data,
     }
+
+
+_LAYER_SUM_RESULT_KEYS = (
+    "schema",
+    "layers",
+    "reference",
+    "scenarios",
+    "elements",
+    "drivers",
+    "data",
+)
+_LAYER_SUM_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "count",
+    "mean",
+    "min",
+    "max",
+    "uncertainty",
+)
+_LAYER_TREND_SCHEMA = "climate-grid/lt-v1"
+
+
+def _validate_layer_sum(
+    summary: Any, *, where: str = "summary"
+) -> tuple[str, list[str], list[str], list[str], list]:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _LAYER_SUM_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, layers, "
+            "reference, scenarios, elements, drivers, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _LAYER_SUM_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_LAYER_SUM_SCHEMA!r}"
+        )
+
+    layers = summary["layers"]
+    if not isinstance(layers, list):
+        raise TypeError(f"{where}.layers must be a list")
+    if len(layers) == 0:
+        raise ValueError(f"{where}.layers must be non-empty")
+    seen_pairs: set[tuple[str, str]] = set()
+    for index, layer in enumerate(layers):
+        layer_where = f"{where}.layers[{index}]"
+        if not isinstance(layer, dict):
+            raise TypeError(f"{layer_where} must be a dict")
+        if tuple(layer.keys()) != ("period", "region"):
+            raise ValueError(
+                f"{layer_where} must have exactly the keys period, region "
+                "in order"
+            )
+        period = layer["period"]
+        region = layer["region"]
+        if not isinstance(period, str):
+            raise TypeError(f"{layer_where}.period must be a str")
+        if period == "":
+            raise ValueError(f"{layer_where}.period must be non-empty")
+        if not isinstance(region, str):
+            raise TypeError(f"{layer_where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{layer_where}.region must be non-empty")
+        if (period, region) in seen_pairs:
+            raise ValueError(
+                f"duplicate period/region pair: {(period, region)!r}"
+            )
+        seen_pairs.add((period, region))
+
+    reference = summary["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        summary["elements"], f"{where}.elements"
+    )
+    drivers = _validate_string_list(
+        summary["drivers"], f"{where}.drivers"
+    )
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(scenarios) * len(elements) * len(drivers)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/element/driver combination, in "
+            "scenario-then-element-then-driver order)"
+        )
+
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for driver in drivers:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _LAYER_SUM_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, driver, count, mean, min, max, "
+                        "uncertainty in order"
+                    )
+
+                row_scenario = row["scenario"]
+                if not isinstance(row_scenario, str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row_scenario != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_driver = row["driver"]
+                if not isinstance(row_driver, str):
+                    raise TypeError(f"{row_where}.driver must be a str")
+                if row_driver != driver:
+                    raise ValueError(
+                        f"{row_where}.driver must be {driver!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{row_where}.count must be a non-bool int")
+                if count < 0:
+                    raise ValueError(
+                        f"{row_where}.count must be non-negative"
+                    )
+
+                mean = row["mean"]
+                minimum = row["min"]
+                maximum = row["max"]
+                uncertainty = row["uncertainty"]
+                _validate_number(mean, f"{row_where}.mean", nullable=True)
+                _validate_number(minimum, f"{row_where}.min", nullable=True)
+                _validate_number(maximum, f"{row_where}.max", nullable=True)
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                present = [mean is not None, minimum is not None,
+                           maximum is not None, uncertainty is not None]
+                if any(present) and not all(present):
+                    raise ValueError(
+                        f"{row_where}: mean, min, max and uncertainty must "
+                        "be all None or all present"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                row_index += 1
+
+    return reference, scenarios, elements, drivers, data
+
+
+def layer_trend(summaries, years, *, min_points: int = 2) -> dict:
+    """Fit per-row linear trends across :func:`layer_sum` summaries.
+
+    ``summaries`` must be a non-empty list of complete :func:`layer_sum`
+    results (schema ``climate-grid/rs-v1``), each validated against that
+    contract; every summary must share the same ``reference`` and the same
+    ``scenarios``, ``elements`` and ``drivers`` in the same order, all
+    taken from the first summary.  ``years`` must be a list of non-bool
+    ints, one per summary and strictly increasing.  ``min_points`` must be
+    a non-bool int of at least 2.
+
+    For every scenario (in scenario order), element (in element order) and
+    driver (in driver order), the points whose ``mean`` and ``uncertainty``
+    are both not ``None`` are collected in summary order with the
+    corresponding year as ``x``, the ``mean`` as ``y`` and the
+    ``uncertainty`` as ``u``; ``count`` is their number ``n``.  When ``n``
+    is below ``min_points``, ``slope`` and ``uncertainty`` are both
+    ``None``; otherwise, with ``S = sum((x - x_mean) ** 2)``, they are
+    ``sum((x - x_mean) * (y - y_mean)) / S`` and
+    ``sqrt(sum(((x - x_mean) * u) ** 2)) / S`` respectively.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    scenarios, elements, drivers, data``; ``schema`` is
+    ``climate-grid/lt-v1``, ``years`` echoes the given years and
+    ``reference``, ``scenarios``, ``elements`` and ``drivers`` echo the
+    first summary's axes.  ``data`` is a flat list in
+    scenario-then-element-then-driver order; each row uses the key order
+    ``scenario, element, driver, count, slope, uncertainty``.  ``count``
+    is a non-bool int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(summaries, list):
+        raise TypeError("summaries must be a list")
+    if len(summaries) == 0:
+        raise ValueError("summaries must be non-empty")
+
+    validated: list[list] = []
+    for index, summary in enumerate(summaries):
+        reference, scenarios, elements, drivers, data = _validate_layer_sum(
+            summary, where=f"summaries[{index}]"
+        )
+        if not validated:
+            first_reference = reference
+            first_scenarios = scenarios
+            first_elements = elements
+            first_drivers = drivers
+        else:
+            if reference != first_reference:
+                raise ValueError(
+                    "all summaries must share the same reference, taken "
+                    "from the first summary"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all summaries must share the same scenarios in the "
+                    "same order, taken from the first summary"
+                )
+            if elements != first_elements:
+                raise ValueError(
+                    "all summaries must share the same elements in the "
+                    "same order, taken from the first summary"
+                )
+            if drivers != first_drivers:
+                raise ValueError(
+                    "all summaries must share the same drivers in the "
+                    "same order, taken from the first summary"
+                )
+        validated.append(data)
+
+    if not isinstance(years, list):
+        raise TypeError("years must be a list")
+    if len(years) != len(summaries):
+        raise ValueError("years must have one entry per summary")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError("years must be strictly increasing")
+
+    if not isinstance(min_points, int) or isinstance(min_points, bool):
+        raise TypeError("min_points must be a non-bool int")
+    if min_points < 2:
+        raise ValueError("min_points must be at least 2")
+
+    n_elements = len(first_elements)
+    n_drivers = len(first_drivers)
+
+    result_data = []
+    for s_index, scenario in enumerate(first_scenarios):
+        for e_index, element in enumerate(first_elements):
+            for d_index, driver in enumerate(first_drivers):
+                row_offset = (
+                    (s_index * n_elements + e_index) * n_drivers + d_index
+                )
+                points = []
+                for year, data in zip(years, validated):
+                    row = data[row_offset]
+                    mean = row["mean"]
+                    uncertainty = row["uncertainty"]
+                    if mean is not None and uncertainty is not None:
+                        points.append((year, mean, uncertainty))
+
+                count = len(points)
+                if count < min_points:
+                    slope = None
+                    trend_uncertainty = None
+                else:
+                    x_mean = sum(x for x, _y, _u in points) / count
+                    y_mean = sum(y for _x, y, _u in points) / count
+                    sxx = sum((x - x_mean) ** 2 for x, _y, _u in points)
+                    slope = _round_output(
+                        sum(
+                            (x - x_mean) * (y - y_mean)
+                            for x, y, _u in points
+                        )
+                        / sxx
+                    )
+                    trend_uncertainty = _round_output(
+                        math.sqrt(
+                            sum(
+                                ((x - x_mean) * u) ** 2
+                                for x, _y, u in points
+                            )
+                        )
+                        / sxx
+                    )
+
+                result_data.append(
+                    {
+                        "scenario": scenario,
+                        "element": element,
+                        "driver": driver,
+                        "count": count,
+                        "slope": slope,
+                        "uncertainty": trend_uncertainty,
+                    }
+                )
+
+    return {
+        "schema": _LAYER_TREND_SCHEMA,
+        "years": list(years),
+        "reference": first_reference,
+        "scenarios": list(first_scenarios),
+        "elements": list(first_elements),
+        "drivers": list(first_drivers),
+        "data": result_data,
+    }
