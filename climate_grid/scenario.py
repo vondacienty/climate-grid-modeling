@@ -5266,3 +5266,236 @@ def compare_rank(summary) -> dict:
         "reference": reference,
         "data": compare_data,
     }
+
+
+_RANK_ATTRIBUTE_SCHEMA = "climate-grid/ra-v1"
+_RANK_COMPARE_KEYS = ("schema", "reference", "data")
+_RANK_COMPARE_ROW_KEYS = (
+    "config",
+    "valid",
+    "mean_abs",
+    "normalized",
+    "stable_delta",
+    "normalized_delta",
+)
+
+
+def _validate_rank_compare(compare: Any) -> tuple[str, list[str], list]:
+    if not isinstance(compare, dict):
+        raise TypeError("compare must be a dict")
+    if tuple(compare.keys()) != _RANK_COMPARE_KEYS:
+        raise ValueError(
+            "compare must have exactly the keys schema, reference, data in order"
+        )
+
+    schema = compare["schema"]
+    if not isinstance(schema, str):
+        raise TypeError("compare.schema must be a str")
+    if schema != _RANK_COMPARE_SCHEMA:
+        raise ValueError(f"compare.schema must be {_RANK_COMPARE_SCHEMA!r}")
+
+    reference = compare["reference"]
+    if not isinstance(reference, str):
+        raise TypeError("compare.reference must be a str")
+    if reference == "":
+        raise ValueError("compare.reference must be non-empty")
+
+    data = compare["data"]
+    if not isinstance(data, list):
+        raise TypeError("compare.data must be a list")
+    if len(data) == 0:
+        raise ValueError("compare.data must be non-empty")
+
+    configs: list[str] = []
+    seen_configs: set[str] = set()
+    for index, row in enumerate(data):
+        where = f"compare.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(row.keys()) != _RANK_COMPARE_ROW_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys config, valid, mean_abs, "
+                "normalized, stable_delta, normalized_delta in order"
+            )
+
+        config = row["config"]
+        if not isinstance(config, str):
+            raise TypeError(f"{where}.config must be a str")
+        if config == "":
+            raise ValueError(f"{where}.config must be non-empty")
+        if config in seen_configs:
+            raise ValueError(f"duplicate compare config: {config!r}")
+        seen_configs.add(config)
+
+        valid = row["valid"]
+        if not isinstance(valid, int) or isinstance(valid, bool):
+            raise TypeError(f"{where}.valid must be a non-bool int")
+        if valid < 0:
+            raise ValueError(f"{where}.valid must be non-negative")
+
+        if valid == 0:
+            if row["mean_abs"] is not None or row["normalized"] is not None:
+                raise ValueError(
+                    f"{where}.mean_abs and {where}.normalized must be None when "
+                    "valid is zero"
+                )
+        elif row["mean_abs"] is None or row["normalized"] is None:
+            raise ValueError(
+                f"{where}.mean_abs and {where}.normalized must be present when "
+                "valid is positive"
+            )
+
+        for field in ("mean_abs", "normalized", "stable_delta", "normalized_delta"):
+            _validate_number(row[field], f"{where}.{field}", nullable=True)
+
+        configs.append(config)
+
+    if configs[0] != reference:
+        raise ValueError("compare.reference must be the first compare config")
+
+    reference_normalized = data[0]["normalized"]
+    for index, row in enumerate(data):
+        normalized_delta_is_none = row["normalized_delta"] is None
+        expected_none = (
+            row["normalized"] is None or reference_normalized is None
+        )
+        if normalized_delta_is_none != expected_none:
+            where = f"compare.data[{index}]"
+            raise ValueError(
+                f"{where}.normalized_delta must be None exactly when "
+                f"{where}.normalized or the reference normalized is None"
+            )
+
+    return reference, configs, data
+
+
+def _validate_attribute_drivers(drivers: Any, n_configs: int) -> list:
+    if not isinstance(drivers, dict):
+        raise TypeError("drivers must be a dict")
+    if len(drivers) == 0:
+        raise ValueError("drivers must be non-empty")
+
+    validated = []
+    for name, values in drivers.items():
+        if not isinstance(name, str):
+            raise TypeError("drivers keys must be str")
+        if name == "":
+            raise ValueError("drivers keys must be non-empty")
+        if not isinstance(values, list):
+            raise TypeError(f"drivers[{name!r}] must be a list")
+        if len(values) != n_configs:
+            raise ValueError(
+                f"drivers[{name!r}] must have {n_configs} items "
+                "(one per compare config)"
+            )
+        for index, value in enumerate(values):
+            target = f"drivers[{name!r}][{index}]"
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(
+                    f"{target} must be a finite non-bool number in [-1, 1] "
+                    "or None"
+                )
+            if not math.isfinite(value):
+                raise ValueError(f"{target} must be finite")
+            if value < -1.0 or value > 1.0:
+                raise ValueError(f"{target} must be in [-1, 1]")
+        validated.append((name, values))
+
+    return validated
+
+
+def rank_attribute(compare, drivers) -> dict:
+    """Attribute per-config normalized rank deltas to scalar drivers.
+
+    ``compare`` must be a complete :func:`compare_rank` result (schema
+    ``climate-grid/rank-compare-v1``) with exactly the keys ``schema,
+    reference, data`` in that order; every member is validated against that
+    contract, including each ``data`` row's key order ``config, valid,
+    mean_abs, normalized, stable_delta, normalized_delta`` (the four float
+    fields are finite non-bool numbers or ``None``).  ``drivers`` is a
+    non-empty dict preserving insertion order; each key is a non-empty str
+    driver name and each value is a list with the same length as
+    ``compare.data`` whose items are ``None`` or finite non-bool numbers in
+    ``[-1, 1]``.
+
+    For every driver, the driver value ``x`` is paired with the matching
+    row's ``normalized_delta`` ``y``, keeping only configurations where
+    both are not ``None``; ``n`` is the number of retained pairs.  When
+    ``n < 2`` or ``Sxx = Σ(x − x̄)²`` is zero, ``contribution`` and
+    ``uncertainty`` are ``None`` for every configuration.  Otherwise the
+    slope is ``b = Σ(x − x̄)(y − ȳ) / Sxx``, the residuals are
+    ``e = y − ȳ − b(x − x̄)`` and ``r = √(Σe² / n)``; at retained
+    configurations ``contribution`` is ``b(x − x̄)`` and ``uncertainty`` is
+    ``r√(1/n + (x − x̄)²/Sxx)``; configurations dropped from the fit get
+    ``None``.
+
+    The returned mapping uses the key order ``schema, reference, configs,
+    data``; ``schema`` is ``climate-grid/ra-v1``, ``reference`` echoes
+    ``compare.reference`` and ``configs`` follows the ``compare.data``
+    configuration order.  ``data`` follows the driver insertion order; each
+    row uses the key order ``driver, count, contribution, uncertainty``.
+    ``count`` is an int and the two per-config lists align with ``configs``.
+    Every output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    reference, configs, compare_data = _validate_rank_compare(compare)
+    n_configs = len(configs)
+    validated_drivers = _validate_attribute_drivers(drivers, n_configs)
+
+    normalized_deltas = [row["normalized_delta"] for row in compare_data]
+
+    rows = []
+    for name, values in validated_drivers:
+        pairs = [
+            (index, values[index], normalized_deltas[index])
+            for index in range(n_configs)
+            if values[index] is not None and normalized_deltas[index] is not None
+        ]
+        n = len(pairs)
+
+        contribution: list = [None] * n_configs
+        uncertainty: list = [None] * n_configs
+
+        if n >= 2:
+            x_mean = sum(x for _index, x, _y in pairs) / n
+            y_mean = sum(y for _index, _x, y in pairs) / n
+            sxx = sum((x - x_mean) ** 2 for _index, x, _y in pairs)
+            if sxx == 0:
+                pass
+            else:
+                sxy = sum(
+                    (x - x_mean) * (y - y_mean) for _index, x, y in pairs
+                )
+                b = sxy / sxx
+                residual_sq = sum(
+                    (y - y_mean - b * (x - x_mean)) ** 2
+                    for _index, x, y in pairs
+                )
+                r = math.sqrt(residual_sq / n)
+                for index, x, _y in pairs:
+                    dx = x - x_mean
+                    contribution[index] = _round_output(b * dx)
+                    uncertainty[index] = _round_output(
+                        r * math.sqrt(1.0 / n + dx ** 2 / sxx)
+                    )
+
+        rows.append(
+            {
+                "driver": name,
+                "count": n,
+                "contribution": contribution,
+                "uncertainty": uncertainty,
+            }
+        )
+
+    return {
+        "schema": _RANK_ATTRIBUTE_SCHEMA,
+        "reference": reference,
+        "configs": list(configs),
+        "data": rows,
+    }
