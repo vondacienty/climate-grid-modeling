@@ -4221,38 +4221,41 @@ def _composite_rows(
                 }
             )
             continue
-        # Scale every term by the largest positive weight: this keeps
-        # weight * rank / uncertainty products finite even with extreme
-        # weights, so the intermediate sums and squares cannot overflow.
-        # fsum sums without losing precision and hypot avoids squaring the
-        # scaled terms directly; the common max/total factor is reapplied
-        # afterwards.
+        # Normalize the weights by the largest positive weight, then use
+        # fsum to turn the ratios into coefficients a that sum to one:
+        # dividing by max(w) first keeps every term of order one even for
+        # extreme weights, so the intermediate sums cannot overflow.
         max_weight = max(weight for weight, _row in included)
-        total_ratio = math.fsum(weight / max_weight for weight, _row in included)
-        scale = 1.0 / total_ratio
+        ratios = [weight / max_weight for weight, _row in included]
+        total_ratio = math.fsum(ratios)
+        a = [ratio / total_ratio for ratio in ratios]
+        # Scale the uncertainty terms by the largest included uncertainty
+        # and combine with hypot, which never squares its arguments
+        # directly; a_i * u_i / M is at most one even for huge u_i, so the
+        # result stays finite.
+        max_u = max(row["uncertainty"] for _weight, row in included)
+        if max_u == 0.0:
+            u = 0.0
+        else:
+            u = max_u * math.hypot(
+                *[
+                    a_i * row["uncertainty"] / max_u
+                    for a_i, (_weight, row) in zip(a, included)
+                ]
+            )
         rows.append(
             {
                 "scenario": scenario,
                 "covered": covered,
                 "mean": _round_output(
                     math.fsum(
-                        (weight / max_weight)
-                        * row["mean_rank"]
-                        for weight, row in included
+                        a_i * row["mean_rank"]
+                        for a_i, (_weight, row) in zip(a, included)
                     )
-                    * scale
                 ),
                 "best": min(row["best_rank"] for _weight, row in included),
                 "worst": max(row["worst_rank"] for _weight, row in included),
-                "u": _round_output(
-                    math.hypot(
-                        *[
-                            (weight / max_weight) * row["uncertainty"]
-                            for weight, row in included
-                        ]
-                    )
-                    * scale
-                ),
+                "u": _round_output(u),
             }
         )
     return rows
@@ -4313,9 +4316,11 @@ def composite_rank(stability, weights, *, min_elements: int = 1) -> dict:
     ``Σ(w × mean_rank) / W``, ``best`` is the minimum ``best_rank``,
     ``worst`` is the maximum ``worst_rank`` and ``u`` is
     ``√Σ(w × uncertainty)² / W`` over the included rows.  The weights are
-    internally rescaled by the largest positive included weight and the
-    sums use ``math.fsum`` / ``math.hypot`` so that extreme weights cannot
-    overflow the intermediate products.
+    internally divided by the largest positive weight and the ratios are
+    fsum-normalized into coefficients ``a`` summing to one; the uncertainty
+    is then ``M · hypot(aᵢuᵢ/M)`` with ``M`` the largest included
+    uncertainty (``0.0`` when ``M`` is zero), so that extreme weights and
+    uncertainties cannot overflow the intermediate products.
 
     The scenarios are then ranked by ascending ``mean`` with ties keeping
     the original ``scenarios`` order; ``rank`` runs consecutively from 1.
@@ -4356,11 +4361,13 @@ def composite_rank(stability, weights, *, min_elements: int = 1) -> dict:
 _COMPOSITE_RANK_SENSITIVITY_SCHEMA = "climate-grid/crank-sensitivity-v1"
 
 
-def _validate_rank_configs(configs: Any, n_elements: int) -> list[str]:
+def _validate_rank_configs(
+    configs: Any, n_elements: int, *, minimum: int = 1
+) -> list[str]:
     if not isinstance(configs, list):
         raise TypeError("configs must be a list")
-    if len(configs) == 0:
-        raise ValueError("configs must be non-empty")
+    if len(configs) < minimum:
+        raise ValueError(f"configs must contain at least {minimum} entries")
 
     names: list[str] = []
     seen_names: set[str] = set()
@@ -4479,5 +4486,106 @@ def rank_sensitivity(stability, configs, *, min_elements: int = 1) -> dict:
         "schema": _COMPOSITE_RANK_SENSITIVITY_SCHEMA,
         "configurations": names,
         "scenarios": list(scenarios),
+        "data": result_data,
+    }
+
+
+_COMPOSITE_RANK_ROBUSTNESS_SCHEMA = "climate-grid/robust-v1"
+
+
+def rank_robustness(stability, configs, *, min_elements: int = 1) -> dict:
+    """Measure how robust composite scenario ranks are against weight perturbations.
+
+    ``stability`` is validated exactly as in :func:`composite_rank` (a
+    complete :func:`rank_stability` result, schema
+    ``climate-grid/qshift-rank-stability-v1``).  ``configs`` follows the
+    :func:`rank_sensitivity` validation but must contain at least two
+    dicts; each dict must have exactly the keys ``name, weights`` in that
+    order, ``name`` is a unique non-empty str and ``weights`` follows the
+    :func:`composite_rank` weights contract (one finite non-bool
+    non-negative number per stability element, in element order).  The
+    first configuration is the baseline and every other configuration is a
+    perturbation.  ``min_elements`` must be a non-bool positive int.
+
+    A composite ranking is computed for every configuration exactly as in
+    :func:`composite_rank`.  Then, for every scenario (in scenario order),
+    the perturbations whose composite ``rank`` is not ``None`` while the
+    baseline ``rank`` is also not ``None`` are collected; ``d`` is the
+    perturbation rank minus the baseline rank and ``count`` is the number
+    of such perturbations.  When ``count`` is zero, ``range`` is
+    ``[None, None]`` and ``stable`` and ``rms`` are ``None``; otherwise
+    ``range`` is ``[min(d), max(d)]``, ``stable`` is the fraction of the
+    collected perturbations with ``d`` equal to zero and ``rms`` is
+    ``sqrt(fsum(d ** 2) / count)``.
+
+    The returned mapping uses the key order ``schema, baseline, configs,
+    data``; ``schema`` is ``climate-grid/robust-v1``, ``baseline`` is the
+    first configuration name and ``configs`` lists the remaining names in
+    input order.  ``data`` follows the scenario order; each row uses the
+    key order ``scenario, baseline_rank, count, range, stable, rms``.
+    ``baseline_rank``, ``count`` and the ``range`` endpoints are ints or
+    ``None`` and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scenarios, elements, data = _validate_rank_stability(stability)
+    names = _validate_rank_configs(configs, len(elements), minimum=2)
+
+    if not isinstance(min_elements, int) or isinstance(min_elements, bool):
+        raise TypeError("min_elements must be a non-bool int")
+    if min_elements < 1:
+        raise ValueError("min_elements must be positive")
+
+    ranks_by_config: dict[str, dict[str, int]] = {}
+    for config in configs:
+        composite_rows = _rank_composite(
+            scenarios, elements, data, config["weights"], min_elements
+        )
+        ranks_by_config[config["name"]] = {
+            row["scenario"]: row["rank"] for row in composite_rows
+        }
+
+    baseline_name = names[0]
+    perturbation_names = names[1:]
+
+    result_data = []
+    for scenario in scenarios:
+        baseline_rank = ranks_by_config[baseline_name][scenario]
+        deltas = []
+        if baseline_rank is not None:
+            deltas = [
+                ranks_by_config[name][scenario] - baseline_rank
+                for name in perturbation_names
+                if ranks_by_config[name][scenario] is not None
+            ]
+        count = len(deltas)
+        if count == 0:
+            row = {
+                "scenario": scenario,
+                "baseline_rank": baseline_rank,
+                "count": 0,
+                "range": [None, None],
+                "stable": None,
+                "rms": None,
+            }
+        else:
+            stable = math.fsum(1 for d in deltas if d == 0) / count
+            rms = math.sqrt(math.fsum(d ** 2 for d in deltas) / count)
+            row = {
+                "scenario": scenario,
+                "baseline_rank": baseline_rank,
+                "count": count,
+                "range": [min(deltas), max(deltas)],
+                "stable": _round_output(stable),
+                "rms": _round_output(rms),
+            }
+        result_data.append(row)
+
+    return {
+        "schema": _COMPOSITE_RANK_ROBUSTNESS_SCHEMA,
+        "baseline": baseline_name,
+        "configs": list(perturbation_names),
         "data": result_data,
     }
