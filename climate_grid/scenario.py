@@ -4596,3 +4596,100 @@ def rank_robustness(stability, configs, *, min_elements: int = 1) -> dict:
         "configs": perturbation_names,
         "data": result_data,
     }
+
+
+_RANK_TRANSITIONS_SCHEMA = "climate-grid/rank-transitions-v1"
+
+
+def rank_transitions(stability, configs, *, min_elements: int = 1) -> dict:
+    """Tabulate baseline-to-perturbation composite rank transitions.
+
+    ``stability`` is validated exactly as in :func:`composite_rank` (a
+    complete :func:`rank_stability` result, schema
+    ``climate-grid/qshift-rank-stability-v1``).  ``configs`` is a list of at
+    least two dicts validated exactly as in :func:`rank_sensitivity`; each
+    dict must have exactly the keys ``name, weights`` in that order,
+    ``name`` is a unique non-empty str and ``weights`` follows the
+    :func:`composite_rank` weights contract.  The first configuration is
+    the baseline and every other configuration is a perturbation.
+    ``min_elements`` must be a non-bool positive int.
+
+    A composite ranking is computed for every configuration exactly as in
+    :func:`composite_rank`.  Then, for every perturbation configuration (in
+    configuration order) and every scenario (in scenario order), the
+    baseline rank and the perturbation rank are recorded; ``delta`` is
+    ``rank - baseline_rank`` when both ranks are not ``None`` and ``None``
+    otherwise.  The detail rows whose baseline rank and rank are both not
+    ``None`` are counted by the ``(baseline_rank, rank)`` pair; the groups
+    are sorted by that pair in ascending order.
+
+    The returned mapping uses the key order ``schema, baseline, configs,
+    scenarios, data, transitions``; ``schema`` is
+    ``climate-grid/rank-transitions-v1``, ``baseline`` is the first
+    configuration name, ``configs`` lists the remaining configuration names
+    in input order and ``scenarios`` echoes the stability scenarios.
+    ``data`` is a flat list of rows in configuration-then-scenario order;
+    each row uses the key order ``config, scenario, baseline_rank, rank,
+    delta`` and the ranks and ``delta`` are non-bool ints or ``None``.
+    ``transitions`` rows use the key order ``baseline_rank, rank, count``
+    and all three fields are positive non-bool ints.  Inputs are not
+    modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scenarios, elements, data = _validate_rank_stability(stability)
+    names = _validate_rank_configs(configs, len(elements), minimum=2)
+
+    if not isinstance(min_elements, int) or isinstance(min_elements, bool):
+        raise TypeError("min_elements must be a non-bool int")
+    if min_elements < 1:
+        raise ValueError("min_elements must be positive")
+
+    ranks_by_config: dict[str, dict[str, int | None]] = {}
+    for config in configs:
+        composite_rows = _rank_composite(
+            scenarios, elements, data, config["weights"], min_elements
+        )
+        ranks_by_config[config["name"]] = {
+            row["scenario"]: row["rank"] for row in composite_rows
+        }
+
+    baseline_name = names[0]
+    perturbation_names = names[1:]
+
+    result_data = []
+    transition_counts: dict[tuple[int, int], int] = {}
+    for name in perturbation_names:
+        for scenario in scenarios:
+            baseline_rank = ranks_by_config[baseline_name][scenario]
+            rank = ranks_by_config[name][scenario]
+            if baseline_rank is None or rank is None:
+                delta = None
+            else:
+                delta = rank - baseline_rank
+                pair = (baseline_rank, rank)
+                transition_counts[pair] = transition_counts.get(pair, 0) + 1
+            result_data.append(
+                {
+                    "config": name,
+                    "scenario": scenario,
+                    "baseline_rank": baseline_rank,
+                    "rank": rank,
+                    "delta": delta,
+                }
+            )
+
+    transitions = [
+        {"baseline_rank": baseline_rank, "rank": rank, "count": count}
+        for (baseline_rank, rank), count in sorted(transition_counts.items())
+    ]
+
+    return {
+        "schema": _RANK_TRANSITIONS_SCHEMA,
+        "baseline": baseline_name,
+        "configs": perturbation_names,
+        "scenarios": list(scenarios),
+        "data": result_data,
+        "transitions": transitions,
+    }
