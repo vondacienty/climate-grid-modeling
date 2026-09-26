@@ -12382,30 +12382,27 @@ def _validate_region_interval_ranking(
                             raise ValueError(
                                 f"{row_where}.rank must run consecutively from 1"
                             )
-                        _validate_number(
-                            center_delta, f"{row_where}.center_delta",
-                            nullable=True,
-                        )
-                        _validate_number(
-                            lower_delta, f"{row_where}.lower_delta",
-                            nullable=True,
-                        )
-                        _validate_number(
-                            upper_delta, f"{row_where}.upper_delta",
-                            nullable=True,
-                        )
+                        for field_name, field_value in (
+                            ("center_delta", center_delta),
+                            ("lower_delta", lower_delta),
+                            ("upper_delta", upper_delta),
+                        ):
+                            if field_value is None:
+                                raise ValueError(
+                                    f"{row_where}.{field_name} must be present "
+                                    "when rank is not None"
+                                )
+                            _validate_number(
+                                field_value, f"{row_where}.{field_name}",
+                                nullable=False,
+                            )
+                        if overlap is None:
+                            raise ValueError(
+                                f"{row_where}.overlap must be present when rank "
+                                "is not None"
+                            )
                         if not isinstance(overlap, bool):
                             raise TypeError(f"{row_where}.overlap must be a bool")
-                        if (
-                            center_delta is None
-                            or lower_delta is None
-                            or upper_delta is None
-                        ):
-                            raise ValueError(
-                                f"{row_where}: center_delta, lower_delta and "
-                                "upper_delta must be present when rank is not "
-                                "None"
-                            )
                         if (
                             previous_center is not None
                             and center_delta > previous_center
@@ -12527,5 +12524,176 @@ def rank_region_stability(ranking, *, min_ranks: int = 1) -> dict:
     return {
         "schema": _REGION_RANK_STABILITY_SCHEMA,
         "scenarios": list(scenarios),
+        "data": result_rows,
+    }
+
+
+_WINDOW_RANK_SCHEMA = "climate-grid/wr-v1"
+_WINDOW_RANK_ROW_KEYS = (
+    "window",
+    "scenario",
+    "total",
+    "valid",
+    "missing_rate",
+    "mean",
+    "best",
+    "worst",
+    "stddev",
+)
+
+
+def window_rank(rs, *, minimum: int = 1) -> dict:
+    """Aggregate scenario ranks per window across rank results.
+
+    ``rs`` must be a non-empty list of complete
+    :func:`rank_region_intervals` results (schema
+    ``climate-grid/rr-interval-rank-v1``); each result must contain
+    exactly one entry in ``windows``.  The single window names must be
+    pairwise distinct across the items, while every item's
+    ``scenarios``, ``elements``, ``regions``, ``factors`` and ``pairs``
+    must be identical and in the same order (axes are taken from the
+    first item).  ``minimum`` must be a non-bool positive int.
+
+    Let ``total = len(pairs) * len(elements) * len(factors)``.  For each
+    result (in ``rs`` order) and each scenario (in scenario order), its
+    non-``None`` ranks are gathered across pairs, elements and factors;
+    their number is ``valid`` and
+    ``missing_rate = (total - valid) / total``.  When
+    ``valid < minimum``, ``mean``, ``best``, ``worst`` and ``stddev``
+    are all ``None``; otherwise they are the mean, minimum and maximum
+    of the gathered ranks and
+    ``stddev = sqrt(sum((rank - mean) ** 2) / valid)``.
+
+    The returned mapping uses the key order ``schema, data``;
+    ``schema`` is ``climate-grid/wr-v1``.  ``data`` follows the
+    ``rs``-then-scenario order; each row uses the key order
+    ``window, scenario, total, valid, missing_rate, mean, best, worst,
+    stddev``, with ``window`` echoing the item's single window name.
+    ``total`` and ``valid`` are ints, ``best`` and ``worst`` are
+    positive non-bool ints or ``None``, and the other statistics are
+    floats or ``None``; every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(rs, list):
+        raise TypeError("rs must be a list")
+    if len(rs) == 0:
+        raise ValueError("rs must be non-empty")
+
+    first_scenarios = None
+    first_elements = None
+    first_regions = None
+    first_factors = None
+    first_pairs = None
+    prepared: list[tuple[str, list[str], int, list]] = []
+    seen_windows: set[str] = set()
+    for r_index, result in enumerate(rs):
+        where = f"rs[{r_index}]"
+        scenarios, elements, factors, pairs, data = (
+            _validate_region_interval_ranking(result, where=where)
+        )
+
+        windows = result["windows"]
+        if len(windows) != 1:
+            raise ValueError(f"{where}.windows must contain exactly one window")
+        window_name = windows[0]["name"]
+        if window_name in seen_windows:
+            raise ValueError(
+                "the single window names of the items in rs must be pairwise "
+                f"distinct: {window_name!r} repeats"
+            )
+        seen_windows.add(window_name)
+
+        regions = result["regions"]
+        if r_index == 0:
+            first_scenarios = scenarios
+            first_elements = elements
+            first_regions = regions
+            first_factors = factors
+            first_pairs = pairs
+        else:
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items in rs must share the same scenarios in the "
+                    "same order, taken from the first item"
+                )
+            if elements != first_elements:
+                raise ValueError(
+                    "all items in rs must share the same elements in the "
+                    "same order, taken from the first item"
+                )
+            if regions != first_regions:
+                raise ValueError(
+                    "all items in rs must share the same regions in the "
+                    "same order, taken from the first item"
+                )
+            if factors != first_factors:
+                raise ValueError(
+                    "all items in rs must share the same factors in the "
+                    "same order, taken from the first item"
+                )
+            if pairs != first_pairs:
+                raise ValueError(
+                    "all items in rs must share the same pairs in the "
+                    "same order, taken from the first item"
+                )
+
+        prepared.append((window_name, scenarios, len(pairs), data))
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_elements = len(first_elements)
+    n_factors = len(first_factors)
+
+    result_rows = []
+    for window_name, scenarios, n_pairs, data in prepared:
+        total = n_pairs * n_elements * n_factors
+        scenario_index = {
+            scenario: index for index, scenario in enumerate(scenarios)
+        }
+        ranks_by_scenario: list[list[int]] = [[] for _ in scenarios]
+        for row in data:
+            rank = row["rank"]
+            if rank is not None:
+                ranks_by_scenario[scenario_index[row["scenario"]]].append(rank)
+
+        for s_index, scenario in enumerate(scenarios):
+            ranks = ranks_by_scenario[s_index]
+            valid = len(ranks)
+            missing_rate = _round_output((total - valid) / total)
+            if valid < minimum:
+                mean = None
+                best = None
+                worst = None
+                stddev = None
+            else:
+                mean_value = sum(ranks) / valid
+                mean = _round_output(mean_value)
+                best = min(ranks)
+                worst = max(ranks)
+                variance = sum((rank - mean_value) ** 2 for rank in ranks) / valid
+                stddev = _round_output(math.sqrt(variance))
+
+            result_rows.append(
+                {
+                    "window": window_name,
+                    "scenario": scenario,
+                    "total": total,
+                    "valid": valid,
+                    "missing_rate": missing_rate,
+                    "mean": mean,
+                    "best": best,
+                    "worst": worst,
+                    "stddev": stddev,
+                }
+            )
+
+    return {
+        "schema": _WINDOW_RANK_SCHEMA,
         "data": result_rows,
     }
