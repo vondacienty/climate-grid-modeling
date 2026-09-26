@@ -8501,3 +8501,341 @@ def rank_trend_difference(summary, *, min_drivers: int = 1) -> dict:
         "drivers": list(drivers),
         "data": result_data,
     }
+
+
+_LAYER_TREND_RANK_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "scenarios",
+    "elements",
+    "drivers",
+    "data",
+)
+_LAYER_TREND_RANK_ROW_KEYS = (
+    "element",
+    "scenario",
+    "count",
+    "coverage",
+    "difference",
+    "uncertainty",
+    "rank",
+)
+_LAYER_TREND_SELECT_SCHEMA = "climate-grid/ltc-select-v1"
+_LAYER_TREND_SELECT_REQUEST_KEYS = ("element", "top")
+
+
+def _validate_rank_trend_difference(
+    ranking: Any, *, where: str = "ranking"
+) -> tuple[list, str, list[str], list[str], list[str], list]:
+    if not isinstance(ranking, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(ranking.keys()) != _LAYER_TREND_RANK_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "scenarios, elements, drivers, data in order"
+        )
+
+    schema = ranking["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _LAYER_TREND_RANK_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_LAYER_TREND_RANK_SCHEMA!r}")
+
+    years = ranking["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = ranking["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        ranking["scenarios"], f"{where}.scenarios"
+    )
+    if reference in scenarios:
+        raise ValueError(
+            f"{where}.reference must not appear in {where}.scenarios"
+        )
+    elements = _validate_string_list(
+        ranking["elements"], f"{where}.elements"
+    )
+    drivers = _validate_string_list(ranking["drivers"], f"{where}.drivers")
+
+    data = ranking["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(elements) * len(scenarios)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "element/scenario combination, in element-then-rank order)"
+        )
+
+    n_scenarios = len(scenarios)
+    n_drivers = len(drivers)
+    row_index = 0
+    for element in elements:
+        seen_scenarios: set[str] = set()
+        expected_rank = 1
+        closed = False
+        for _ in range(n_scenarios):
+            row_where = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _LAYER_TREND_RANK_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys element, "
+                    "scenario, count, coverage, difference, uncertainty, "
+                    "rank in order"
+                )
+
+            row_element = row["element"]
+            if not isinstance(row_element, str):
+                raise TypeError(f"{row_where}.element must be a str")
+            if row_element != element:
+                raise ValueError(
+                    f"{row_where}.element must be {element!r} for its "
+                    "element-then-rank position"
+                )
+
+            row_scenario = row["scenario"]
+            if not isinstance(row_scenario, str):
+                raise TypeError(f"{row_where}.scenario must be a str")
+            if row_scenario not in scenarios:
+                raise ValueError(
+                    f"{row_where}.scenario must be one of {where}.scenarios"
+                )
+            if row_scenario in seen_scenarios:
+                raise ValueError(
+                    f"{row_where}.scenario duplicates {row_scenario!r} "
+                    "within its element group"
+                )
+            seen_scenarios.add(row_scenario)
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if count < 0 or count > n_drivers:
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and the "
+                    "number of drivers"
+                )
+
+            coverage = row["coverage"]
+            _validate_number(coverage, f"{row_where}.coverage", nullable=False)
+            if coverage < 0 or coverage > 1:
+                raise ValueError(
+                    f"{row_where}.coverage must be between 0 and 1"
+                )
+
+            difference = row["difference"]
+            uncertainty = row["uncertainty"]
+            _validate_number(
+                difference, f"{row_where}.difference", nullable=True
+            )
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=True
+            )
+            if uncertainty is not None and uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+
+            rank = row["rank"]
+            if rank is not None:
+                if not isinstance(rank, int) or isinstance(rank, bool):
+                    raise TypeError(
+                        f"{row_where}.rank must be a non-bool int or None"
+                    )
+                if rank < 1:
+                    raise ValueError(f"{row_where}.rank must be positive")
+
+            none_flags = (
+                difference is None,
+                uncertainty is None,
+                rank is None,
+            )
+            if any(none_flags) and not all(none_flags):
+                raise ValueError(
+                    f"{row_where}: difference, uncertainty and rank must "
+                    "be all None or all present"
+                )
+            if rank is None:
+                closed = True
+            else:
+                if closed:
+                    raise ValueError(
+                        f"{row_where}: ranked rows must precede unranked "
+                        "rows within their element group"
+                    )
+                if rank != expected_rank:
+                    raise ValueError(
+                        f"{row_where}.rank must run consecutively from 1 "
+                        "within its element group"
+                    )
+                expected_rank += 1
+
+            row_index += 1
+
+    return years, reference, scenarios, elements, drivers, data
+
+
+def select_rank(ranking, requests, *, min_coverage=0.0) -> dict:
+    """Select top-ranked scenarios per element from a trend ranking.
+
+    ``ranking`` must be a complete :func:`rank_trend_difference` result
+    (schema ``climate-grid/ltc-rank-v1``) with exactly the keys ``schema,
+    years, reference, scenarios, elements, drivers, data`` in that order;
+    every member is validated against that contract, including the
+    non-empty strictly increasing non-bool int ``years``, the non-empty
+    str ``reference`` (which must not appear in ``scenarios``), the flat
+    element-then-rank ``data`` row order, each row's key order ``element,
+    scenario, count, coverage, difference, uncertainty, rank`` and the
+    row invariants (``count`` a non-bool int between 0 and the number of
+    drivers; ``coverage`` a finite number between 0 and 1; ``difference``,
+    ``uncertainty`` and ``rank`` all ``None`` or all present, with
+    ``uncertainty`` non-negative, ranked rows preceding unranked ones and
+    ``rank`` running consecutively from 1 within each element group).
+
+    ``requests`` must be a non-empty list of dicts; each dict must have
+    exactly the keys ``element, top`` in that order, where ``element`` is
+    a non-empty str that appears in ``ranking['elements']`` (elements
+    must be distinct across requests) and ``top`` is a non-bool positive
+    int.  ``min_coverage`` must be a finite non-bool number between 0 and
+    1 inclusive.
+
+    For every request (in request order), the ranking rows for its
+    element whose ``rank`` is not ``None`` and at most ``top`` and whose
+    ``coverage`` is at least ``min_coverage`` are selected in ranking
+    order.  ``count`` is their number ``n``; when ``n`` is zero ``mean``
+    and ``uncertainty`` are ``None``, otherwise they are
+    ``sum(difference) / n`` and ``sqrt(sum(uncertainty ** 2)) / n`` over
+    the selected rows.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    drivers, data``; ``schema`` is ``climate-grid/ltc-select-v1`` and
+    ``years``, ``reference`` and ``drivers`` echo the ranking metadata in
+    their original order.  ``data`` is a flat list in request order; each
+    item uses the key order ``element, top, count, mean, uncertainty,
+    rows`` and ``rows`` holds the selected rows as copies with the key
+    order ``scenario, count, coverage, difference, uncertainty, rank``.
+    ``count`` is an int and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        years,
+        reference,
+        scenarios,
+        elements,
+        drivers,
+        data,
+    ) = _validate_rank_trend_difference(ranking)
+
+    if not isinstance(requests, list):
+        raise TypeError("requests must be a list")
+    if len(requests) == 0:
+        raise ValueError("requests must be non-empty")
+    seen_elements: set[str] = set()
+    parsed = []
+    for index, request in enumerate(requests):
+        request_where = f"requests[{index}]"
+        if not isinstance(request, dict):
+            raise TypeError(f"{request_where} must be a dict")
+        if tuple(request.keys()) != _LAYER_TREND_SELECT_REQUEST_KEYS:
+            raise ValueError(
+                f"{request_where} must have exactly the keys element, "
+                "top in order"
+            )
+        element = request["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{request_where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{request_where}.element must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate requests element: {element!r}")
+        if element not in elements:
+            raise ValueError(
+                f"{request_where}.element must be one of ranking.elements"
+            )
+        seen_elements.add(element)
+        top = request["top"]
+        if not isinstance(top, int) or isinstance(top, bool):
+            raise TypeError(f"{request_where}.top must be a non-bool int")
+        if top < 1:
+            raise ValueError(f"{request_where}.top must be positive")
+        parsed.append((element, top))
+
+    if not isinstance(min_coverage, (int, float)) or isinstance(
+        min_coverage, bool
+    ):
+        raise TypeError("min_coverage must be a non-bool int or float")
+    if not math.isfinite(min_coverage):
+        raise ValueError("min_coverage must be finite")
+    if min_coverage < 0 or min_coverage > 1:
+        raise ValueError("min_coverage must be between 0 and 1")
+
+    result_data = []
+    for element, top in parsed:
+        selected = [
+            row
+            for row in data
+            if row["element"] == element
+            and row["rank"] is not None
+            and row["rank"] <= top
+            and row["coverage"] >= min_coverage
+        ]
+        n = len(selected)
+        if n == 0:
+            mean = None
+            uncertainty = None
+        else:
+            mean = _round_output(
+                sum(row["difference"] for row in selected) / n
+            )
+            uncertainty = _round_output(
+                math.sqrt(sum(row["uncertainty"] ** 2 for row in selected))
+                / n
+            )
+        result_data.append(
+            {
+                "element": element,
+                "top": top,
+                "count": n,
+                "mean": mean,
+                "uncertainty": uncertainty,
+                "rows": [
+                    {
+                        "scenario": row["scenario"],
+                        "count": row["count"],
+                        "coverage": row["coverage"],
+                        "difference": row["difference"],
+                        "uncertainty": row["uncertainty"],
+                        "rank": row["rank"],
+                    }
+                    for row in selected
+                ],
+            }
+        )
+
+    return {
+        "schema": _LAYER_TREND_SELECT_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "drivers": list(drivers),
+        "data": result_data,
+    }
