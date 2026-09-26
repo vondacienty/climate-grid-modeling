@@ -13984,3 +13984,232 @@ def scale_summary(result, *, min_pairs: int = 1) -> dict:
         "scales": list(scales),
         "data": rows,
     }
+
+
+_SCALE_SUMMARY_OUTPUT_RESULT_KEYS = ("schema", "scales", "data")
+_SCALE_SUMMARY_OUTPUT_ROW_KEYS = (
+    "scenario",
+    "count",
+    "delta",
+    "pair",
+    "peak",
+    "uncertainty",
+)
+_CONVERGE_SCHEMA = "climate-grid/cv1"
+
+
+def _validate_scale_summary(
+    result: Any, *, where: str = "summary"
+) -> tuple[list[str], list]:
+    """Validate a complete :func:`scale_summary` result.
+
+    Returns the scale names and the ``data`` rows.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _SCALE_SUMMARY_OUTPUT_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scales, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _SCALE_SUMMARY_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_SCALE_SUMMARY_SCHEMA!r}")
+
+    scales = _validate_string_list(result["scales"], f"{where}.scales")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    seen_scenarios: set[str] = set()
+    for index, row in enumerate(data):
+        row_where = f"{where}.data[{index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _SCALE_SUMMARY_OUTPUT_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, count, "
+                "delta, pair, peak, uncertainty in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario == "":
+            raise ValueError(f"{row_where}.scenario must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {row_where}.scenario: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{row_where}.count must be non-negative")
+
+        delta = row["delta"]
+        pair = row["pair"]
+        peak = row["peak"]
+        uncertainty = row["uncertainty"]
+        presence = (
+            delta is not None,
+            pair is not None,
+            peak is not None,
+            uncertainty is not None,
+        )
+        if any(presence) and not all(presence):
+            raise ValueError(
+                f"{row_where}: delta, pair, peak and uncertainty must be "
+                "all None or all present"
+            )
+        if delta is None:
+            continue
+
+        _validate_number(delta, f"{row_where}.delta", nullable=False)
+
+        if not isinstance(pair, list):
+            raise TypeError(f"{row_where}.pair must be a list")
+        if len(pair) != 2:
+            raise ValueError(
+                f"{row_where}.pair must have exactly 2 names (left, right)"
+            )
+        for pair_index, name in enumerate(pair):
+            if not isinstance(name, str):
+                raise TypeError(
+                    f"{row_where}.pair[{pair_index}] must be a str"
+                )
+            if name == "":
+                raise ValueError(
+                    f"{row_where}.pair[{pair_index}] must be non-empty"
+                )
+
+        _validate_number(peak, f"{row_where}.peak", nullable=False)
+        if peak < 0:
+            raise ValueError(f"{row_where}.peak must be non-negative")
+        _validate_number(
+            uncertainty, f"{row_where}.uncertainty", nullable=False
+        )
+        if uncertainty < 0:
+            raise ValueError(f"{row_where}.uncertainty must be non-negative")
+
+    return scales, data
+
+
+def converge(summary, *, tolerance=0.1, factor=2, minimum=1) -> dict:
+    """Classify per-scenario scale summaries by convergence interval.
+
+    ``summary`` must be a complete :func:`scale_summary` result (schema
+    ``climate-grid/ss-v1``); it is validated against that contract.
+    ``tolerance`` must be a finite non-bool number ``>= 0``, ``factor`` a
+    finite non-bool number ``> 0`` and ``minimum`` a non-bool positive
+    int.
+
+    For every data row, with ``u`` its ``uncertainty``: when
+    ``count < minimum`` or any of ``delta``, ``pair``, ``peak`` and
+    ``u`` is ``None`` the row's ``interval``, ``state`` and ``rank``
+    are all ``None``.  Otherwise ``lo`` is
+    ``max(peak, abs(delta) - factor * u, 0)``, ``hi`` is
+    ``max(peak, abs(delta) + factor * u)`` and ``interval`` is
+    ``[lo, hi]``; the row is ``stable`` when ``hi <= tolerance``,
+    ``divergent`` when ``lo > tolerance`` and ``uncertain`` otherwise.
+
+    Rows with an interval are ranked ascending by ``(hi, original
+    position)`` with ``rank`` starting at 1 and are emitted first; rows
+    without an interval follow in their original order with
+    ``rank`` ``None``.
+
+    The returned mapping uses the key order ``schema, scales, tolerance,
+    factor, data``; ``schema`` is ``climate-grid/cv1`` and ``scales``
+    echoes the summary's scales.  Each ``data`` row uses the key order
+    ``scenario, count, pair, peak, interval, state, rank`` with the
+    first four taken from the input row.  Every computed output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong summary/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scales, data = _validate_scale_summary(summary)
+
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
+        raise TypeError("tolerance must be a number")
+    if not _is_finite(tolerance):
+        raise ValueError("tolerance must be finite")
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative")
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+        raise TypeError("factor must be a number")
+    if not _is_finite(factor):
+        raise ValueError("factor must be finite")
+    if factor <= 0:
+        raise ValueError("factor must be positive")
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    ranked = []
+    invalid = []
+    for index, row in enumerate(data):
+        count = row["count"]
+        delta = row["delta"]
+        pair = row["pair"]
+        peak = row["peak"]
+        uncertainty = row["uncertainty"]
+
+        if (
+            count < minimum
+            or delta is None
+            or pair is None
+            or peak is None
+            or uncertainty is None
+        ):
+            interval = None
+            state = None
+            hi = None
+        else:
+            lo = _round_output(
+                max(peak, abs(delta) - factor * uncertainty, 0)
+            )
+            hi = _round_output(
+                max(peak, abs(delta) + factor * uncertainty)
+            )
+            interval = [lo, hi]
+            if hi <= tolerance:
+                state = "stable"
+            elif lo > tolerance:
+                state = "divergent"
+            else:
+                state = "uncertain"
+
+        entry = {
+            "scenario": row["scenario"],
+            "count": count,
+            "pair": None if pair is None else list(pair),
+            "peak": peak,
+            "interval": interval,
+            "state": state,
+            "rank": None,
+        }
+        if hi is None:
+            invalid.append(entry)
+        else:
+            ranked.append((hi, index, entry))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    rows = []
+    for rank, (_, _, entry) in enumerate(ranked, start=1):
+        entry["rank"] = rank
+        rows.append(entry)
+    rows.extend(invalid)
+
+    return {
+        "schema": _CONVERGE_SCHEMA,
+        "scales": list(scales),
+        "tolerance": _round_output(tolerance),
+        "factor": _round_output(factor),
+        "data": rows,
+    }
