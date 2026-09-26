@@ -4811,6 +4811,12 @@ def _validate_rank_transitions(result: Any, *, where: str = "result") -> tuple:
             baseline_rank = row["baseline_rank"]
             rank = row["rank"]
             delta = row["delta"]
+            if delta is not None and (
+                not isinstance(delta, int) or isinstance(delta, bool)
+            ):
+                raise TypeError(
+                    f"{row_where}.delta must be a non-bool int or None"
+                )
             if baseline_rank is None or rank is None:
                 if delta is not None:
                     raise ValueError(
@@ -4818,10 +4824,6 @@ def _validate_rank_transitions(result: Any, *, where: str = "result") -> tuple:
                     )
             else:
                 valid_total += 1
-                if not isinstance(delta, int) or isinstance(delta, bool):
-                    raise TypeError(
-                        f"{row_where}.delta must be a non-bool int or None"
-                    )
                 if delta != rank - baseline_rank:
                     raise ValueError(
                         f"{row_where}.delta must equal rank - baseline_rank"
@@ -4957,4 +4959,310 @@ def rank_transition_summary(result) -> dict:
         "scenarios": list(scenarios),
         "data": summary_data,
         "transitions": summary_transitions,
+    }
+
+
+_RANK_COMPARE_SCHEMA = "climate-grid/rank-compare-v1"
+_RANK_TRANSITION_SUMMARY_KEYS = (
+    "schema",
+    "baseline",
+    "configs",
+    "scenarios",
+    "data",
+    "transitions",
+)
+_RANK_TRANSITION_SUMMARY_ROW_KEYS = (
+    "config",
+    "total",
+    "valid",
+    "stable",
+    "stable_rate",
+)
+_RANK_TRANSITION_SUMMARY_GROUP_KEYS = (
+    "config",
+    "baseline_rank",
+    "rank",
+    "count",
+    "rate",
+)
+
+
+def _validate_rank_transition_summary(
+    summary: Any, *, where: str = "summary", minimum: int = 1
+) -> tuple:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _RANK_TRANSITION_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, baseline, configs, "
+            "scenarios, data, transitions in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _RANK_TRANSITION_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_RANK_TRANSITION_SUMMARY_SCHEMA!r}"
+        )
+
+    baseline = summary["baseline"]
+    if not isinstance(baseline, str):
+        raise TypeError(f"{where}.baseline must be a str")
+    if baseline == "":
+        raise ValueError(f"{where}.baseline must be non-empty")
+
+    configs = summary["configs"]
+    if not isinstance(configs, list):
+        raise TypeError(f"{where}.configs must be a list")
+    if len(configs) < minimum:
+        if minimum == 1:
+            raise ValueError(f"{where}.configs must be non-empty")
+        raise ValueError(
+            f"{where}.configs must contain at least {minimum} entries"
+        )
+    seen_configs: set[str] = set()
+    for index, config in enumerate(configs):
+        if not isinstance(config, str):
+            raise TypeError(f"{where}.configs[{index}] must be a str")
+        if config == "":
+            raise ValueError(f"{where}.configs[{index}] must be non-empty")
+        if config in seen_configs:
+            raise ValueError(f"duplicate {where}.configs entry: {config!r}")
+        seen_configs.add(config)
+
+    scenarios = summary["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where}.scenarios[{index}] must be a str")
+        if scenario == "":
+            raise ValueError(f"{where}.scenarios[{index}] must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate {where}.scenarios entry: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(configs):
+        raise ValueError(
+            f"{where}.data must have {len(configs)} rows "
+            "(one per config, in config order)"
+        )
+
+    n_scenarios = len(scenarios)
+    valids: dict[str, int] = {}
+    stable_rates: dict[str, float | None] = {}
+    for index, config in enumerate(configs):
+        row_where = f"{where}.data[{index}]"
+        row = data[index]
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _RANK_TRANSITION_SUMMARY_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys config, total, "
+                "valid, stable, stable_rate in order"
+            )
+
+        if not isinstance(row["config"], str):
+            raise TypeError(f"{row_where}.config must be a str")
+        if row["config"] != config:
+            raise ValueError(
+                f"{row_where}.config must be {config!r} for its config position"
+            )
+
+        for count_name in ("total", "valid", "stable"):
+            count = row[count_name]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(
+                    f"{row_where}.{count_name} must be a non-bool int"
+                )
+            if count < 0:
+                raise ValueError(
+                    f"{row_where}.{count_name} must be non-negative"
+                )
+        if row["total"] != n_scenarios:
+            raise ValueError(
+                f"{row_where}.total must equal the number of scenarios"
+            )
+        if row["valid"] > row["total"]:
+            raise ValueError(f"{row_where}.valid must not exceed total")
+        if row["stable"] > row["valid"]:
+            raise ValueError(f"{row_where}.stable must not exceed valid")
+
+        stable_rate = row["stable_rate"]
+        if row["valid"] == 0:
+            if stable_rate is not None:
+                raise ValueError(
+                    f"{row_where}.stable_rate must be None when valid is zero"
+                )
+        else:
+            _validate_number(
+                stable_rate, f"{row_where}.stable_rate", nullable=False
+            )
+            if stable_rate != _round_output(row["stable"] / row["valid"]):
+                raise ValueError(
+                    f"{row_where}.stable_rate must equal stable / valid"
+                )
+
+        valids[config] = row["valid"]
+        stable_rates[config] = stable_rate
+
+    transitions = summary["transitions"]
+    if not isinstance(transitions, list):
+        raise TypeError(f"{where}.transitions must be a list")
+    config_positions = {config: index for index, config in enumerate(configs)}
+    transition_totals = {config: 0 for config in configs}
+    previous_key: tuple[int, int, int] | None = None
+    for index, group in enumerate(transitions):
+        group_where = f"{where}.transitions[{index}]"
+        if not isinstance(group, dict):
+            raise TypeError(f"{group_where} must be a dict")
+        if tuple(group.keys()) != _RANK_TRANSITION_SUMMARY_GROUP_KEYS:
+            raise ValueError(
+                f"{group_where} must have exactly the keys config, "
+                "baseline_rank, rank, count, rate in order"
+            )
+
+        config = group["config"]
+        if not isinstance(config, str):
+            raise TypeError(f"{group_where}.config must be a str")
+        if config not in config_positions:
+            raise ValueError(
+                f"{group_where}.config must be one of {where}.configs"
+            )
+
+        for field in ("baseline_rank", "rank", "count"):
+            value = group[field]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{group_where}.{field} must be a non-bool int")
+            if value < 1:
+                raise ValueError(f"{group_where}.{field} must be positive")
+
+        key = (config_positions[config], group["baseline_rank"], group["rank"])
+        if previous_key is not None and key <= previous_key:
+            raise ValueError(
+                f"{where}.transitions must be sorted by config then ascending "
+                "(baseline_rank, rank) with no duplicate pairs"
+            )
+        previous_key = key
+
+        valid = valids[config]
+        if valid == 0:
+            raise ValueError(
+                f"{group_where}: transition rows require a positive valid "
+                f"for config {config!r}"
+            )
+        rate = group["rate"]
+        _validate_number(rate, f"{group_where}.rate", nullable=False)
+        if rate != _round_output(group["count"] / valid):
+            raise ValueError(f"{group_where}.rate must equal count / valid")
+
+        transition_totals[config] += group["count"]
+
+    for config in configs:
+        if transition_totals[config] != valids[config]:
+            raise ValueError(
+                f"{where}.transitions counts must sum to each config's valid"
+            )
+
+    return configs, n_scenarios, valids, stable_rates, transitions
+
+
+def compare_rank(summary) -> dict:
+    """Compare per-config rank transition stats against a reference config.
+
+    ``summary`` must be a complete :func:`rank_transition_summary` result
+    (schema ``climate-grid/rank-transition-summary-v1``) with exactly the
+    keys ``schema, baseline, configs, scenarios, data, transitions`` in
+    that order and at least two configs; every member is validated against
+    that contract, including the per-config ``data`` rows (key order
+    ``config, total, valid, stable, stable_rate``; ``total`` equal to the
+    number of scenarios; ``stable_rate`` equal to ``stable / valid`` or
+    ``None`` when ``valid`` is zero) and the ``transitions`` groups (key
+    order ``config, baseline_rank, rank, count, rate``; sorted by config
+    then ascending ``(baseline_rank, rank)``; ``rate`` equal to
+    ``count / valid``; counts summing to each config's ``valid``).  The
+    first configuration is the reference.
+
+    For every configuration (in configuration order), ``valid`` echoes the
+    summary row and ``mean_abs`` is ``Σ(count × |rank − baseline_rank|) /
+    valid`` over the configuration's transition groups; ``normalized`` is
+    ``mean_abs / max(n_scenarios − 1, 1)``.  When ``valid`` is zero,
+    ``mean_abs`` and ``normalized`` are both ``None``.  ``stable_delta``
+    is ``stable_rate − reference.stable_rate`` and ``normalized_delta`` is
+    ``normalized − reference.normalized``; each is ``None`` when either
+    operand is ``None``.
+
+    The returned mapping uses the key order ``schema, reference, data``;
+    ``schema`` is ``climate-grid/rank-compare-v1`` and ``reference`` is
+    the first configuration name.  ``data`` follows the configuration
+    order; each row uses the key order ``config, valid, mean_abs,
+    normalized, stable_delta, normalized_delta``.  ``valid`` is an int and
+    every output float is ``round(x, 12)`` with negative zero normalized
+    to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    configs, n_scenarios, valids, stable_rates, transitions = (
+        _validate_rank_transition_summary(summary, minimum=2)
+    )
+
+    reference = configs[0]
+    mean_abs_by_config: dict[str, float | None] = {}
+    normalized_by_config: dict[str, float | None] = {}
+    for config in configs:
+        valid = valids[config]
+        if valid == 0:
+            mean_abs_by_config[config] = None
+            normalized_by_config[config] = None
+            continue
+        weighted = sum(
+            group["count"] * abs(group["rank"] - group["baseline_rank"])
+            for group in transitions
+            if group["config"] == config
+        )
+        mean_abs = weighted / valid
+        mean_abs_by_config[config] = mean_abs
+        normalized_by_config[config] = mean_abs / max(n_scenarios - 1, 1)
+
+    reference_stable_rate = stable_rates[reference]
+    reference_normalized = normalized_by_config[reference]
+
+    compare_data = []
+    for config in configs:
+        stable_rate = stable_rates[config]
+        normalized = normalized_by_config[config]
+        if stable_rate is None or reference_stable_rate is None:
+            stable_delta = None
+        else:
+            stable_delta = _round_output(stable_rate - reference_stable_rate)
+        if normalized is None or reference_normalized is None:
+            normalized_delta = None
+        else:
+            normalized_delta = _round_output(normalized - reference_normalized)
+        mean_abs = mean_abs_by_config[config]
+        compare_data.append(
+            {
+                "config": config,
+                "valid": valids[config],
+                "mean_abs": None if mean_abs is None else _round_output(mean_abs),
+                "normalized": (
+                    None if normalized is None else _round_output(normalized)
+                ),
+                "stable_delta": stable_delta,
+                "normalized_delta": normalized_delta,
+            }
+        )
+
+    return {
+        "schema": _RANK_COMPARE_SCHEMA,
+        "reference": reference,
+        "data": compare_data,
     }
