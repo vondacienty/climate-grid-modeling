@@ -5269,6 +5269,8 @@ def compare_rank(summary) -> dict:
 
 
 _RANK_ATTRIBUTE_SCHEMA = "climate-grid/ra-v1"
+_RANK_ATTRIBUTE_BATCH_SCHEMA = "climate-grid/ra-batch-v1"
+_RANK_ATTRIBUTE_ITEM_KEYS = ("element", "compare")
 _RANK_COMPARE_KEYS = ("schema", "reference", "data")
 _RANK_COMPARE_ROW_KEYS = (
     "config",
@@ -5344,6 +5346,11 @@ def _validate_rank_compare(
                         f"{row_where}.{name} must be None when valid is zero"
                     )
             else:
+                if value is None:
+                    raise ValueError(
+                        f"{row_where}.{name} must not be None when valid is "
+                        "positive"
+                    )
                 _validate_number(value, f"{row_where}.{name}", nullable=False)
 
         if reference_valid is None:
@@ -5493,5 +5500,111 @@ def rank_attribute(compare, drivers) -> dict:
         "schema": _RANK_ATTRIBUTE_SCHEMA,
         "reference": reference,
         "configs": list(configs),
+        "data": result_data,
+    }
+
+
+def batch_rank_attribute(items, drivers) -> dict:
+    """Attribute per-config rank compare deltas for several elements at once.
+
+    ``items`` must be a non-empty list of mappings, each with exactly the
+    keys ``element, compare`` in that order.  ``element`` is a unique
+    non-empty str and ``compare`` is a complete :func:`compare_rank` result
+    (schema ``climate-grid/rank-compare-v1``); every item's compare is
+    validated exactly as for :func:`rank_attribute` and all items must share
+    the same ``reference`` and the same ``configs`` in the same order.
+    ``drivers`` follows :func:`rank_attribute` exactly: a non-empty dict
+    (insertion order is kept) whose keys are non-empty str and whose values
+    are lists with one item per config, each ``None`` or a finite non-bool
+    number in ``[-1, 1]``; the same drivers are applied to every item.
+
+    Each item is processed with the same logic as :func:`rank_attribute`.
+
+    The returned mapping uses the key order ``schema, reference, configs,
+    elements, drivers, data``; ``schema`` is ``climate-grid/ra-batch-v1``,
+    ``reference`` and ``configs`` are taken from the first item,
+    ``elements`` lists the item element names in item order and
+    ``drivers`` lists the driver mapping's keys in insertion order.
+    ``data`` is a flat list of rows in element-then-driver order; each row
+    uses the key order ``element, driver, count, contribution,
+    uncertainty``.  ``count`` is an int and ``contribution`` and
+    ``uncertainty`` are lists (one slot per config, in configs order) of
+    floats or ``None``, copied from the corresponding
+    :func:`rank_attribute` row.  Every output float is ``round(x, 12)``
+    with negative zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    elements: list[str] = []
+    validated_compares: list = []
+    first_reference: str | None = None
+    first_configs: list[str] | None = None
+    seen_elements: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _RANK_ATTRIBUTE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys element, compare in order"
+            )
+
+        element = item["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{where}.element must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        seen_elements.add(element)
+
+        reference, configs, _compare_data = _validate_rank_compare(
+            item["compare"], where=f"{where}.compare"
+        )
+        if first_reference is None:
+            first_reference = reference
+            first_configs = configs
+        else:
+            if reference != first_reference:
+                raise ValueError(
+                    "all items must have the same reference in the same order"
+                )
+            if configs != first_configs:
+                raise ValueError(
+                    "all items must have the same configs in the same order"
+                )
+
+        elements.append(element)
+        validated_compares.append(item["compare"])
+
+    validated_drivers = _validate_drivers(drivers, len(first_configs))
+    driver_names = [name for name, _values in validated_drivers]
+
+    result_data = []
+    for element, compare in zip(elements, validated_compares):
+        attributed = rank_attribute(compare, drivers)
+        for row in attributed["data"]:
+            result_data.append(
+                {
+                    "element": element,
+                    "driver": row["driver"],
+                    "count": row["count"],
+                    "contribution": row["contribution"],
+                    "uncertainty": row["uncertainty"],
+                }
+            )
+
+    return {
+        "schema": _RANK_ATTRIBUTE_BATCH_SCHEMA,
+        "reference": first_reference,
+        "configs": list(first_configs),
+        "elements": elements,
+        "drivers": driver_names,
         "data": result_data,
     }
