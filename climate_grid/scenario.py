@@ -14599,6 +14599,11 @@ def _validate_converge_matrix(
     """Validate a complete :func:`converge_matrix` result.
 
     Returns the tolerance, the ``layers`` rows and the ``data`` rows.
+    Rows with an ``interval`` must carry the state implied by the
+    interval and the shared tolerance (``stable`` when ``hi`` is at most
+    the tolerance, ``divergent`` when ``lo`` exceeds it, ``uncertain``
+    otherwise) and the ``rank`` values must be the consecutive ranks
+    ``1..n`` by ascending interval ``hi`` with ties in scenario order.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -14664,7 +14669,7 @@ def _validate_converge_matrix(
         raise ValueError(f"{where}.data must be non-empty")
 
     seen_scenarios: set[str] = set()
-    ranks: list[int] = []
+    ranks: list[tuple[float, int, int]] = []
     for index, row in enumerate(data):
         row_where = f"{where}.data[{index}]"
         if not isinstance(row, dict):
@@ -14761,17 +14766,30 @@ def _validate_converge_matrix(
                 f"{row_where}.state must be one of stable, uncertain, "
                 "divergent"
             )
+        if interval[1] <= tolerance:
+            expected_state = "stable"
+        elif interval[0] > tolerance:
+            expected_state = "divergent"
+        else:
+            expected_state = "uncertain"
+        if state != expected_state:
+            raise ValueError(
+                f"{row_where}.state must be {expected_state!r} for the "
+                "given interval and tolerance"
+            )
 
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise TypeError(f"{row_where}.rank must be a non-bool int")
         if rank < 1:
             raise ValueError(f"{row_where}.rank must be positive")
-        ranks.append(rank)
+        ranks.append((interval[1], index, rank))
 
-    if sorted(ranks) != list(range(1, len(ranks) + 1)):
+    ranked = sorted(ranks, key=lambda entry: (entry[0], entry[1]))
+    if [entry[2] for entry in ranked] != list(range(1, len(ranked) + 1)):
         raise ValueError(
-            f"{where}.data ranks must be exactly 1..{len(ranks)} over the "
-            "rows with an interval"
+            f"{where}.data ranks must be the consecutive ranks "
+            f"1..{len(ranked)} by ascending interval hi with ties in "
+            "scenario order"
         )
 
     return tolerance, validated_layers, data
@@ -14909,6 +14927,173 @@ def compare_matrix(items) -> dict:
         "names": list(names[1:]),
         "tolerance": first_tolerance,
         "layers": [dict(layer) for layer in first_layers],
+        "scenarios": list(first_scenarios),
+        "data": rows,
+    }
+
+
+_MATRIX_EVOLUTION_SCHEMA = "climate-grid/cme-v1"
+_MATRIX_EVOLUTION_ITEM_KEYS = ("period", "models")
+
+
+def matrix_evolution(items) -> dict:
+    """Track per-model :func:`converge_matrix` results across periods.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``period, models`` in that order.  ``period`` is a
+    non-empty str that is unique across items and ``models`` is a
+    non-empty mapping of non-empty str model names to complete
+    :func:`converge_matrix` results (schema ``climate-grid/cvm-v1``);
+    every matrix is validated against that contract.  All items must
+    share the same model keys in the same order, taken from the first
+    item, and all matrices must share the same ``tolerance``, the same
+    ``layers`` and the same scenario order, taken from the first item's
+    first model.
+
+    For every adjacent pair of periods (in item order), every model (in
+    the shared model order) and every scenario (in the shared scenario
+    order) the row ``left`` and ``right`` are the earlier and later
+    ``period`` and ``from`` and ``to`` are the earlier and later
+    ``state``.  When both rows have an ``interval``, ``interval`` is
+    ``[later lo − earlier lo, later hi − earlier hi]``; otherwise it is
+    ``None``.  ``rank`` is the later ``rank`` minus the earlier ``rank``
+    when both are present, else ``None``.
+
+    The returned mapping uses the key order ``schema, periods, models,
+    scenarios, data``; ``schema`` is ``climate-grid/cme-v1`` and
+    ``periods``, ``models`` and ``scenarios`` echo the shared orders.
+    ``data`` iterates the adjacent period pairs in order, then the
+    models in order and then the scenarios in order; each row uses the
+    key order ``left, right, model, scenario, from, to, interval,
+    rank``.  ``rank`` is an int and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    periods = []
+    validated: list[dict] = []
+    seen_periods: set[str] = set()
+    first_model_names: list[str] | None = None
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _MATRIX_EVOLUTION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys period, models in "
+                "order"
+            )
+
+        period = item["period"]
+        if not isinstance(period, str):
+            raise TypeError(f"{where}.period must be a str")
+        if period == "":
+            raise ValueError(f"{where}.period must be non-empty")
+        if period in seen_periods:
+            raise ValueError(f"duplicate items period: {period!r}")
+        seen_periods.add(period)
+
+        models = item["models"]
+        if not isinstance(models, dict):
+            raise TypeError(f"{where}.models must be a dict")
+        if len(models) == 0:
+            raise ValueError(f"{where}.models must be non-empty")
+        model_names = list(models.keys())
+        for name in model_names:
+            if not isinstance(name, str):
+                raise TypeError(f"{where}.models keys must be strs")
+            if name == "":
+                raise ValueError(f"{where}.models keys must be non-empty")
+        if first_model_names is None:
+            first_model_names = model_names
+        elif model_names != first_model_names:
+            raise ValueError(
+                "all items must share the same models keys in the same "
+                "order, taken from the first item"
+            )
+
+        lookup_by_model = {}
+        for name in model_names:
+            model_where = f"{where}.models[{name!r}]"
+            tolerance, layers, data = _validate_converge_matrix(
+                models[name], where=model_where
+            )
+            scenarios = [row["scenario"] for row in data]
+            if not validated and name == first_model_names[0]:
+                first_tolerance = tolerance
+                first_layers = layers
+                first_scenarios = scenarios
+            else:
+                if tolerance != first_tolerance:
+                    raise ValueError(
+                        "all models must share the same matrix tolerance, "
+                        "taken from the first item's first model"
+                    )
+                if layers != first_layers:
+                    raise ValueError(
+                        "all models must share the same matrix layers, "
+                        "taken from the first item's first model"
+                    )
+                if scenarios != first_scenarios:
+                    raise ValueError(
+                        "all models must share the same matrix scenario "
+                        "order, taken from the first item's first model"
+                    )
+            lookup_by_model[name] = {row["scenario"]: row for row in data}
+
+        periods.append(period)
+        validated.append(lookup_by_model)
+
+    rows = []
+    for index in range(len(items) - 1):
+        earlier = validated[index]
+        later = validated[index + 1]
+        for name in first_model_names:
+            for scenario in first_scenarios:
+                before = earlier[name][scenario]
+                after = later[name][scenario]
+                if (
+                    before["interval"] is not None
+                    and after["interval"] is not None
+                ):
+                    interval = [
+                        _round_output(
+                            after["interval"][0] - before["interval"][0]
+                        ),
+                        _round_output(
+                            after["interval"][1] - before["interval"][1]
+                        ),
+                    ]
+                else:
+                    interval = None
+                if before["rank"] is not None and after["rank"] is not None:
+                    rank = after["rank"] - before["rank"]
+                else:
+                    rank = None
+                rows.append(
+                    {
+                        "left": periods[index],
+                        "right": periods[index + 1],
+                        "model": name,
+                        "scenario": scenario,
+                        "from": before["state"],
+                        "to": after["state"],
+                        "interval": interval,
+                        "rank": rank,
+                    }
+                )
+
+    return {
+        "schema": _MATRIX_EVOLUTION_SCHEMA,
+        "periods": periods,
+        "models": list(first_model_names),
         "scenarios": list(first_scenarios),
         "data": rows,
     }
