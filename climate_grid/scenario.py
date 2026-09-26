@@ -15764,3 +15764,379 @@ def consensus(summary, *, minimum: int = 2) -> dict:
         "scenarios": list(scenarios),
         "data": rows,
     }
+
+
+_REGION_CONSENSUS_SCHEMA = "climate-grid/rc-v1"
+_REGION_CONSENSUS_ITEM_KEYS = ("window", "region", "result")
+_CONSENSUS_OPTIONAL_KEYS = (
+    "rates",
+    "agree",
+    "entropy",
+    "band",
+    "spread",
+    "mean",
+    "abs",
+    "std",
+)
+
+
+def _validate_consensus_result(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`consensus` result.
+
+    Returns the ``periods``, ``models`` and ``scenarios`` axes and the
+    flat ``data`` row list.  ``data`` must hold one row per scenario in
+    scenario order and every row must follow the ``climate-grid/mc-v1``
+    contract, including the all-``None`` or all-present ``rates, agree,
+    entropy, band, spread, mean, abs, std`` group.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _CONSENSUS_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, periods, models, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _CONSENSUS_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_CONSENSUS_SCHEMA!r}"
+        )
+
+    periods = _validate_string_list(
+        result["periods"], f"{where}.periods", minimum=2
+    )
+    models = _validate_string_list(result["models"], f"{where}.models")
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    for s_index, scenario in enumerate(scenarios):
+        row_where = f"{where}.data[{s_index}]"
+        row = data[s_index]
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _CONSENSUS_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, n, "
+                "moves, rates, agree, entropy, band, spread, mean, abs, "
+                "std in order"
+            )
+
+        if not isinstance(row["scenario"], str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if row["scenario"] != scenario:
+            raise ValueError(
+                f"{row_where}.scenario must be {scenario!r} for its "
+                "position"
+            )
+        if not isinstance(row["n"], int) or isinstance(row["n"], bool):
+            raise TypeError(f"{row_where}.n must be a non-bool int")
+        if not 0 <= row["n"] <= len(models):
+            raise ValueError(
+                f"{row_where}.n must be between 0 and {len(models)}"
+            )
+
+        moves = row["moves"]
+        if not isinstance(moves, list):
+            raise TypeError(f"{row_where}.moves must be a list")
+        if len(moves) != 9:
+            raise ValueError(
+                f"{row_where}.moves must have exactly 9 counts"
+            )
+        for m_index, m_count in enumerate(moves):
+            if not isinstance(m_count, int) or isinstance(m_count, bool):
+                raise TypeError(
+                    f"{row_where}.moves[{m_index}] must be a non-bool int"
+                )
+            if m_count < 0:
+                raise ValueError(
+                    f"{row_where}.moves[{m_index}] must be non-negative"
+                )
+
+        presence = [
+            row[name] is not None for name in _CONSENSUS_OPTIONAL_KEYS
+        ]
+        if not all(presence) and any(presence):
+            raise ValueError(
+                f"{row_where}: rates, agree, entropy, band, spread, "
+                "mean, abs and std must be all None or all present"
+            )
+        if not any(presence):
+            continue
+
+        rates = row["rates"]
+        if not isinstance(rates, list):
+            raise TypeError(f"{row_where}.rates must be a list")
+        if len(rates) != 9:
+            raise ValueError(
+                f"{row_where}.rates must have exactly 9 rates"
+            )
+        for r_index, rate in enumerate(rates):
+            _validate_number(
+                rate, f"{row_where}.rates[{r_index}]", nullable=False
+            )
+            if not 0 <= rate <= 1:
+                raise ValueError(
+                    f"{row_where}.rates[{r_index}] must be between 0 and 1"
+                )
+        if sum(moves) <= 0:
+            raise ValueError(
+                f"{row_where}.moves must have a positive total when "
+                "rates is present"
+            )
+        if row["n"] < 1:
+            raise ValueError(
+                f"{row_where}.n must be positive when rates is present"
+            )
+
+        _validate_number(
+            row["agree"], f"{row_where}.agree", nullable=False
+        )
+        if not 0 <= row["agree"] <= 1:
+            raise ValueError(
+                f"{row_where}.agree must be between 0 and 1"
+            )
+        _validate_number(
+            row["entropy"], f"{row_where}.entropy", nullable=False
+        )
+        if row["entropy"] < 0:
+            raise ValueError(
+                f"{row_where}.entropy must be non-negative"
+            )
+
+        band = row["band"]
+        if not isinstance(band, list):
+            raise TypeError(f"{row_where}.band must be a list")
+        if len(band) != 2:
+            raise ValueError(
+                f"{row_where}.band must have exactly 2 bounds"
+            )
+        for bound_index, bound in enumerate(band):
+            _validate_number(
+                bound,
+                f"{row_where}.band[{bound_index}]",
+                nullable=False,
+            )
+
+        _validate_number(
+            row["spread"], f"{row_where}.spread", nullable=False
+        )
+        if row["spread"] < 0:
+            raise ValueError(
+                f"{row_where}.spread must be non-negative"
+            )
+        _validate_number(
+            row["mean"], f"{row_where}.mean", nullable=False
+        )
+        _validate_number(
+            row["abs"], f"{row_where}.abs", nullable=False
+        )
+        if row["abs"] < 0:
+            raise ValueError(f"{row_where}.abs must be non-negative")
+        _validate_number(
+            row["std"], f"{row_where}.std", nullable=False
+        )
+        if row["std"] < 0:
+            raise ValueError(f"{row_where}.std must be non-negative")
+
+    return periods, models, scenarios, data
+
+
+def region_consensus(items, *, minimum: int = 1) -> dict:
+    """Aggregate per-region/per-scenario consensus across windows.
+
+    ``items`` must be a non-empty list of mappings, each with exactly
+    the keys ``window, region, result`` in that order.  ``window`` and
+    ``region`` are non-empty str and every ``(window, region)`` pair
+    must be unique.  ``result`` is a complete :func:`consensus` result
+    (schema ``climate-grid/mc-v1``) with exactly the keys
+    ``schema, periods, models, scenarios, data`` in that order; every
+    member is validated against that contract, including the flat
+    per-scenario ``data`` row order, each row's key order
+    ``scenario, n, moves, rates, agree, entropy, band, spread, mean,
+    abs, std`` and the all-``None`` or all-present optional group.
+    Every result must share the same ``models`` and ``scenarios`` in
+    the same order; both are taken from the first item.  ``minimum``
+    must be a non-bool positive int.
+
+    For each region (in first-appearance order) and scenario (in
+    scenario order) the consensus data rows whose ``rates`` is not
+    ``None`` are collected across the region's items in item order:
+    ``count`` is the number of collected rows ``c`` and ``moves`` is
+    the column-wise sum of their nine ``moves`` entries.  When ``c``
+    is below ``minimum``, ``stats`` is ``[None, None, None]``;
+    otherwise ``p`` is each ``moves`` entry divided by the total moves
+    and ``stats`` are the migration entropy
+    ``-sum([p > 0] p * log2(p))``, the interval dispersion
+    ``sqrt(sum(spread ** 2) / c)`` and the ranking standard deviation
+    ``sqrt(sum(std ** 2 + (mean - sum(mean) / c) ** 2) / c)`` in that
+    order.
+
+    The returned mapping uses the key order ``schema, scenarios,
+    windows, regions, data``; ``schema`` is ``climate-grid/rc-v1``,
+    ``scenarios`` echoes the first item's scenario axis and ``windows``
+    and ``regions`` list the item values in first-appearance order.
+    ``data`` is a flat list in region-then-scenario order; each row
+    uses the key order ``region, scenario, count, moves, stats``.
+    ``count`` and the ``moves`` entries are ints and every output float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    windows: list[str] = []
+    regions: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    validated: list[tuple[str, dict]] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _REGION_CONSENSUS_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys window, region, "
+                "result in order"
+            )
+
+        window = item["window"]
+        region = item["region"]
+        if not isinstance(window, str):
+            raise TypeError(f"{where}.window must be a str")
+        if window == "":
+            raise ValueError(f"{where}.window must be non-empty")
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{where}.region must be non-empty")
+        if (window, region) in seen_pairs:
+            raise ValueError(
+                f"duplicate window/region pair: {(window, region)!r}"
+            )
+        seen_pairs.add((window, region))
+
+        _periods, models, scenarios, result_rows = (
+            _validate_consensus_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated:
+            first_models = models
+            first_scenarios = scenarios
+        else:
+            if models != first_models:
+                raise ValueError(
+                    "all results must share the same models in the same "
+                    "order, taken from the first item"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all results must share the same scenarios in the same "
+                    "order, taken from the first item"
+                )
+
+        if window not in windows:
+            windows.append(window)
+        if region not in regions:
+            regions.append(region)
+        validated.append((region, result_rows))
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    rows = []
+    for region in regions:
+        for s_index, scenario in enumerate(first_scenarios):
+            collected = []
+            for item_region, result_rows in validated:
+                if item_region != region:
+                    continue
+                row = result_rows[s_index]
+                if row["rates"] is not None:
+                    collected.append(row)
+
+            count = len(collected)
+            moves = [
+                sum(row["moves"][m_index] for row in collected)
+                for m_index in range(9)
+            ]
+            if count < minimum:
+                stats = [None, None, None]
+            else:
+                try:
+                    total_moves = sum(moves)
+                    probabilities = [
+                        move / total_moves for move in moves
+                    ]
+                    entropy_value = -sum(
+                        p * math.log2(p) for p in probabilities if p > 0
+                    )
+                    dispersion_value = math.sqrt(
+                        sum(row["spread"] ** 2 for row in collected) / count
+                    )
+                    rank_mean_overall = (
+                        sum(row["mean"] for row in collected) / count
+                    )
+                    rank_std_value = math.sqrt(
+                        sum(
+                            row["std"] ** 2
+                            + (row["mean"] - rank_mean_overall) ** 2
+                            for row in collected
+                        )
+                        / count
+                    )
+                except OverflowError:
+                    raise ValueError(
+                        f"data[{region!r}][{scenario!r}] results must be "
+                        "finite"
+                    ) from None
+                computed = [
+                    entropy_value,
+                    dispersion_value,
+                    rank_std_value,
+                ]
+                if not all(_is_finite(value) for value in computed):
+                    raise ValueError(
+                        f"data[{region!r}][{scenario!r}] results must be "
+                        "finite"
+                    )
+                stats = [_round_output(value) for value in computed]
+
+            rows.append(
+                {
+                    "region": region,
+                    "scenario": scenario,
+                    "count": count,
+                    "moves": moves,
+                    "stats": stats,
+                }
+            )
+
+    return {
+        "schema": _REGION_CONSENSUS_SCHEMA,
+        "scenarios": list(first_scenarios),
+        "windows": windows,
+        "regions": regions,
+        "data": rows,
+    }
