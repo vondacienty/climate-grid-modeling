@@ -7989,3 +7989,252 @@ def compare_trends(trend) -> dict:
         "drivers": list(drivers),
         "data": result_data,
     }
+
+
+_LAYER_TREND_COMPARE_SUMMARY_SCHEMA = "climate-grid/ltc-summary-v1"
+_LAYER_TREND_COMPARE_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "scenarios",
+    "elements",
+    "drivers",
+    "data",
+)
+_LAYER_TREND_COMPARE_ROW_KEYS = (
+    "scenario",
+    "element",
+    "driver",
+    "count",
+    "difference",
+    "uncertainty",
+)
+
+
+def _validate_layer_trend_compare(
+    comparison: Any, *, where: str = "comparison"
+) -> tuple[list, str, list[str], list[str], list[str], list]:
+    if not isinstance(comparison, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(comparison.keys()) != _LAYER_TREND_COMPARE_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "scenarios, elements, drivers, data in order"
+        )
+
+    schema = comparison["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _LAYER_TREND_COMPARE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_LAYER_TREND_COMPARE_SCHEMA!r}"
+        )
+
+    years = comparison["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = comparison["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        comparison["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        comparison["elements"], f"{where}.elements"
+    )
+    drivers = _validate_string_list(
+        comparison["drivers"], f"{where}.drivers"
+    )
+    if reference in scenarios:
+        raise ValueError(
+            f"{where}.reference must not appear in {where}.scenarios"
+        )
+
+    data = comparison["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(scenarios) * len(elements) * len(drivers)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/element/driver combination, in "
+            "scenario-then-element-then-driver order)"
+        )
+
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for driver in drivers:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _LAYER_TREND_COMPARE_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, driver, count, difference, uncertainty "
+                        "in order"
+                    )
+
+                row_scenario = row["scenario"]
+                if not isinstance(row_scenario, str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row_scenario != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+                row_driver = row["driver"]
+                if not isinstance(row_driver, str):
+                    raise TypeError(f"{row_where}.driver must be a str")
+                if row_driver != driver:
+                    raise ValueError(
+                        f"{row_where}.driver must be {driver!r} for its "
+                        "scenario-then-element-then-driver position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{row_where}.count must be a non-bool int")
+                if count < 0:
+                    raise ValueError(f"{row_where}.count must be non-negative")
+
+                difference = row["difference"]
+                uncertainty = row["uncertainty"]
+                _validate_number(
+                    difference, f"{row_where}.difference", nullable=True
+                )
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                if (difference is None) != (uncertainty is None):
+                    raise ValueError(
+                        f"{row_where}: difference and uncertainty must be "
+                        "both None or both present"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                row_index += 1
+
+    return years, reference, scenarios, elements, drivers, data
+
+
+def trend_difference_summary(comparison, *, min_drivers: int = 1) -> dict:
+    """Summarize trend differences per scenario and element.
+
+    ``comparison`` must be a complete :func:`compare_trends` result (schema
+    ``climate-grid/ltc-v1``) with exactly the keys ``schema, years,
+    reference, scenarios, elements, drivers, data`` in that order; every
+    member is validated against that contract, including the non-empty
+    strictly increasing non-bool int ``years``, the non-empty str
+    ``reference`` (absent from ``scenarios``), the flat
+    scenario-then-element-then-driver ``data`` row order, each row's key
+    order ``scenario, element, driver, count, difference, uncertainty``
+    and the row invariants (``count`` a non-bool non-negative int;
+    ``difference`` and ``uncertainty`` both ``None`` or both finite
+    numbers, with ``uncertainty`` non-negative).  ``min_drivers`` must be
+    a non-bool positive int.
+
+    For every scenario (in scenario order) and element (in element
+    order), the non-``None`` ``(difference, uncertainty)`` pairs of its
+    driver rows are collected; ``count`` (``n``) is the number of valid
+    drivers.  When ``n < min_drivers``, ``mean``, ``min``, ``max`` and
+    ``uncertainty`` are all ``None``; otherwise they are ``sum(d) / n``,
+    ``min(d)``, ``max(d)`` and ``sqrt(sum(u ** 2)) / n`` respectively.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    scenarios, elements, drivers, data``; ``schema`` is
+    ``climate-grid/ltc-summary-v1`` and the metadata members echo the
+    comparison input in its original order.  ``data`` is flattened in
+    scenario-then-element order; each row uses the key order
+    ``scenario, element, count, mean, min, max, uncertainty``.  ``count``
+    is an int and every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    years, reference, scenarios, elements, drivers, data = (
+        _validate_layer_trend_compare(comparison)
+    )
+
+    if not isinstance(min_drivers, int) or isinstance(min_drivers, bool):
+        raise TypeError("min_drivers must be a non-bool int")
+    if min_drivers < 1:
+        raise ValueError("min_drivers must be positive")
+
+    n_elements = len(elements)
+    n_drivers = len(drivers)
+
+    result_data = []
+    for s_index, scenario in enumerate(scenarios):
+        for e_index, element in enumerate(elements):
+            base = (s_index * n_elements + e_index) * n_drivers
+            pairs = [
+                (
+                    data[base + d_index]["difference"],
+                    data[base + d_index]["uncertainty"],
+                )
+                for d_index in range(n_drivers)
+                if data[base + d_index]["difference"] is not None
+            ]
+            count = len(pairs)
+
+            if count < min_drivers:
+                mean = None
+                minimum = None
+                maximum = None
+                uncertainty = None
+            else:
+                differences = [difference for difference, _u in pairs]
+                mean = _round_output(sum(differences) / count)
+                minimum = _round_output(min(differences))
+                maximum = _round_output(max(differences))
+                uncertainty = _round_output(
+                    math.sqrt(sum(u * u for _d, u in pairs)) / count
+                )
+
+            result_data.append(
+                {
+                    "scenario": scenario,
+                    "element": element,
+                    "count": count,
+                    "mean": mean,
+                    "min": minimum,
+                    "max": maximum,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _LAYER_TREND_COMPARE_SUMMARY_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "drivers": list(drivers),
+        "data": result_data,
+    }
