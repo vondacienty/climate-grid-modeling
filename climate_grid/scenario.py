@@ -10383,7 +10383,7 @@ def summarize_region_comparison(
     ``count`` ``n`` with ``mean``, ``min``, ``max`` and
     ``uncertainty`` all ``None``.  Otherwise they are the mean of the
     differences ``sum(d) / n``, ``min(d)``, ``max(d)`` and the combined
-    uncertainty ``sqrt(sum(u ** 2)) / n``.
+    uncertainty ``hypot(*u) / n``.
 
     The returned mapping uses the same key order as ``comparison``:
     ``schema, years, reference, baseline, scenarios, elements, windows,
@@ -10452,7 +10452,7 @@ def summarize_region_comparison(
                     minimum = _round_output(min(differences))
                     maximum = _round_output(max(differences))
                     combined = _round_output(
-                        math.sqrt(sum(u ** 2 for u in uncertainties)) / count
+                        math.hypot(*uncertainties) / count
                     )
 
                 result_data.append(
@@ -10470,6 +10470,351 @@ def summarize_region_comparison(
 
     return {
         "schema": _REGION_REPORT_SUMMARY_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "baseline": baseline,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
+        "data": result_data,
+    }
+
+
+_REGION_REPORT_AGGREGATE_SCHEMA = "climate-grid/rr-aggregate-v1"
+_REGION_REPORT_SUMMARY_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "baseline",
+    "scenarios",
+    "elements",
+    "windows",
+    "regions",
+    "data",
+)
+_REGION_REPORT_SUMMARY_ROW_KEYS = (
+    "window",
+    "region",
+    "element",
+    "count",
+    "mean",
+    "min",
+    "max",
+    "uncertainty",
+)
+
+
+def _validate_region_summary(
+    summary: Any, *, where: str = "summary"
+) -> tuple[list, str, str, list[str], list[str], list, list[str], list]:
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _REGION_REPORT_SUMMARY_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "baseline, scenarios, elements, windows, regions, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_REPORT_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_REPORT_SUMMARY_SCHEMA!r}"
+        )
+
+    years = summary["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = summary["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    baseline = summary["baseline"]
+    if not isinstance(baseline, str):
+        raise TypeError(f"{where}.baseline must be a str")
+    if baseline == "":
+        raise ValueError(f"{where}.baseline must be non-empty")
+
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios"
+    )
+    if baseline in scenarios:
+        raise ValueError(
+            f"{where}.baseline must not appear in {where}.scenarios"
+        )
+    elements = _validate_string_list(
+        summary["elements"], f"{where}.elements"
+    )
+
+    windows = summary["windows"]
+    if not isinstance(windows, list):
+        raise TypeError(f"{where}.windows must be a list")
+    if len(windows) == 0:
+        raise ValueError(f"{where}.windows must be non-empty")
+    seen_windows: set[str] = set()
+    for index, window in enumerate(windows):
+        window_where = f"{where}.windows[{index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{window_where} must be a dict")
+        if list(window.keys()) != ["name", "start", "end"]:
+            raise ValueError(
+                f"{window_where} must have exactly the keys name, start, "
+                "end in order"
+            )
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{window_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{window_where}.name must be non-empty")
+        if name in seen_windows:
+            raise ValueError(f"duplicate {where}.windows name: {name!r}")
+        seen_windows.add(name)
+        start_day = _parse_date(window["start"], f"{window_where}.start")
+        end_day = _parse_date(window["end"], f"{window_where}.end")
+        if start_day > end_day:
+            raise ValueError(
+                f"{window_where}.start must be on or before "
+                f"{window_where}.end"
+            )
+
+    regions = _validate_string_list(summary["regions"], f"{where}.regions")
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_scenarios = len(scenarios)
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+    expected_rows = n_windows * n_regions * n_elements
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "window/region/element combination, in window-then-region-then-"
+            "element order)"
+        )
+
+    row_index = 0
+    for w_index, window in enumerate(windows):
+        for r_index, region in enumerate(regions):
+            for e_index, element in enumerate(elements):
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _REGION_REPORT_SUMMARY_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys window, "
+                        "region, element, count, mean, min, max, uncertainty "
+                        "in order"
+                    )
+
+                row_window = row["window"]
+                if not isinstance(row_window, str):
+                    raise TypeError(f"{row_where}.window must be a str")
+                if row_window != window["name"]:
+                    raise ValueError(
+                        f"{row_where}.window must be {window['name']!r} for "
+                        "its window-then-region-then-element position"
+                    )
+                row_region = row["region"]
+                if not isinstance(row_region, str):
+                    raise TypeError(f"{row_where}.region must be a str")
+                if row_region != region:
+                    raise ValueError(
+                        f"{row_where}.region must be {region!r} for its "
+                        "window-then-region-then-element position"
+                    )
+                row_element = row["element"]
+                if not isinstance(row_element, str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row_element != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "window-then-region-then-element position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"{row_where}.count must be a non-bool int")
+                if count < 0 or count > n_scenarios:
+                    raise ValueError(
+                        f"{row_where}.count must be between 0 and the number "
+                        f"of scenarios ({n_scenarios})"
+                    )
+
+                mean = row["mean"]
+                minimum = row["min"]
+                maximum = row["max"]
+                uncertainty = row["uncertainty"]
+                _validate_number(mean, f"{row_where}.mean", nullable=True)
+                _validate_number(minimum, f"{row_where}.min", nullable=True)
+                _validate_number(maximum, f"{row_where}.max", nullable=True)
+                _validate_number(
+                    uncertainty, f"{row_where}.uncertainty", nullable=True
+                )
+                stats_present = (
+                    mean is not None,
+                    minimum is not None,
+                    maximum is not None,
+                    uncertainty is not None,
+                )
+                if not (all(stats_present) or not any(stats_present)):
+                    raise ValueError(
+                        f"{row_where}: mean, min, max and uncertainty must "
+                        "be all None or all present"
+                    )
+                if any(stats_present) and count == 0:
+                    raise ValueError(
+                        f"{row_where}.count must be positive when mean, min, "
+                        "max and uncertainty are present"
+                    )
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                row_index += 1
+
+    return years, reference, baseline, scenarios, elements, windows, regions, data
+
+
+def aggregate_region_summary(
+    summary, *, min_windows: int = 1
+) -> dict:
+    """Aggregate a :func:`summarize_region_comparison` result across windows.
+
+    ``summary`` must be a complete :func:`summarize_region_comparison`
+    result (schema ``climate-grid/rr-summary-v1``) with exactly the keys
+    ``schema, years, reference, baseline, scenarios, elements, windows,
+    regions, data`` in that order; every member is validated against that
+    contract, including the flat ``data`` rows (key order ``window,
+    region, element, count, mean, min, max, uncertainty``) and their
+    invariants.
+
+    ``min_windows`` must be a non-bool positive ``int``; a wrong type
+    raises ``TypeError`` and a non-positive value raises ``ValueError``.
+
+    For each region (in region order) and element (in element order),
+    the window rows for that combination are scanned in window order,
+    collecting those whose ``mean``, ``min``, ``max`` and
+    ``uncertainty`` are all non-``None``; let ``k`` be their count and
+    ``N`` the sum of their per-row ``count`` values.  When
+    ``k < min_windows`` the row reports ``window_count`` ``k`` and
+    ``count`` ``N`` with ``mean``, ``min``, ``max`` and ``uncertainty``
+    all ``None``.  Otherwise, writing ``a = count / N`` for each
+    collected row, the row reports ``mean`` ``sum(a * mean)``, ``min``
+    and ``max`` as the extrema across the collected rows, and
+    ``uncertainty`` ``hypot(a * uncertainty, ...)``.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    baseline, scenarios, elements, windows, regions, data``; ``schema``
+    is ``climate-grid/rr-aggregate-v1`` and the other metadata members
+    echo the input in their original order.  ``data`` is a nested
+    mapping keyed by region then element (in region/element order); each
+    row uses the key order ``region, element, window_count, count, mean,
+    min, max, uncertainty``.  ``window_count`` and ``count`` are
+    ``int`` values (``k`` and ``N``) and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item types and
+    ``ValueError`` for any other contract violation.
+    """
+    (
+        years,
+        reference,
+        baseline,
+        scenarios,
+        elements,
+        windows,
+        regions,
+        data,
+    ) = _validate_region_summary(summary)
+
+    if not isinstance(min_windows, int) or isinstance(min_windows, bool):
+        raise TypeError("min_windows must be a non-bool int")
+    if min_windows < 1:
+        raise ValueError("min_windows must be positive")
+
+    n_windows = len(windows)
+    n_regions = len(regions)
+    n_elements = len(elements)
+
+    def _row(w_index: int, r_index: int, e_index: int) -> dict:
+        return data[(w_index * n_regions + r_index) * n_elements + e_index]
+
+    result_data = {}
+    for r_index, region in enumerate(regions):
+        result_data[region] = {}
+        for e_index, element in enumerate(elements):
+            window_rows = []
+            for w_index in range(n_windows):
+                row = _row(w_index, r_index, e_index)
+                if (
+                    row["mean"] is not None
+                    and row["min"] is not None
+                    and row["max"] is not None
+                    and row["uncertainty"] is not None
+                ):
+                    window_rows.append(row)
+
+            window_count = len(window_rows)
+            total_count = sum(row["count"] for row in window_rows)
+            if window_count < min_windows:
+                mean = None
+                minimum = None
+                maximum = None
+                combined = None
+            else:
+                weights = [row["count"] / total_count for row in window_rows]
+                mean = _round_output(
+                    sum(
+                        weight * row["mean"]
+                        for weight, row in zip(weights, window_rows)
+                    )
+                )
+                minimum = _round_output(
+                    min(row["min"] for row in window_rows)
+                )
+                maximum = _round_output(
+                    max(row["max"] for row in window_rows)
+                )
+                combined = _round_output(
+                    math.hypot(
+                        *(
+                            weight * row["uncertainty"]
+                            for weight, row in zip(weights, window_rows)
+                        )
+                    )
+                )
+
+            result_data[region][element] = {
+                "region": region,
+                "element": element,
+                "window_count": window_count,
+                "count": total_count,
+                "mean": mean,
+                "min": minimum,
+                "max": maximum,
+                "uncertainty": combined,
+            }
+
+    return {
+        "schema": _REGION_REPORT_AGGREGATE_SCHEMA,
         "years": list(years),
         "reference": reference,
         "baseline": baseline,
