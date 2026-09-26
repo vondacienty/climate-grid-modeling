@@ -12125,3 +12125,393 @@ def rank_region_intervals(items) -> dict:
         ],
         "data": result_rows,
     }
+
+
+_REGION_INTERVAL_RANK_STABILITY_SCHEMA = "climate-grid/rrs-v1"
+_REGION_INTERVAL_RANK_STABILITY_ROW_KEYS = (
+    "scenario",
+    "total",
+    "valid",
+    "missing_rate",
+    "mean",
+    "best",
+    "worst",
+    "stddev",
+)
+
+
+def _validate_region_intervals_rank(
+    ranking: Any, *, where: str = "ranking"
+) -> tuple[list[str], list[str], list, list, dict]:
+    if not isinstance(ranking, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(ranking.keys()) != _REGION_REPORT_INTERVAL_RANK_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scenarios, "
+            "elements, windows, regions, factors, pairs, data in order"
+        )
+
+    schema = ranking["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_REPORT_INTERVAL_RANK_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_REPORT_INTERVAL_RANK_SCHEMA!r}"
+        )
+
+    scenarios = _validate_string_list(
+        ranking["scenarios"], f"{where}.scenarios", minimum=2
+    )
+    elements = _validate_string_list(
+        ranking["elements"], f"{where}.elements"
+    )
+
+    windows = ranking["windows"]
+    if not isinstance(windows, list):
+        raise TypeError(f"{where}.windows must be a list")
+    if len(windows) == 0:
+        raise ValueError(f"{where}.windows must be non-empty")
+    seen_windows: set[str] = set()
+    for index, window in enumerate(windows):
+        window_where = f"{where}.windows[{index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{window_where} must be a dict")
+        if list(window.keys()) != ["name", "start", "end"]:
+            raise ValueError(
+                f"{window_where} must have exactly the keys name, start, "
+                "end in order"
+            )
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{window_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{window_where}.name must be non-empty")
+        if name in seen_windows:
+            raise ValueError(f"duplicate {where}.windows name: {name!r}")
+        seen_windows.add(name)
+        start_day = _parse_date(window["start"], f"{window_where}.start")
+        end_day = _parse_date(window["end"], f"{window_where}.end")
+        if start_day > end_day:
+            raise ValueError(
+                f"{window_where}.start must be on or before "
+                f"{window_where}.end"
+            )
+
+    regions = _validate_string_list(ranking["regions"], f"{where}.regions")
+
+    factors = ranking["factors"]
+    if not isinstance(factors, list):
+        raise TypeError(f"{where}.factors must be a list")
+    if len(factors) == 0:
+        raise ValueError(f"{where}.factors must be non-empty")
+    for index, factor in enumerate(factors):
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+            raise TypeError(
+                f"{where}.factors[{index}] must be a finite non-bool int "
+                "or float"
+            )
+        if not _is_finite(factor):
+            raise ValueError(f"{where}.factors[{index}] must be finite")
+        if factor <= 0:
+            raise ValueError(f"{where}.factors[{index}] must be positive")
+    for index in range(1, len(factors)):
+        if factors[index] <= factors[index - 1]:
+            raise ValueError(f"{where}.factors must be strictly increasing")
+
+    pairs = ranking["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError(f"{where}.pairs must be a list")
+    if len(pairs) == 0:
+        raise ValueError(f"{where}.pairs must be non-empty")
+    seen_pairs: set[str] = set()
+    for index, pair in enumerate(pairs):
+        pair_where = f"{where}.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if list(pair.keys()) != ["name", "left", "right"]:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys name, left, "
+                "right in order"
+            )
+        pair_name = pair["name"]
+        left = pair["left"]
+        right = pair["right"]
+        for key, value in (
+            ("name", pair_name),
+            ("left", left),
+            ("right", right),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{pair_where}.{key} must be a str")
+            if value == "":
+                raise ValueError(f"{pair_where}.{key} must be non-empty")
+        if pair_name in seen_pairs:
+            raise ValueError(f"duplicate {where}.pairs name: {pair_name!r}")
+        seen_pairs.add(pair_name)
+        for key, value in (("left", left), ("right", right)):
+            if value not in regions:
+                raise ValueError(
+                    f"{pair_where}.{key} must be a name in {where}.regions"
+                )
+        if left == right:
+            raise ValueError(
+                f"{pair_where}.left and {pair_where}.right must be "
+                "different regions"
+            )
+
+    data = ranking["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_scenarios = len(scenarios)
+    expected_rows = (
+        len(pairs) * len(elements) * len(factors) * n_scenarios
+    )
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "pair/element/factor/scenario combination, in pair-then-"
+            "element-then-factor-then-rank order)"
+        )
+
+    rows: dict[tuple[int, int, int], list] = {}
+    row_index = 0
+    for p_index, pair in enumerate(pairs):
+        for e_index, element in enumerate(elements):
+            for f_index, factor in enumerate(factors):
+                group = []
+                seen_group_scenarios: set[str] = set()
+                valid_count = 0
+                saw_missing = False
+                previous_center: float | None = None
+                for _position in range(n_scenarios):
+                    row_where = f"{where}.data[{row_index}]"
+                    row = data[row_index]
+                    if not isinstance(row, dict):
+                        raise TypeError(f"{row_where} must be a dict")
+                    if tuple(row.keys()) != _REGION_REPORT_INTERVAL_RANK_ROW_KEYS:
+                        raise ValueError(
+                            f"{row_where} must have exactly the keys pair, "
+                            "left, right, element, factor, scenario, "
+                            "center_delta, lower_delta, upper_delta, "
+                            "overlap, rank in order"
+                        )
+
+                    for key, expected in (
+                        ("pair", pair["name"]),
+                        ("left", pair["left"]),
+                        ("right", pair["right"]),
+                        ("element", element),
+                    ):
+                        value = row[key]
+                        if not isinstance(value, str):
+                            raise TypeError(f"{row_where}.{key} must be a str")
+                        if value != expected:
+                            raise ValueError(
+                                f"{row_where}.{key} must be {expected!r} for "
+                                "its pair-then-element-then-factor position"
+                            )
+
+                    row_factor = row["factor"]
+                    if (
+                        not isinstance(row_factor, (int, float))
+                        or isinstance(row_factor, bool)
+                    ):
+                        raise TypeError(
+                            f"{row_where}.factor must be a non-bool number"
+                        )
+                    if row_factor != factor:
+                        raise ValueError(
+                            f"{row_where}.factor must be {factor!r} for its "
+                            "pair-then-element-then-factor position"
+                        )
+
+                    scenario = row["scenario"]
+                    if not isinstance(scenario, str):
+                        raise TypeError(f"{row_where}.scenario must be a str")
+                    if scenario not in scenarios:
+                        raise ValueError(
+                            f"{row_where}.scenario must be a name in "
+                            f"{where}.scenarios"
+                        )
+                    if scenario in seen_group_scenarios:
+                        raise ValueError(
+                            f"{row_where}.scenario duplicates {scenario!r} "
+                            "within its pair/element/factor group"
+                        )
+                    seen_group_scenarios.add(scenario)
+
+                    center_delta = row["center_delta"]
+                    lower_delta = row["lower_delta"]
+                    upper_delta = row["upper_delta"]
+                    overlap = row["overlap"]
+                    _validate_number(
+                        center_delta, f"{row_where}.center_delta", nullable=True
+                    )
+                    _validate_number(
+                        lower_delta, f"{row_where}.lower_delta", nullable=True
+                    )
+                    _validate_number(
+                        upper_delta, f"{row_where}.upper_delta", nullable=True
+                    )
+                    if overlap is not None and not isinstance(overlap, bool):
+                        raise TypeError(
+                            f"{row_where}.overlap must be a bool or None"
+                        )
+
+                    results_present = (
+                        center_delta is not None,
+                        lower_delta is not None,
+                        upper_delta is not None,
+                        overlap is not None,
+                    )
+                    if not (all(results_present) or not any(results_present)):
+                        raise ValueError(
+                            f"{row_where}: center_delta, lower_delta, "
+                            "upper_delta and overlap must be all None or all "
+                            "present"
+                        )
+
+                    rank = row["rank"]
+                    if rank is not None:
+                        if not isinstance(rank, int) or isinstance(rank, bool):
+                            raise TypeError(
+                                f"{row_where}.rank must be a non-bool int "
+                                "or None"
+                            )
+                        if rank < 1:
+                            raise ValueError(
+                                f"{row_where}.rank must be positive"
+                            )
+                    if (rank is None) != (center_delta is None):
+                        raise ValueError(
+                            f"{row_where}.rank must be None exactly when "
+                            "center_delta, lower_delta, upper_delta and "
+                            "overlap are None"
+                        )
+
+                    if rank is None:
+                        saw_missing = True
+                    else:
+                        if saw_missing:
+                            raise ValueError(
+                                f"{row_where}: ranked rows must precede "
+                                "rows with rank None within their "
+                                "pair/element/factor group"
+                            )
+                        valid_count += 1
+                        if rank != valid_count:
+                            raise ValueError(
+                                f"{row_where}.rank must run consecutively "
+                                "from 1 in rank order within its "
+                                "pair/element/factor group"
+                            )
+                        if (
+                            previous_center is not None
+                            and center_delta > previous_center
+                        ):
+                            raise ValueError(
+                                f"{row_where}.center_delta must be "
+                                "non-increasing in rank order within its "
+                                "pair/element/factor group"
+                            )
+                        previous_center = center_delta
+
+                    group.append(row)
+                    row_index += 1
+                rows[(p_index, e_index, f_index)] = group
+
+    return scenarios, elements, factors, pairs, rows
+
+
+def rank_region_stability(ranking, *, min_ranks: int = 1) -> dict:
+    """Aggregate per-scenario interval ranks into rank stability stats.
+
+    ``ranking`` must be a complete :func:`rank_region_intervals` result
+    (schema ``climate-grid/rr-interval-rank-v1``) with exactly the keys
+    ``schema, scenarios, elements, windows, regions, factors, pairs,
+    data`` in that order; every member is validated against that contract,
+    including the flat pair-then-element-then-factor-then-rank ``data``
+    row order, each row's key order ``pair, left, right, element, factor,
+    scenario, center_delta, lower_delta, upper_delta, overlap, rank`` and
+    the row invariants (each scenario appears exactly once per
+    pair/element/factor group, ``rank`` is ``None`` exactly when the three
+    deltas and ``overlap`` are, and the ranked rows lead their group in
+    non-increasing ``center_delta`` order with ranks running consecutively
+    from 1).  ``min_ranks`` must be a non-bool positive int.
+
+    For every scenario (in ``scenarios`` order) the non-``None`` ranks are
+    collected across all pair/element/factor groups; ``total`` is
+    ``len(pairs) * len(elements) * len(factors)``, ``valid`` is the number
+    of collected ranks and ``missing_rate`` is ``(total - valid) / total``.
+    When ``valid`` is below ``min_ranks``, ``mean``, ``best``, ``worst``
+    and ``stddev`` are all ``None``; otherwise they are the mean, minimum
+    and maximum of the collected ranks and
+    ``sqrt(sum((rank - mean) ** 2) / valid)``.
+
+    The returned mapping uses the key order ``schema, scenarios, data``;
+    ``schema`` is ``climate-grid/rrs-v1`` and ``scenarios`` echoes the
+    ranking.  ``data`` is a flat list of rows in scenario order; each row
+    uses the key order ``scenario, total, valid, missing_rate, mean, best,
+    worst, stddev``.  ``total`` and ``valid`` are ints, ``best`` and
+    ``worst`` are ints or ``None`` and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The input
+    is not modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scenarios, elements, factors, pairs, rows = _validate_region_intervals_rank(
+        ranking
+    )
+
+    if not isinstance(min_ranks, int) or isinstance(min_ranks, bool):
+        raise TypeError("min_ranks must be a non-bool int")
+    if min_ranks < 1:
+        raise ValueError("min_ranks must be positive")
+
+    total = len(pairs) * len(elements) * len(factors)
+
+    result_rows = []
+    for scenario in scenarios:
+        ranks = []
+        for p_index in range(len(pairs)):
+            for e_index in range(len(elements)):
+                for f_index in range(len(factors)):
+                    for row in rows[(p_index, e_index, f_index)]:
+                        if row["scenario"] == scenario and row["rank"] is not None:
+                            ranks.append(row["rank"])
+        valid = len(ranks)
+        missing_rate = _round_output((total - valid) / total)
+        if valid < min_ranks:
+            mean = None
+            best = None
+            worst = None
+            stddev = None
+        else:
+            mean_value = sum(ranks) / valid
+            mean = _round_output(mean_value)
+            best = min(ranks)
+            worst = max(ranks)
+            stddev = _round_output(
+                math.sqrt(
+                    sum((rank - mean_value) ** 2 for rank in ranks) / valid
+                )
+            )
+        result_rows.append(
+            {
+                "scenario": scenario,
+                "total": total,
+                "valid": valid,
+                "missing_rate": missing_rate,
+                "mean": mean,
+                "best": best,
+                "worst": worst,
+                "stddev": stddev,
+            }
+        )
+
+    return {
+        "schema": _REGION_INTERVAL_RANK_STABILITY_SCHEMA,
+        "scenarios": list(scenarios),
+        "data": result_rows,
+    }
