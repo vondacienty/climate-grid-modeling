@@ -11643,3 +11643,432 @@ def compare_region_intervals(intervals, pairs) -> dict:
         ],
         "data": result_rows,
     }
+
+
+_REGION_REPORT_INTERVAL_COMPARE_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "baseline",
+    "scenarios",
+    "elements",
+    "windows",
+    "regions",
+    "factors",
+    "pairs",
+    "data",
+)
+_REGION_REPORT_INTERVAL_COMPARE_ROW_KEYS = (
+    "pair",
+    "left",
+    "right",
+    "element",
+    "factor",
+    "center_delta",
+    "lower_delta",
+    "upper_delta",
+    "overlap",
+)
+_REGION_REPORT_INTERVAL_RANK_SCHEMA = "climate-grid/rr-interval-rank-v1"
+_REGION_REPORT_INTERVAL_RANK_ITEM_KEYS = ("name", "comparison")
+_REGION_REPORT_INTERVAL_RANK_ROW_KEYS = (
+    "pair",
+    "left",
+    "right",
+    "element",
+    "factor",
+    "scenario",
+    "center_delta",
+    "lower_delta",
+    "upper_delta",
+    "overlap",
+    "rank",
+)
+
+
+def _validate_region_interval_comparison(
+    comparison: Any, *, where: str
+) -> tuple[list[str], list, list[str], list, list, dict]:
+    if not isinstance(comparison, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(comparison.keys()) != _REGION_REPORT_INTERVAL_COMPARE_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "baseline, scenarios, elements, windows, regions, factors, "
+            "pairs, data in order"
+        )
+
+    schema = comparison["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_REPORT_INTERVAL_COMPARE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be "
+            f"{_REGION_REPORT_INTERVAL_COMPARE_SCHEMA!r}"
+        )
+
+    years = comparison["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = comparison["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    baseline = comparison["baseline"]
+    if not isinstance(baseline, str):
+        raise TypeError(f"{where}.baseline must be a str")
+    if baseline == "":
+        raise ValueError(f"{where}.baseline must be non-empty")
+
+    scenarios = _validate_string_list(
+        comparison["scenarios"], f"{where}.scenarios"
+    )
+    if baseline in scenarios:
+        raise ValueError(
+            f"{where}.baseline must not appear in {where}.scenarios"
+        )
+    elements = _validate_string_list(
+        comparison["elements"], f"{where}.elements"
+    )
+
+    windows = comparison["windows"]
+    if not isinstance(windows, list):
+        raise TypeError(f"{where}.windows must be a list")
+    if len(windows) == 0:
+        raise ValueError(f"{where}.windows must be non-empty")
+    seen_windows: set[str] = set()
+    for index, window in enumerate(windows):
+        window_where = f"{where}.windows[{index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{window_where} must be a dict")
+        if list(window.keys()) != ["name", "start", "end"]:
+            raise ValueError(
+                f"{window_where} must have exactly the keys name, start, "
+                "end in order"
+            )
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{window_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{window_where}.name must be non-empty")
+        if name in seen_windows:
+            raise ValueError(f"duplicate {where}.windows name: {name!r}")
+        seen_windows.add(name)
+        start_day = _parse_date(window["start"], f"{window_where}.start")
+        end_day = _parse_date(window["end"], f"{window_where}.end")
+        if start_day > end_day:
+            raise ValueError(
+                f"{window_where}.start must be on or before "
+                f"{window_where}.end"
+            )
+
+    regions = _validate_string_list(comparison["regions"], f"{where}.regions")
+
+    factors = comparison["factors"]
+    if not isinstance(factors, list):
+        raise TypeError(f"{where}.factors must be a list")
+    if len(factors) == 0:
+        raise ValueError(f"{where}.factors must be non-empty")
+    for index, factor in enumerate(factors):
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+            raise TypeError(
+                f"{where}.factors[{index}] must be a finite non-bool int "
+                "or float"
+            )
+        if not _is_finite(factor):
+            raise ValueError(f"{where}.factors[{index}] must be finite")
+        if factor <= 0:
+            raise ValueError(f"{where}.factors[{index}] must be positive")
+    for index in range(1, len(factors)):
+        if factors[index] <= factors[index - 1]:
+            raise ValueError(f"{where}.factors must be strictly increasing")
+
+    pairs = comparison["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError(f"{where}.pairs must be a list")
+    if len(pairs) == 0:
+        raise ValueError(f"{where}.pairs must be non-empty")
+    validated_pairs: list[tuple[str, str, str]] = []
+    seen_pairs: set[str] = set()
+    for index, pair in enumerate(pairs):
+        pair_where = f"{where}.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if list(pair.keys()) != ["name", "left", "right"]:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys name, left, "
+                "right in order"
+            )
+        pair_name = pair["name"]
+        left = pair["left"]
+        right = pair["right"]
+        for key, value in (
+            ("name", pair_name),
+            ("left", left),
+            ("right", right),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{pair_where}.{key} must be a str")
+            if value == "":
+                raise ValueError(f"{pair_where}.{key} must be non-empty")
+        if pair_name in seen_pairs:
+            raise ValueError(f"duplicate {where}.pairs name: {pair_name!r}")
+        seen_pairs.add(pair_name)
+        for key, value in (("left", left), ("right", right)):
+            if value not in regions:
+                raise ValueError(
+                    f"{pair_where}.{key} must be a name in {where}.regions"
+                )
+        if left == right:
+            raise ValueError(
+                f"{pair_where}.left and {pair_where}.right must be "
+                "different regions"
+            )
+        validated_pairs.append((pair_name, left, right))
+
+    data = comparison["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    expected_rows = len(validated_pairs) * len(elements) * len(factors)
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "pair/element/factor combination, in pair-then-element-then-"
+            "factor order)"
+        )
+
+    row_index = 0
+    for pair_name, left, right in validated_pairs:
+        for element in elements:
+            for factor in factors:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _REGION_REPORT_INTERVAL_COMPARE_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys pair, "
+                        "left, right, element, factor, center_delta, "
+                        "lower_delta, upper_delta, overlap in order"
+                    )
+                if row["pair"] != pair_name:
+                    raise ValueError(
+                        f"{row_where}.pair must be {pair_name!r} for its "
+                        "pair-then-element-then-factor position"
+                    )
+                if row["left"] != left:
+                    raise ValueError(
+                        f"{row_where}.left must be {left!r} for its "
+                        "pair-then-element-then-factor position"
+                    )
+                if row["right"] != right:
+                    raise ValueError(
+                        f"{row_where}.right must be {right!r} for its "
+                        "pair-then-element-then-factor position"
+                    )
+                if row["element"] != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for its "
+                        "pair-then-element-then-factor position"
+                    )
+                if row["factor"] != factor:
+                    raise ValueError(
+                        f"{row_where}.factor must be {factor!r} for its "
+                        "pair-then-element-then-factor position"
+                    )
+                for key in ("center_delta", "lower_delta", "upper_delta"):
+                    _validate_number(row[key], f"{row_where}.{key}", nullable=True)
+                overlap = row["overlap"]
+                if overlap is not None and not isinstance(overlap, bool):
+                    raise TypeError(f"{row_where}.overlap must be a bool or None")
+                deltas_present = (
+                    row["center_delta"] is not None,
+                    row["lower_delta"] is not None,
+                    row["upper_delta"] is not None,
+                    overlap is not None,
+                )
+                if not (all(deltas_present) or not any(deltas_present)):
+                    raise ValueError(
+                        f"{row_where}: center_delta, lower_delta, "
+                        "upper_delta and overlap must be all None or all "
+                        "present"
+                    )
+                row_index += 1
+
+    return elements, windows, regions, factors, validated_pairs, data
+
+
+def rank_region_intervals(items) -> dict:
+    """Rank scenarios across paired region interval comparisons.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, comparison`` in that order.  ``name`` is a unique
+    non-empty str labeling the scenario and ``comparison`` is a complete
+    :func:`compare_region_intervals` result (schema
+    ``climate-grid/rr-interval-compare-v1``); every item's comparison is
+    validated against that contract and all items must share equal
+    ``elements``, ``windows``, ``regions``, ``factors`` and ``pairs``
+    arrays in the same order.  A wrong container/item type raises
+    ``TypeError`` and any other violation raises ``ValueError``.
+
+    For each pair (in pair order), element (in element order) and factor
+    (in factor order) the scenario rows are gathered: rows whose
+    ``center_delta`` is not ``None`` are ordered by descending
+    ``center_delta`` with ties keeping the original items order, and
+    ``rank`` runs consecutively from 1.  Rows whose ``center_delta`` is
+    ``None`` follow the ranked rows in their original items order with
+    ``rank`` ``None``.
+
+    The returned mapping uses the key order ``schema, scenarios,
+    elements, windows, regions, factors, pairs, data``; ``schema`` is
+    ``climate-grid/rr-interval-rank-v1``, ``scenarios`` lists the item
+    names in item order and the other axes are taken from the first
+    item's comparison.  ``data`` is a flat list of rows ordered by group
+    (pair-then-element-then-factor) and then by rank within the group;
+    each row uses the key order ``pair, left, right, element, factor,
+    scenario, center_delta, lower_delta, upper_delta, overlap, rank``.
+    ``rank`` is a non-bool positive int or ``None`` and every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two items")
+
+    scenario_names: list[str] = []
+    comparisons: list[dict] = []
+    seen_names: set[str] = set()
+    first_axes: tuple | None = None
+    for index, item in enumerate(items):
+        where = f"items[{index}].comparison"
+        if not isinstance(item, dict):
+            raise TypeError(f"items[{index}] must be a dict")
+        if tuple(item.keys()) != _REGION_REPORT_INTERVAL_RANK_ITEM_KEYS:
+            raise ValueError(
+                f"items[{index}] must have exactly the keys name, "
+                "comparison in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"items[{index}].name must be a str")
+        if name == "":
+            raise ValueError(f"items[{index}].name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate scenario name: {name!r}")
+        seen_names.add(name)
+
+        axes = _validate_region_interval_comparison(
+            item["comparison"], where=where
+        )
+        # The axes tuple is (elements, windows, regions, factors, pairs,
+        # data); only the shared axes are compared across items.
+        shared_axes = axes[:5]
+        if first_axes is None:
+            first_axes = shared_axes
+        elif shared_axes != first_axes:
+            raise ValueError(
+                "all items must have equal elements, windows, regions, "
+                "factors and pairs in the same order"
+            )
+
+        scenario_names.append(name)
+        comparisons.append(item["comparison"])
+
+    assert first_axes is not None
+    elements, windows, regions, factors, pairs = first_axes
+
+    def _number_out(value):
+        if value is None:
+            return None
+        if isinstance(value, float):
+            return _round_output(value)
+        return value
+
+    n_elements = len(elements)
+    n_factors = len(factors)
+    result_rows = []
+    for p_index, (pair_name, left, right) in enumerate(pairs):
+        for e_index, element in enumerate(elements):
+            for f_index, factor in enumerate(factors):
+                row_index = (
+                    (p_index * n_elements + e_index) * n_factors + f_index
+                )
+                valid = []
+                invalid = []
+                for s_index, (scenario, comparison) in enumerate(
+                    zip(scenario_names, comparisons)
+                ):
+                    row = comparison["data"][row_index]
+                    if row["center_delta"] is None:
+                        invalid.append((s_index, scenario, row))
+                    else:
+                        valid.append((s_index, scenario, row))
+                # Python's sort is stable, so equal values keep the
+                # original items order.
+                valid.sort(
+                    key=lambda entry: entry[2]["center_delta"], reverse=True
+                )
+                for rank, (_s_index, scenario, row) in enumerate(
+                    valid, start=1
+                ):
+                    result_rows.append(
+                        {
+                            "pair": pair_name,
+                            "left": left,
+                            "right": right,
+                            "element": element,
+                            "factor": factor,
+                            "scenario": scenario,
+                            "center_delta": _number_out(row["center_delta"]),
+                            "lower_delta": _number_out(row["lower_delta"]),
+                            "upper_delta": _number_out(row["upper_delta"]),
+                            "overlap": row["overlap"],
+                            "rank": rank,
+                        }
+                    )
+                for _s_index, scenario, row in invalid:
+                    result_rows.append(
+                        {
+                            "pair": pair_name,
+                            "left": left,
+                            "right": right,
+                            "element": element,
+                            "factor": factor,
+                            "scenario": scenario,
+                            "center_delta": None,
+                            "lower_delta": None,
+                            "upper_delta": None,
+                            "overlap": None,
+                            "rank": None,
+                        }
+                    )
+
+    return {
+        "schema": _REGION_REPORT_INTERVAL_RANK_SCHEMA,
+        "scenarios": scenario_names,
+        "elements": list(elements),
+        "windows": windows,
+        "regions": list(regions),
+        "factors": list(factors),
+        "pairs": [
+            {"name": name, "left": left, "right": right}
+            for name, left, right in pairs
+        ],
+        "data": result_rows,
+    }
