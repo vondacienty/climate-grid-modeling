@@ -8896,3 +8896,325 @@ def select_rank(ranking, requests, *, min_coverage: float = 0.0) -> dict:
         "drivers": list(drivers),
         "data": result_data,
     }
+
+
+_LAYER_TREND_SELECT_RESULT_KEYS = (
+    "schema",
+    "years",
+    "reference",
+    "drivers",
+    "data",
+)
+_LAYER_TREND_SELECT_ITEM_KEYS = (
+    "element",
+    "top",
+    "count",
+    "mean",
+    "uncertainty",
+    "rows",
+)
+_LAYER_TREND_SELECT_ROW_KEYS = (
+    "scenario",
+    "count",
+    "coverage",
+    "difference",
+    "uncertainty",
+    "rank",
+)
+_SELECTION_SUMMARY_SCHEMA = "climate-grid/ltc-ss-v1"
+
+
+def _validate_select_result(
+    selection: Any, *, where: str = "selection"
+) -> tuple[list, str, list[str], list]:
+    if not isinstance(selection, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(selection.keys()) != _LAYER_TREND_SELECT_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, years, reference, "
+            "drivers, data in order"
+        )
+
+    schema = selection["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _LAYER_TREND_SELECT_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_LAYER_TREND_SELECT_SCHEMA!r}"
+        )
+
+    years = selection["years"]
+    if not isinstance(years, list):
+        raise TypeError(f"{where}.years must be a list")
+    if len(years) == 0:
+        raise ValueError(f"{where}.years must be non-empty")
+    for index, year in enumerate(years):
+        if not isinstance(year, int) or isinstance(year, bool):
+            raise TypeError(f"{where}.years[{index}] must be a non-bool int")
+    for index in range(1, len(years)):
+        if years[index] <= years[index - 1]:
+            raise ValueError(f"{where}.years must be strictly increasing")
+
+    reference = selection["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    drivers = _validate_string_list(selection["drivers"], f"{where}.drivers")
+    n_drivers = len(drivers)
+
+    data = selection["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) == 0:
+        raise ValueError(f"{where}.data must be non-empty")
+
+    seen_elements: set[str] = set()
+    for index, item in enumerate(data):
+        item_where = f"{where}.data[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where} must be a dict")
+        if tuple(item.keys()) != _LAYER_TREND_SELECT_ITEM_KEYS:
+            raise ValueError(
+                f"{item_where} must have exactly the keys element, top, "
+                "count, mean, uncertainty, rows in order"
+            )
+
+        element = item["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{item_where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{item_where}.element must be non-empty")
+        if element in seen_elements:
+            raise ValueError(f"{item_where}: duplicate element {element!r}")
+        seen_elements.add(element)
+
+        top = item["top"]
+        if not isinstance(top, int) or isinstance(top, bool):
+            raise TypeError(f"{item_where}.top must be a non-bool int")
+        if top < 1:
+            raise ValueError(f"{item_where}.top must be positive")
+
+        rows = item["rows"]
+        if not isinstance(rows, list):
+            raise TypeError(f"{item_where}.rows must be a list")
+
+        count = item["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{item_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{item_where}.count must be non-negative")
+        if count != len(rows):
+            raise ValueError(
+                f"{item_where}.count must equal the number of rows"
+            )
+
+        seen_scenarios: set[str] = set()
+        for row_index, row in enumerate(rows):
+            row_where = f"{item_where}.rows[{row_index}]"
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _LAYER_TREND_SELECT_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys scenario, "
+                    "count, coverage, difference, uncertainty, rank in order"
+                )
+
+            scenario = row["scenario"]
+            if not isinstance(scenario, str):
+                raise TypeError(f"{row_where}.scenario must be a str")
+            if scenario == "":
+                raise ValueError(f"{row_where}.scenario must be non-empty")
+            if scenario in seen_scenarios:
+                raise ValueError(
+                    f"{row_where}: duplicate scenario {scenario!r}"
+                )
+            seen_scenarios.add(scenario)
+
+            row_count = row["count"]
+            if not isinstance(row_count, int) or isinstance(row_count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if row_count < 0 or row_count > n_drivers:
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and the number of "
+                    "drivers"
+                )
+
+            coverage = row["coverage"]
+            _validate_number(coverage, f"{row_where}.coverage", nullable=False)
+            if coverage < 0.0 or coverage > 1.0:
+                raise ValueError(
+                    f"{row_where}.coverage must be between 0 and 1"
+                )
+
+            _validate_number(
+                row["difference"], f"{row_where}.difference", nullable=False
+            )
+            row_uncertainty = row["uncertainty"]
+            _validate_number(
+                row_uncertainty, f"{row_where}.uncertainty", nullable=False
+            )
+            if row_uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+
+            rank = row["rank"]
+            if not isinstance(rank, int) or isinstance(rank, bool):
+                raise TypeError(f"{row_where}.rank must be a non-bool int")
+            if rank != row_index + 1:
+                raise ValueError(
+                    f"{row_where}.rank must run consecutively from 1"
+                )
+            if rank > top:
+                raise ValueError(
+                    f"{row_where}.rank must not exceed {item_where}.top"
+                )
+
+        mean = item["mean"]
+        uncertainty = item["uncertainty"]
+        if count == 0:
+            if mean is not None or uncertainty is not None:
+                raise ValueError(
+                    f"{item_where}: mean and uncertainty must be None when "
+                    "count is zero"
+                )
+        else:
+            _validate_number(mean, f"{item_where}.mean", nullable=False)
+            _validate_number(
+                uncertainty, f"{item_where}.uncertainty", nullable=False
+            )
+            if uncertainty < 0:
+                raise ValueError(
+                    f"{item_where}.uncertainty must be non-negative"
+                )
+            expected_mean = _round_output(
+                sum(row["difference"] for row in rows) / count
+            )
+            if mean != expected_mean:
+                raise ValueError(
+                    f"{item_where}.mean must be the rounded mean of the row "
+                    "differences"
+                )
+            expected_uncertainty = _round_output(
+                math.sqrt(sum(row["uncertainty"] ** 2 for row in rows))
+                / count
+            )
+            if uncertainty != expected_uncertainty:
+                raise ValueError(
+                    f"{item_where}.uncertainty must be the rounded combined "
+                    "row uncertainty"
+                )
+
+    return years, reference, drivers, data
+
+
+def selection_summary(selection, *, min_elements: int = 1) -> dict:
+    """Summarize a selection result per scenario across all elements.
+
+    ``selection`` must be a complete :func:`select_rank` result (schema
+    ``climate-grid/ltc-select-v1``) with exactly the keys ``schema, years,
+    reference, drivers, data`` in that order; every member is validated
+    against that contract, including the non-empty strictly increasing
+    non-bool int ``years``, the non-empty str ``reference``, the request
+    order of ``data``, each item's key order ``element, top, count, mean,
+    uncertainty, rows``, the distinct non-empty str elements, the non-bool
+    positive int ``top``, each row's key order ``scenario, count, coverage,
+    difference, uncertainty, rank`` and the row invariants (``count`` a
+    non-bool int between 0 and the number of drivers; ``coverage`` a finite
+    number between 0 and 1; ``difference`` and ``uncertainty`` finite
+    numbers with ``uncertainty`` non-negative; scenarios distinct within an
+    item; ``rank`` a non-bool int running consecutively from 1 and not
+    exceeding ``top``; the item ``count`` equals the number of rows; the
+    item ``mean`` and ``uncertainty`` are both ``None`` when the count is
+    zero and otherwise equal the rounded row aggregates).  ``min_elements``
+    must be a non-bool positive int.
+
+    The items are scanned in ``data`` order; the element order is the item
+    order and the scenario order is the order of first appearance across
+    the scanned rows.  For each scenario (in scenario order) the rows are
+    collected in element order: ``covered`` is the number ``n`` of rows,
+    ``driver_count`` is the sum of the row counts and ``coverage`` is
+    ``sum(coverage) / n``.  When ``n`` is below ``min_elements``, ``mean``
+    and ``uncertainty`` are both ``None``; otherwise they are
+    ``sum(difference) / n`` and ``sqrt(sum(uncertainty ** 2)) / n`` over
+    the collected rows.
+
+    The returned mapping uses the key order ``schema, years, reference,
+    drivers, elements, scenarios, data``; ``schema`` is
+    ``climate-grid/ltc-ss-v1`` and ``years``, ``reference`` and ``drivers``
+    echo the selection metadata.  ``data`` follows the scenario order;
+    each row uses the key order ``scenario, covered, driver_count,
+    coverage, mean, uncertainty``.  ``covered`` and ``driver_count`` are
+    ints and every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``.  Inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    years, reference, drivers, data = _validate_select_result(selection)
+
+    if not isinstance(min_elements, int) or isinstance(min_elements, bool):
+        raise TypeError("min_elements must be a non-bool int")
+    if min_elements < 1:
+        raise ValueError("min_elements must be positive")
+
+    elements = [item["element"] for item in data]
+
+    scenarios: list[str] = []
+    rows_by_scenario: dict[str, dict[str, Any]] = {}
+    for item in data:
+        element = item["element"]
+        for row in item["rows"]:
+            scenario = row["scenario"]
+            if scenario not in rows_by_scenario:
+                scenarios.append(scenario)
+                rows_by_scenario[scenario] = {}
+            rows_by_scenario[scenario][element] = row
+
+    result_data = []
+    for scenario in scenarios:
+        per_element = rows_by_scenario[scenario]
+        rows = [
+            per_element[element]
+            for element in elements
+            if element in per_element
+        ]
+
+        n = len(rows)
+        driver_count = sum(row["count"] for row in rows)
+        coverage = _round_output(
+            sum(row["coverage"] for row in rows) / n
+        )
+        if n < min_elements:
+            mean = None
+            uncertainty = None
+        else:
+            mean = _round_output(
+                sum(row["difference"] for row in rows) / n
+            )
+            uncertainty = _round_output(
+                math.sqrt(sum(row["uncertainty"] ** 2 for row in rows)) / n
+            )
+
+        result_data.append(
+            {
+                "scenario": scenario,
+                "covered": n,
+                "driver_count": driver_count,
+                "coverage": coverage,
+                "mean": mean,
+                "uncertainty": uncertainty,
+            }
+        )
+
+    return {
+        "schema": _SELECTION_SUMMARY_SCHEMA,
+        "years": list(years),
+        "reference": reference,
+        "drivers": list(drivers),
+        "elements": elements,
+        "scenarios": scenarios,
+        "data": result_data,
+    }
