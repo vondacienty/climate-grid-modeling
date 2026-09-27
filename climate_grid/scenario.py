@@ -18380,3 +18380,247 @@ def weight_robustness(summary, *, minimum: int = 1) -> dict:
         "regions": list(regions),
         "data": rows,
     }
+
+
+_REGION_WEIGHT_DIGEST_SCHEMA = "climate-grid/rws-digest-v1"
+
+
+def _validate_region_weight_robustness(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`weight_robustness` result.
+
+    Returns the ``scenarios``, ``elements`` and ``regions`` axes and the
+    flat scenario-then-region ``data`` row list.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != (
+        "schema",
+        "scenarios",
+        "elements",
+        "regions",
+        "data",
+    ):
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scenarios, "
+            "elements, regions, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WEIGHT_ROBUSTNESS_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WEIGHT_ROBUSTNESS_SCHEMA!r}"
+        )
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(result["elements"], f"{where}.elements")
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_scenarios = len(scenarios)
+    n_regions = len(regions)
+    if len(data) != n_scenarios * n_regions:
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(scenario, region) pair"
+        )
+
+    row_index = 0
+    for scenario in scenarios:
+        for region in regions:
+            row_where = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != (
+                "scenario",
+                "region",
+                "count",
+                "score",
+                "interval",
+            ):
+                raise ValueError(
+                    f"{row_where} must have exactly the keys scenario, "
+                    "region, count, score, interval in order"
+                )
+
+            if not isinstance(row["scenario"], str):
+                raise TypeError(f"{row_where}.scenario must be a str")
+            if row["scenario"] != scenario:
+                raise ValueError(
+                    f"{row_where}.scenario must be {scenario!r} for its "
+                    "position"
+                )
+            if not isinstance(row["region"], str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row["region"] != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its "
+                    "position"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if count < 0:
+                raise ValueError(f"{row_where}.count must be non-negative")
+
+            score = row["score"]
+            interval = row["interval"]
+            if score is None or interval is None:
+                if score is not None or interval is not None:
+                    raise ValueError(
+                        f"{row_where}: score and interval must both be "
+                        "None or both present"
+                    )
+            else:
+                _validate_number(score, f"{row_where}.score", nullable=False)
+                if not isinstance(interval, list):
+                    raise TypeError(f"{row_where}.interval must be a list")
+                if len(interval) != 2:
+                    raise ValueError(
+                        f"{row_where}.interval must contain exactly two items"
+                    )
+                lower, upper = interval
+                _validate_number(
+                    lower, f"{row_where}.interval[0]", nullable=False
+                )
+                _validate_number(
+                    upper, f"{row_where}.interval[1]", nullable=False
+                )
+                if lower > score or upper < score:
+                    raise ValueError(
+                        f"{row_where}.interval must contain its score"
+                    )
+                if lower > upper:
+                    raise ValueError(
+                        f"{row_where}.interval[0] must not exceed "
+                        f"{row_where}.interval[1]"
+                    )
+
+            row_index += 1
+
+    return scenarios, elements, regions, data
+
+
+def _validate_digest_bounds(bounds: Any) -> list:
+    """Validate the ``bounds`` argument of :func:`robustness_digest`."""
+    if not isinstance(bounds, list):
+        raise TypeError("bounds must be a list")
+    if len(bounds) != 2:
+        raise ValueError("bounds must contain exactly two items")
+    for index, bound in enumerate(bounds):
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            raise TypeError(f"bounds[{index}] must be a non-bool number")
+        if not _is_finite(bound):
+            raise ValueError(f"bounds[{index}] must be finite")
+        if bound < 0:
+            raise ValueError(f"bounds[{index}] must be non-negative")
+    if bounds[0] >= bounds[1]:
+        raise ValueError("bounds must be strictly increasing")
+    return bounds
+
+
+def robustness_digest(result, bounds, *, minimum: int = 1) -> dict:
+    """Digest a :func:`weight_robustness` result into per-scenario counts.
+
+    ``result`` must be a complete :func:`weight_robustness` result (schema
+    ``climate-grid/rws-robust-v1``) with exactly the keys ``schema,
+    scenarios, elements, regions, data`` in that order; every member is
+    validated against that contract, including the flat
+    scenario-then-region ``data`` row order and each row's key order
+    ``scenario, region, count, score, interval``.  ``bounds`` must be a
+    list of two finite, non-bool, non-negative, strictly increasing
+    numbers ``a`` and ``b``; ``minimum`` must be a non-bool positive int.
+
+    Rows are scanned in scenario-then-region order.  A row whose
+    ``score`` or ``interval`` is ``None`` counts as ``missing``; every
+    other row counts as ``valid`` and, using the interval
+    ``[lower, upper]``, as ``stable`` when ``upper <= a``, ``fragile``
+    when ``lower > b``, or ``uncertain`` otherwise.  A scenario's
+    ``decision`` is ``None`` when its ``valid`` count is below
+    ``minimum``; otherwise it is ``fragile`` if any row is fragile,
+    ``uncertain`` if any row is uncertain, and ``stable`` if all rows
+    are stable.
+
+    The returned mapping uses the key order ``schema, scenarios,
+    elements, regions, bounds, data``; ``schema`` is
+    ``climate-grid/rws-digest-v1``, the axes echo ``result`` unchanged
+    and ``bounds`` is echoed unchanged.  ``data`` has one row per
+    scenario in scenario order, each using the key order ``scenario,
+    valid, missing, stable, uncertain, fragile, decision`` with the five
+    counts as ints.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scenarios, elements, regions, data = (
+        _validate_region_weight_robustness(result)
+    )
+    bounds = _validate_digest_bounds(bounds)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    a, b = bounds[0], bounds[1]
+    rows = []
+    offset = 0
+    for scenario in scenarios:
+        valid = 0
+        missing = 0
+        stable = 0
+        uncertain = 0
+        fragile = 0
+        for row in data[offset:offset + len(regions)]:
+            if row["score"] is None or row["interval"] is None:
+                missing += 1
+                continue
+            valid += 1
+            lower = row["interval"][0]
+            upper = row["interval"][1]
+            if upper <= a:
+                stable += 1
+            elif lower > b:
+                fragile += 1
+            else:
+                uncertain += 1
+
+        if valid < minimum:
+            decision = None
+        elif fragile:
+            decision = "fragile"
+        elif uncertain:
+            decision = "uncertain"
+        else:
+            decision = "stable"
+
+        rows.append(
+            {
+                "scenario": scenario,
+                "valid": valid,
+                "missing": missing,
+                "stable": stable,
+                "uncertain": uncertain,
+                "fragile": fragile,
+                "decision": decision,
+            }
+        )
+        offset += len(regions)
+
+    return {
+        "schema": _REGION_WEIGHT_DIGEST_SCHEMA,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "bounds": list(bounds),
+        "data": rows,
+    }
