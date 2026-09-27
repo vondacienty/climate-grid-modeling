@@ -18918,3 +18918,349 @@ def digest_consensus(results, *, minimum: int = 1) -> dict:
         "bounds": list(bounds),
         "data": rows,
     }
+
+
+_REGION_WEIGHT_EVOLUTION_SCHEMA = "climate-grid/rc-evolution-v1"
+_REGION_WEIGHT_CONSENSUS_OUTPUT_KEYS = (
+    "schema",
+    "scenarios",
+    "elements",
+    "regions",
+    "bounds",
+    "data",
+)
+_REGION_WEIGHT_CONSENSUS_ROW_KEYS = (
+    "scenario",
+    "valid",
+    "missing",
+    "votes",
+    "decision",
+    "agreement",
+)
+_REGION_WEIGHT_EVOLUTION_ITEM_KEYS = ("period", "result")
+_REGION_WEIGHT_EVOLUTION_ROW_KEYS = (
+    "period",
+    "scenario",
+    "coverage",
+    "decision",
+    "agreement",
+    "agreement_delta",
+    "changed",
+)
+
+
+def _validate_region_weight_consensus(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`digest_consensus` result.
+
+    Returns the ``scenarios``, ``elements``, ``regions`` and ``bounds``
+    axes and the flat scenario-ordered ``data`` row list.  Each row must
+    carry non-bool non-negative int ``valid``/``missing`` counts with a
+    positive, row-constant total, a three-item ``votes`` list of non-bool
+    non-negative ints summing to ``valid``, plus a ``decision`` of
+    ``None`` or one of ``"stable"``, ``"uncertain"``, ``"fragile"`` and
+    an ``agreement`` of ``None`` or a finite non-bool number, both
+    consistent with the votes.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_WEIGHT_CONSENSUS_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scenarios, "
+            "elements, regions, bounds, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WEIGHT_CONSENSUS_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WEIGHT_CONSENSUS_SCHEMA!r}"
+        )
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        result["elements"], f"{where}.elements"
+    )
+    regions = _validate_string_list(
+        result["regions"], f"{where}.regions"
+    )
+
+    bounds = result["bounds"]
+    if not isinstance(bounds, list):
+        raise TypeError(f"{where}.bounds must be a list")
+    if len(bounds) != 2:
+        raise ValueError(f"{where}.bounds must contain exactly 2 items")
+    for index, bound in enumerate(bounds):
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            raise TypeError(
+                f"{where}.bounds[{index}] must be a finite non-bool int "
+                "or float"
+            )
+        if not _is_finite(bound):
+            raise ValueError(f"{where}.bounds[{index}] must be finite")
+        if bound < 0:
+            raise ValueError(f"{where}.bounds[{index}] must be non-negative")
+    if bounds[1] <= bounds[0]:
+        raise ValueError(f"{where}.bounds must be strictly increasing")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    total = None
+    for row_index, scenario in enumerate(scenarios):
+        row_where = f"{where}.data[{row_index}]"
+        row = data[row_index]
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _REGION_WEIGHT_CONSENSUS_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, valid, "
+                "missing, votes, decision, agreement in order"
+            )
+
+        if not isinstance(row["scenario"], str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if row["scenario"] != scenario:
+            raise ValueError(
+                f"{row_where}.scenario must be {scenario!r} for its "
+                "position"
+            )
+
+        for key in ("valid", "missing"):
+            value = row[key]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{row_where}.{key} must be a non-bool int")
+            if value < 0:
+                raise ValueError(f"{row_where}.{key} must be non-negative")
+        valid = row["valid"]
+        row_total = valid + row["missing"]
+        if row_total < 1:
+            raise ValueError(
+                f"{row_where}: valid and missing must sum to a positive "
+                "total"
+            )
+        if total is None:
+            total = row_total
+        elif row_total != total:
+            raise ValueError(
+                f"{row_where}: valid and missing must sum to the same "
+                "total in every row"
+            )
+
+        votes = row["votes"]
+        if not isinstance(votes, list):
+            raise TypeError(f"{row_where}.votes must be a list")
+        if len(votes) != 3:
+            raise ValueError(
+                f"{row_where}.votes must contain exactly 3 items"
+            )
+        for vote_index, vote in enumerate(votes):
+            if not isinstance(vote, int) or isinstance(vote, bool):
+                raise TypeError(
+                    f"{row_where}.votes[{vote_index}] must be a non-bool "
+                    "int"
+                )
+            if vote < 0:
+                raise ValueError(
+                    f"{row_where}.votes[{vote_index}] must be non-negative"
+                )
+        if sum(votes) != valid:
+            raise ValueError(
+                f"{row_where}: votes must sum to valid"
+            )
+
+        decision = row["decision"]
+        agreement = row["agreement"]
+        if decision is None:
+            if agreement is not None:
+                raise ValueError(
+                    f"{row_where}.agreement must be None when decision "
+                    "is None"
+                )
+            continue
+        if not isinstance(decision, str):
+            raise TypeError(f"{row_where}.decision must be a str or None")
+        if decision not in _REGION_WEIGHT_DIGEST_DECISIONS:
+            raise ValueError(
+                f"{row_where}.decision must be one of stable, uncertain, "
+                "fragile or None"
+            )
+        if valid == 0:
+            raise ValueError(
+                f"{row_where}.decision must be None when valid is 0"
+            )
+        best = max(votes)
+        if votes[2] == best:
+            winner = "fragile"
+        elif votes[1] == best:
+            winner = "uncertain"
+        else:
+            winner = "stable"
+        if decision != winner:
+            raise ValueError(
+                f"{row_where}.decision must be {winner!r} for its votes"
+            )
+        if not isinstance(agreement, (int, float)) or isinstance(
+            agreement, bool
+        ):
+            raise TypeError(
+                f"{row_where}.agreement must be a finite non-bool int or "
+                "float or None"
+            )
+        if not _is_finite(agreement):
+            raise ValueError(f"{row_where}.agreement must be finite")
+        if agreement != _round_output(best / valid):
+            raise ValueError(
+                f"{row_where}.agreement must be the winning vote count "
+                "divided by valid"
+            )
+
+    return scenarios, elements, regions, bounds, data
+
+
+def consensus_evolution(items) -> dict:
+    """Track per-scenario consensus across ordered periods.
+
+    ``items`` must be a list of at least two dicts, each with exactly
+    the keys ``period, result`` in that order.  ``period`` must be a
+    unique non-empty str and ``result`` a complete
+    :func:`digest_consensus` result (schema ``climate-grid/rc-v1``),
+    validated against that contract; all results must share the same
+    ``scenarios``, ``elements``, ``regions`` and ``bounds`` in the same
+    order.
+
+    For every period (in item order) and scenario (in scenario order)
+    the row carries ``coverage`` as ``valid / (valid + missing)`` plus
+    the ``decision`` and ``agreement`` of that period's consensus row.
+    The first period's ``agreement_delta`` and ``changed`` are ``None``;
+    for later periods, when the current and previous ``decision`` and
+    ``agreement`` are all non-``None``, ``agreement_delta`` is the
+    current minus the previous ``agreement`` and ``changed`` reports
+    whether the ``decision`` changed, otherwise both are ``None``.
+
+    The returned mapping uses the key order ``schema, periods,
+    scenarios, elements, regions, bounds, data``; ``schema`` is
+    ``climate-grid/rc-evolution-v1``, ``periods`` echoes the item
+    periods unchanged and the remaining axes echo the first result.
+    ``data`` is a flat list in period-then-scenario order; each row
+    uses the key order ``period, scenario, coverage, decision,
+    agreement, agreement_delta, changed``.  Floats are
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    periods = []
+    results = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _REGION_WEIGHT_EVOLUTION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys period, result in "
+                "order"
+            )
+        period = item["period"]
+        if not isinstance(period, str):
+            raise TypeError(f"{where}.period must be a str")
+        if period == "":
+            raise ValueError(f"{where}.period must be non-empty")
+        if period in seen:
+            raise ValueError(f"duplicate items period: {period!r}")
+        seen.add(period)
+        periods.append(period)
+        results.append(item["result"])
+
+    scenarios, elements, regions, bounds, first_data = (
+        _validate_region_weight_consensus(
+            results[0], where="items[0].result"
+        )
+    )
+    all_data = [first_data]
+    for index in range(1, len(results)):
+        where = f"items[{index}].result"
+        item_scenarios, item_elements, item_regions, item_bounds, data = (
+            _validate_region_weight_consensus(results[index], where=where)
+        )
+        if (
+            item_scenarios != scenarios
+            or item_elements != elements
+            or item_regions != regions
+            or item_bounds != bounds
+        ):
+            raise ValueError(
+                f"{where} must share the scenarios, elements, regions "
+                "and bounds of items[0].result in the same order"
+            )
+        all_data.append(data)
+
+    rows = []
+    previous = None
+    for period_index, period in enumerate(periods):
+        data = all_data[period_index]
+        current = []
+        for scenario_index, scenario in enumerate(scenarios):
+            row = data[scenario_index]
+            coverage = _round_output(
+                row["valid"] / (row["valid"] + row["missing"])
+            )
+            decision = row["decision"]
+            agreement = row["agreement"]
+            if period_index == 0:
+                agreement_delta = None
+                changed = None
+            else:
+                prev_decision, prev_agreement = previous[scenario_index]
+                if (
+                    decision is not None
+                    and agreement is not None
+                    and prev_decision is not None
+                    and prev_agreement is not None
+                ):
+                    agreement_delta = _round_output(
+                        agreement - prev_agreement
+                    )
+                    changed = decision != prev_decision
+                else:
+                    agreement_delta = None
+                    changed = None
+            current.append((decision, agreement))
+            rows.append(
+                {
+                    "period": period,
+                    "scenario": scenario,
+                    "coverage": coverage,
+                    "decision": decision,
+                    "agreement": agreement,
+                    "agreement_delta": agreement_delta,
+                    "changed": changed,
+                }
+            )
+        previous = current
+
+    return {
+        "schema": _REGION_WEIGHT_EVOLUTION_SCHEMA,
+        "periods": list(periods),
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "bounds": list(bounds),
+        "data": rows,
+    }
