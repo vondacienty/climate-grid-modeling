@@ -21963,3 +21963,394 @@ def grade_history(items, *, minimum: int = 1) -> dict:
         "scenarios": list(first_scenarios),
         "data": result_data,
     }
+
+
+_GRADE_WINDOWS_SCHEMA = "climate-grid/rw"
+_GRADE_WINDOWS_KEYS = ("schema", "windows", "scenarios", "data")
+_GRADE_WINDOW_KEYS = ("name", "start", "end")
+_GRADE_WINDOWS_ROW_KEYS = (
+    "window",
+    "scenario",
+    "valid",
+    "count",
+    "transitions",
+    "stability",
+    "trend",
+)
+_GRADE_WINDOWS_HISTORY_KEYS = (
+    "schema",
+    "periods",
+    "scenarios",
+    "data",
+)
+_GRADE_WINDOWS_HISTORY_ROW_KEYS = (
+    "scenario",
+    "total",
+    "valid",
+    "levels",
+    "count",
+    "transitions",
+    "changes",
+    "rate",
+)
+_GRADE_WINDOWS_SCORES = {"strong": 0, "moderate": 1, "conflict": 2}
+
+
+def _validate_grade_windows(
+    windows: Any, periods: list
+) -> list[tuple[str, str, str, int, int]]:
+    """Validate the ``windows`` argument against a history period axis."""
+    if not isinstance(windows, list):
+        raise TypeError("windows must be a list")
+    if len(windows) == 0:
+        raise ValueError("windows must be non-empty")
+
+    period_index = {period: i for i, period in enumerate(periods)}
+    validated: list[tuple[str, str, str, int, int]] = []
+    seen_names: set[str] = set()
+    for w_index, window in enumerate(windows):
+        where = f"windows[{w_index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(window.keys()) != _GRADE_WINDOW_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, start, end "
+                "in order"
+            )
+
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate window name: {name!r}")
+        seen_names.add(name)
+
+        start = window["start"]
+        end = window["end"]
+        if not isinstance(start, str):
+            raise TypeError(f"{where}.start must be a str")
+        if not isinstance(end, str):
+            raise TypeError(f"{where}.end must be a str")
+        if start not in period_index:
+            raise ValueError(
+                f"{where}.start must be one of the history periods"
+            )
+        if end not in period_index:
+            raise ValueError(
+                f"{where}.end must be one of the history periods"
+            )
+        start_index = period_index[start]
+        end_index = period_index[end]
+        if start_index > end_index:
+            raise ValueError(
+                f"{where}.start must be on or before {where}.end"
+            )
+
+        validated.append((name, start, end, start_index, end_index))
+
+    return validated
+
+
+def _validate_grade_windows_history(history: Any) -> tuple[list, list, list]:
+    """Validate a complete :func:`grade_history` result.
+
+    Returns the ``periods`` axis, the ``scenarios`` axis and the
+    per-scenario ``levels`` lists (one row per scenario), checking the
+    full ``climate-grid/rgh-v1`` contract including key order and the
+    recomputed ``valid``/``count``/``transitions``/``changes`` values.
+    """
+    if not isinstance(history, dict):
+        raise TypeError("history must be a dict")
+    if tuple(history.keys()) != _GRADE_WINDOWS_HISTORY_KEYS:
+        raise ValueError(
+            "history must have exactly the keys schema, periods, "
+            "scenarios, data in order"
+        )
+
+    schema = history["schema"]
+    if not isinstance(schema, str):
+        raise TypeError("history.schema must be a str")
+    if schema != _GRADE_HISTORY_SCHEMA:
+        raise ValueError(
+            f"history.schema must be {_GRADE_HISTORY_SCHEMA!r}"
+        )
+
+    periods = history["periods"]
+    if not isinstance(periods, list):
+        raise TypeError("history.periods must be a list")
+    if len(periods) < 2:
+        raise ValueError("history.periods must contain at least 2 periods")
+    seen_periods: set[str] = set()
+    for p_index, period in enumerate(periods):
+        if not isinstance(period, str):
+            raise TypeError(f"history.periods[{p_index}] must be a str")
+        if period == "":
+            raise ValueError(f"history.periods[{p_index}] must be non-empty")
+        if period in seen_periods:
+            raise ValueError(f"duplicate history period: {period!r}")
+        seen_periods.add(period)
+
+    scenarios = history["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError("history.scenarios must be a list")
+    if len(scenarios) == 0:
+        raise ValueError("history.scenarios must be non-empty")
+    seen_scenarios: set[str] = set()
+    for s_index, scenario in enumerate(scenarios):
+        if not isinstance(scenario, str):
+            raise TypeError(f"history.scenarios[{s_index}] must be a str")
+        if scenario == "":
+            raise ValueError(
+                f"history.scenarios[{s_index}] must be non-empty"
+            )
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate history scenario: {scenario!r}")
+        seen_scenarios.add(scenario)
+
+    data = history["data"]
+    if not isinstance(data, list):
+        raise TypeError("history.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError("history.data must contain one row per scenario")
+
+    n_periods = len(periods)
+    levels_by_scenario: list[list] = []
+    for row_index, row in enumerate(data):
+        where = f"history.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(row.keys()) != _GRADE_WINDOWS_HISTORY_ROW_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys scenario, total, "
+                "valid, levels, count, transitions, changes, rate in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where}.scenario must be a str")
+        if scenario != scenarios[row_index]:
+            raise ValueError(
+                f"{where}.scenario {scenario!r} must equal "
+                f"history.scenarios[{row_index}] ({scenarios[row_index]!r})"
+            )
+
+        total = row["total"]
+        if not isinstance(total, int) or isinstance(total, bool):
+            raise TypeError(f"{where}.total must be a non-bool int")
+        if total != n_periods:
+            raise ValueError(
+                f"{where}.total must equal the number of periods"
+            )
+
+        levels = row["levels"]
+        if not isinstance(levels, list):
+            raise TypeError(f"{where}.levels must be a list")
+        if len(levels) != n_periods:
+            raise ValueError(
+                f"{where}.levels must contain one entry per period"
+            )
+        for l_index, level in enumerate(levels):
+            if not isinstance(level, str):
+                raise TypeError(f"{where}.levels[{l_index}] must be a str")
+            if level not in _RC_GRADE_LEVELS:
+                raise ValueError(
+                    f"{where}.levels[{l_index}] must be one of missing, "
+                    "strong, moderate, conflict"
+                )
+
+        transitions = row["transitions"]
+        if not isinstance(transitions, list):
+            raise TypeError(f"{where}.transitions must be a list")
+        if len(transitions) != 9:
+            raise ValueError(
+                f"{where}.transitions must contain exactly 9 items"
+            )
+        expected_transitions = [0 for _ in range(9)]
+        count = 0
+        changes = 0
+        for earlier, later in zip(levels, levels[1:]):
+            if earlier == "missing" or later == "missing":
+                continue
+            count += 1
+            expected_transitions[
+                _GRADE_WINDOWS_SCORES[earlier] * 3
+                + _GRADE_WINDOWS_SCORES[later]
+            ] += 1
+            if earlier != later:
+                changes += 1
+        for t_index, value in enumerate(transitions):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{where}.transitions[{t_index}] must be a non-bool int"
+                )
+            if value < 0:
+                raise ValueError(
+                    f"{where}.transitions[{t_index}] must be non-negative"
+                )
+            if value != expected_transitions[t_index]:
+                raise ValueError(
+                    f"{where}.transitions[{t_index}] must count the "
+                    "adjacent non-missing level pairs"
+                )
+
+        valid = row["valid"]
+        if not isinstance(valid, int) or isinstance(valid, bool):
+            raise TypeError(f"{where}.valid must be a non-bool int")
+        expected_valid = sum(level != "missing" for level in levels)
+        if valid != expected_valid:
+            raise ValueError(
+                f"{where}.valid must equal the number of non-missing levels"
+            )
+
+        row_count = row["count"]
+        if not isinstance(row_count, int) or isinstance(row_count, bool):
+            raise TypeError(f"{where}.count must be a non-bool int")
+        if row_count != count:
+            raise ValueError(
+                f"{where}.count must equal the number of adjacent "
+                "non-missing level pairs"
+            )
+
+        row_changes = row["changes"]
+        if not isinstance(row_changes, int) or isinstance(row_changes, bool):
+            raise TypeError(f"{where}.changes must be a non-bool int")
+        if row_changes != changes:
+            raise ValueError(
+                f"{where}.changes must count the adjacent non-missing "
+                "level pairs whose levels differ"
+            )
+
+        rate = row["rate"]
+        if rate is not None:
+            _validate_number(rate, f"{where}.rate", nullable=False)
+            if count == 0:
+                raise ValueError(
+                    f"{where}.rate must be None when count is 0"
+                )
+            if rate != _round_output(changes / count):
+                raise ValueError(
+                    f"{where}.rate must equal changes / count"
+                )
+
+        levels_by_scenario.append(list(levels))
+
+    return list(periods), list(scenarios), levels_by_scenario
+
+
+def grade_windows(history, windows, *, minimum: int = 1) -> dict:
+    """Grade scenario consistency within windows of a grade history.
+
+    ``history`` must be a complete :func:`grade_history` result (schema
+    ``climate-grid/rgh-v1``) with exactly the keys ``schema, periods,
+    scenarios, data`` in that order; every member is validated against
+    that contract, including key order and the recomputed
+    ``valid``/``count``/``transitions``/``changes`` values.
+    ``windows`` must be a non-empty list of dicts, each with exactly
+    the keys ``name, start, end`` in that order; ``name`` is a unique
+    non-empty str and ``start``/``end`` are periods of the history
+    whose order is non-decreasing.  Windows are closed intervals over
+    the history period axis.  ``minimum`` must be a non-bool positive
+    int.
+
+    Levels score ``strong``, ``moderate`` and ``conflict`` as ``0``,
+    ``1`` and ``2`` respectively.  For every window and scenario (in
+    ``scenarios`` order), ``valid`` counts the non-``missing`` periods
+    in the window and ``count`` counts adjacent pairs of valid
+    periods; ``transitions`` is a length-nine list flattened with the
+    earlier level as the primary order and the later level as the
+    secondary order over ``strong, moderate, conflict``
+    (``strong→strong`` first and ``conflict→conflict`` last).  When
+    ``count < minimum``, ``stability`` is ``None``; otherwise it is
+    the sum of the three diagonal transition counts divided by
+    ``count``.  ``trend`` is the ordinary least-squares slope of the
+    valid periods using their zero-based position within the window as
+    ``x`` and the level score as ``y``; when ``valid <
+    max(minimum, 2)`` it is ``None``.
+
+    The returned mapping uses the key order ``schema, windows,
+    scenarios, data``; ``schema`` is ``climate-grid/rw``, ``windows``
+    lists fresh ``name, start, end`` dicts in the input window order
+    and ``scenarios`` echoes the history scenario axis.  ``data``
+    follows window order and then scenario order; each row uses the
+    key order ``window, scenario, valid, count, transitions,
+    stability, trend``.  Every count is a non-bool int and every float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+    The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    periods, scenarios, levels_by_scenario = (
+        _validate_grade_windows_history(history)
+    )
+    validated_windows = _validate_grade_windows(windows, periods)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    trend_required = max(minimum, 2)
+    rows = []
+    for name, start, end, start_index, end_index in validated_windows:
+        for s_index, scenario in enumerate(scenarios):
+            window_levels = levels_by_scenario[s_index][
+                start_index : end_index + 1
+            ]
+
+            points = []
+            transitions = [0 for _ in range(9)]
+            count = 0
+            for position, level in enumerate(window_levels):
+                if level != "missing":
+                    points.append((position, _GRADE_WINDOWS_SCORES[level]))
+            for earlier, later in zip(window_levels, window_levels[1:]):
+                if earlier == "missing" or later == "missing":
+                    continue
+                count += 1
+                transitions[
+                    _GRADE_WINDOWS_SCORES[earlier] * 3
+                    + _GRADE_WINDOWS_SCORES[later]
+                ] += 1
+
+            valid = len(points)
+            diagonal = transitions[0] + transitions[4] + transitions[8]
+            if count < minimum:
+                stability = None
+            else:
+                stability = _round_output(diagonal / count)
+
+            if valid < trend_required:
+                trend = None
+            else:
+                x_bar = sum(x for x, _y in points) / valid
+                y_bar = sum(y for _x, y in points) / valid
+                s_xx = sum((x - x_bar) ** 2 for x, _y in points)
+                trend = _round_output(
+                    sum((x - x_bar) * (y - y_bar) for x, y in points)
+                    / s_xx
+                )
+
+            rows.append(
+                {
+                    "window": name,
+                    "scenario": scenario,
+                    "valid": valid,
+                    "count": count,
+                    "transitions": transitions,
+                    "stability": stability,
+                    "trend": trend,
+                }
+            )
+
+    return {
+        "schema": _GRADE_WINDOWS_SCHEMA,
+        "windows": [
+            {"name": name, "start": start, "end": end}
+            for name, start, end, _i, _j in validated_windows
+        ],
+        "scenarios": list(scenarios),
+        "data": rows,
+    }
