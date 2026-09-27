@@ -22995,3 +22995,400 @@ def aggregate_grade_changes(result, *, minimum: int = 1) -> dict:
         "scenarios": list(scenarios),
         "data": data,
     }
+
+
+_GRADE_COMPARE_SCHEMA = "climate-grid/rwc2-v1"
+_GRADE_COMPARE_ITEM_KEYS = ("name", "result")
+_GRADE_COMPARE_ROW_KEYS = (
+    "scenario",
+    "valid",
+    "missing",
+    "mean",
+    "std",
+    "band",
+)
+
+
+def _validate_aggregate_grade_changes(
+    result: Any, *, where: str = "result"
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Validate a complete :func:`aggregate_grade_changes` result.
+
+    Returns the fresh ``pairs`` mappings, the ``scenarios`` axis and
+    the data rows (in scenario order), checking the
+    ``climate-grid/rw-aggregate-v1`` contract: key order, the
+    pairs/scenarios axes, the scenario-order rows and the internal
+    ``count``/``cumulative``/``total``/``interval`` invariants of
+    every row.  A cumulative entry is either two finite non-bool
+    numbers or ``[None, None]``; ``count`` must equal the number of
+    valid entries and a present ``total``/``interval`` must match the
+    recomputed final totals and cumulative-path ranges.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _GRADE_WINDOW_CHANGE_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, pairs, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _GRADE_WINDOW_CHANGE_AGGREGATE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be "
+            f"{_GRADE_WINDOW_CHANGE_AGGREGATE_SCHEMA!r}"
+        )
+
+    pairs = result["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError(f"{where}.pairs must be a list")
+    if not pairs:
+        raise ValueError(f"{where}.pairs must be non-empty")
+    out_pairs: list[dict] = []
+    for index, pair in enumerate(pairs):
+        pair_where = f"{where}.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if tuple(pair.keys()) != _GRADE_WINDOW_CHANGE_PAIR_KEYS:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys left, right "
+                "in order"
+            )
+        left = pair["left"]
+        right = pair["right"]
+        if not isinstance(left, str):
+            raise TypeError(f"{pair_where}.left must be a str")
+        if not isinstance(right, str):
+            raise TypeError(f"{pair_where}.right must be a str")
+        if left == "":
+            raise ValueError(f"{pair_where}.left must be non-empty")
+        if right == "":
+            raise ValueError(f"{pair_where}.right must be non-empty")
+        out_pairs.append({"left": left, "right": right})
+
+    scenarios = result["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if not scenarios:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    out_scenarios: list[str] = []
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        scenario_where = f"{where}.scenarios[{index}]"
+        if not isinstance(scenario, str):
+            raise TypeError(f"{scenario_where} must be a str")
+        if scenario == "":
+            raise ValueError(f"{scenario_where} must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(
+                f"duplicate {where} scenario: {scenario!r}"
+            )
+        seen_scenarios.add(scenario)
+        out_scenarios.append(scenario)
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(out_scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    n_pairs = len(out_pairs)
+    out_rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _GRADE_WINDOW_CHANGE_AGGREGATE_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, "
+                "count, cumulative, total, interval in order"
+            )
+
+        scenario_name = row["scenario"]
+        if not isinstance(scenario_name, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        expected_scenario = out_scenarios[row_index]
+        if scenario_name != expected_scenario:
+            raise ValueError(
+                f"{row_where}.scenario {scenario_name!r} must follow "
+                f"scenario order (expected {expected_scenario!r})"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{row_where}.count must be non-negative")
+
+        cumulative = row["cumulative"]
+        if not isinstance(cumulative, list):
+            raise TypeError(f"{row_where}.cumulative must be a list")
+        if len(cumulative) != n_pairs:
+            raise ValueError(
+                f"{row_where}.cumulative must contain exactly one "
+                "entry per window pair"
+            )
+        stability_path: list = []
+        trend_path: list = []
+        for entry_index, entry in enumerate(cumulative):
+            entry_where = f"{row_where}.cumulative[{entry_index}]"
+            if not isinstance(entry, list):
+                raise TypeError(f"{entry_where} must be a list")
+            if len(entry) != 2:
+                raise ValueError(
+                    f"{entry_where} must contain exactly 2 items"
+                )
+            stability_total, trend_total = entry
+            if stability_total is None or trend_total is None:
+                if stability_total is not None or trend_total is not None:
+                    raise ValueError(
+                        f"{entry_where} must be two finite numbers or "
+                        "[None, None]"
+                    )
+                continue
+            _validate_number(
+                stability_total, f"{entry_where}[0]", nullable=False
+            )
+            _validate_number(
+                trend_total, f"{entry_where}[1]", nullable=False
+            )
+            stability_path.append(stability_total)
+            trend_path.append(trend_total)
+
+        if count != len(stability_path):
+            raise ValueError(
+                f"{row_where}.count must equal the number of valid "
+                "cumulative entries"
+            )
+
+        total = row["total"]
+        interval = row["interval"]
+        if total is None or interval is None:
+            if total is not None or interval is not None:
+                raise ValueError(
+                    f"{row_where}.total and {row_where}.interval must "
+                    "be None together"
+                )
+        else:
+            if count == 0:
+                raise ValueError(
+                    f"{row_where}.total and {row_where}.interval must "
+                    "be None when count is zero"
+                )
+            if not isinstance(total, list):
+                raise TypeError(f"{row_where}.total must be a list")
+            if len(total) != 2:
+                raise ValueError(
+                    f"{row_where}.total must contain exactly 2 items"
+                )
+            for item_index, item in enumerate(total):
+                _validate_number(
+                    item,
+                    f"{row_where}.total[{item_index}]",
+                    nullable=False,
+                )
+            if total != [stability_path[-1], trend_path[-1]]:
+                raise ValueError(
+                    f"{row_where}.total must equal the final "
+                    "cumulative entry"
+                )
+            if not isinstance(interval, list):
+                raise TypeError(f"{row_where}.interval must be a list")
+            if len(interval) != 2:
+                raise ValueError(
+                    f"{row_where}.interval must contain exactly 2 items"
+                )
+            expected_interval = [
+                [
+                    _round_output(min([0.0] + stability_path)),
+                    _round_output(max([0.0] + stability_path)),
+                ],
+                [
+                    _round_output(min([0.0] + trend_path)),
+                    _round_output(max([0.0] + trend_path)),
+                ],
+            ]
+            for column_index, column in enumerate(interval):
+                column_where = f"{row_where}.interval[{column_index}]"
+                if not isinstance(column, list):
+                    raise TypeError(f"{column_where} must be a list")
+                if len(column) != 2:
+                    raise ValueError(
+                        f"{column_where} must contain exactly 2 items"
+                    )
+                for item_index, item in enumerate(column):
+                    _validate_number(
+                        item,
+                        f"{column_where}[{item_index}]",
+                        nullable=False,
+                    )
+            if interval != expected_interval:
+                raise ValueError(
+                    f"{row_where}.interval must equal the range of "
+                    "the cumulative path including the origin"
+                )
+
+        out_rows.append(row)
+
+    return out_pairs, out_scenarios, out_rows
+
+
+def grade_compare(items, *, minimum: int = 2) -> dict:
+    """Compare accumulated grade changes across named results.
+
+    ``items`` must be a list of at least two dicts, each with exactly
+    the keys ``name, result`` in that order.  ``name`` must be a
+    unique non-empty str and ``result`` a complete
+    :func:`aggregate_grade_changes` result (schema
+    ``climate-grid/rw-aggregate-v1``), validated against that
+    contract; all results must share the same ``pairs`` and
+    ``scenarios`` in the same order.  ``minimum`` must be a non-bool
+    positive int.
+
+    For every scenario (in ``scenarios`` order), the rows whose
+    ``total`` and ``interval`` are both non-``None`` are collected in
+    item order; ``valid`` is their number and ``missing`` is
+    ``len(items) - valid``.  When ``valid < minimum``, ``mean``,
+    ``std`` and ``band`` are all ``None``; otherwise, for each of the
+    stability and trend columns, ``mean`` is ``fsum(total) / valid``,
+    ``std`` is the population standard deviation
+    ``sqrt(fsum((total - mean) ** 2) / valid)`` and ``band`` is
+    ``[smallest interval lower bound, largest interval upper bound]``.
+
+    The returned mapping uses the key order ``schema, names, pairs,
+    scenarios, data``; ``schema`` is ``climate-grid/rwc2-v1``,
+    ``names`` echoes the item names in item order and the two axes
+    echo the shared axes of the first result.  ``data`` follows the
+    ``scenarios`` order; each row uses the key order ``scenario,
+    valid, missing, mean, std, band``.  ``valid`` and ``missing`` are
+    ints, ``mean``/``std`` are two-item lists and ``band`` is two
+    ``[min, max]`` pairs.  Every float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``; a non-finite derived value
+    raises ``ValueError``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names = []
+    results = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _GRADE_COMPARE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result "
+                "in order"
+            )
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+        names.append(name)
+        results.append(item["result"])
+
+    pairs, scenarios, first_rows = _validate_aggregate_grade_changes(
+        results[0], where="items[0].result"
+    )
+    all_rows = [first_rows]
+    for index in range(1, len(results)):
+        where = f"items[{index}].result"
+        item_pairs, item_scenarios, rows = (
+            _validate_aggregate_grade_changes(results[index], where=where)
+        )
+        if item_pairs != pairs or item_scenarios != scenarios:
+            raise ValueError(
+                f"{where} must share the pairs and scenarios of "
+                "items[0].result in the same order"
+            )
+        all_rows.append(rows)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_items = len(items)
+    data = []
+    for row_index, scenario in enumerate(scenarios):
+        totals: list = []
+        intervals: list = []
+        for rows in all_rows:
+            row = rows[row_index]
+            total = row["total"]
+            interval = row["interval"]
+            if total is None or interval is None:
+                continue
+            totals.append(total)
+            intervals.append(interval)
+
+        valid = len(totals)
+        missing = n_items - valid
+        if valid < minimum:
+            mean = None
+            std = None
+            band = None
+        else:
+            mean = []
+            std = []
+            band = []
+            for column in range(2):
+                values = [total[column] for total in totals]
+                column_mean = math.fsum(values) / valid
+                column_std = math.sqrt(
+                    math.fsum(
+                        (value - column_mean) ** 2 for value in values
+                    )
+                    / valid
+                )
+                if not _is_finite(column_mean) or not _is_finite(
+                    column_std
+                ):
+                    raise ValueError(
+                        "grade comparison summary values must be finite"
+                    )
+                mean.append(_round_output(column_mean))
+                std.append(_round_output(column_std))
+                band.append(
+                    [
+                        _round_output(
+                            min(interval[column][0] for interval in intervals)
+                        ),
+                        _round_output(
+                            max(interval[column][1] for interval in intervals)
+                        ),
+                    ]
+                )
+
+        data.append(
+            {
+                "scenario": scenario,
+                "valid": valid,
+                "missing": missing,
+                "mean": mean,
+                "std": std,
+                "band": band,
+            }
+        )
+
+    return {
+        "schema": _GRADE_COMPARE_SCHEMA,
+        "names": names,
+        "pairs": [dict(pair) for pair in pairs],
+        "scenarios": list(scenarios),
+        "data": data,
+    }
