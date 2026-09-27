@@ -20365,3 +20365,387 @@ def evolution_rank(comparison) -> dict:
         "scenarios": list(scenarios),
         "data": rows,
     }
+
+
+_EVOLUTION_RANK_KEYS = (
+    "schema",
+    "periods",
+    "reference",
+    "scenarios",
+    "data",
+)
+_EVOLUTION_RANK_ROW_KEYS = (
+    "scenario",
+    "count",
+    "moves",
+    "coverage",
+    "agreement",
+    "rate",
+    "uncertainty",
+    "rank",
+)
+
+
+def _validate_evolution_rank_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list, str, list, list]:
+    """Validate a complete :func:`evolution_rank` result.
+
+    Returns the ``periods`` axis, the ``reference`` scenario, the
+    compared ``scenarios`` axis and the ``data`` rows.  ``data`` must
+    hold exactly one row per compared scenario, in the ranking order:
+    the ranked rows run consecutively from 1, precede the ``rank``
+    ``None`` rows and are ordered by descending
+    ``hypot(coverage, agreement, rate)`` with ties keeping the
+    ``scenarios`` order; the unranked rows keep the ``scenarios``
+    order.  ``count`` is a non-bool int, ``moves`` a list of exactly
+    nine non-bool ints, ``coverage`` a finite non-bool number and
+    ``agreement``, ``rate`` and ``uncertainty`` are finite non-bool
+    numbers (``uncertainty`` non-negative) exactly when ``rank`` is
+    not ``None`` and ``None`` otherwise.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _EVOLUTION_RANK_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, periods, "
+            "reference, scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _EVOLUTION_RANK_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_EVOLUTION_RANK_SCHEMA!r}"
+        )
+
+    periods = _validate_string_list(
+        result["periods"], f"{where}.periods", minimum=2
+    )
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios", minimum=0
+    )
+    if reference in scenarios:
+        raise ValueError(
+            f"{where}.scenarios must not contain the reference "
+            f"scenario {reference!r}"
+        )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_scenarios = len(scenarios)
+    if len(data) != n_scenarios:
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    scenario_index = {
+        scenario: index for index, scenario in enumerate(scenarios)
+    }
+    seen_scenarios: set[str] = set()
+    valid_count = 0
+    null_phase = False
+    previous_score = None
+    previous_order = -1
+    invalid_order = -1
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _EVOLUTION_RANK_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, "
+                "count, moves, coverage, agreement, rate, "
+                "uncertainty, rank in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario not in scenario_index:
+            raise ValueError(
+                f"{row_where}.scenario {scenario!r} must appear in "
+                f"{where}.scenarios"
+            )
+        if scenario in seen_scenarios:
+            raise ValueError(
+                f"{row_where}.scenario {scenario!r} appears more "
+                "than once"
+            )
+        seen_scenarios.add(scenario)
+        order = scenario_index[scenario]
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+
+        moves = row["moves"]
+        if not isinstance(moves, list):
+            raise TypeError(f"{row_where}.moves must be a list")
+        if len(moves) != 9:
+            raise ValueError(
+                f"{row_where}.moves must contain exactly 9 items"
+            )
+        for move_index, move in enumerate(moves):
+            if not isinstance(move, int) or isinstance(move, bool):
+                raise TypeError(
+                    f"{row_where}.moves[{move_index}] must be a "
+                    "non-bool int"
+                )
+        if sum(moves) != count:
+            raise ValueError(
+                f"{row_where}.moves must sum to {row_where}.count"
+            )
+
+        _validate_number(
+            row["coverage"], f"{row_where}.coverage", nullable=False
+        )
+        coverage = row["coverage"]
+        if not -2 <= coverage <= 2:
+            raise ValueError(
+                f"{row_where}.coverage must be between -2 and 2"
+            )
+
+        rank = row["rank"]
+        agreement = row["agreement"]
+        rate = row["rate"]
+        uncertainty = row["uncertainty"]
+        if rank is None:
+            null_phase = True
+            if (
+                agreement is not None
+                or rate is not None
+                or uncertainty is not None
+            ):
+                raise ValueError(
+                    f"{row_where}: agreement, rate and uncertainty "
+                    "must be None when rank is None"
+                )
+            if order <= invalid_order:
+                raise ValueError(
+                    f"{row_where}: unranked rows must keep the "
+                    "scenarios order"
+                )
+            invalid_order = order
+        else:
+            if null_phase:
+                raise ValueError(
+                    f"{row_where}: ranked rows must precede rows "
+                    "with rank None"
+                )
+            if not isinstance(rank, int) or isinstance(rank, bool):
+                raise TypeError(
+                    f"{row_where}.rank must be a non-bool int or None"
+                )
+            valid_count += 1
+            if rank != valid_count:
+                raise ValueError(
+                    f"{row_where}.rank must run consecutively from 1"
+                )
+            if (
+                agreement is None
+                or rate is None
+                or uncertainty is None
+            ):
+                raise ValueError(
+                    f"{row_where}: agreement, rate and uncertainty "
+                    "must be present when rank is not None"
+                )
+            _validate_number(
+                agreement, f"{row_where}.agreement", nullable=True
+            )
+            _validate_number(rate, f"{row_where}.rate", nullable=True)
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=True
+            )
+            if not -2 <= agreement <= 2:
+                raise ValueError(
+                    f"{row_where}.agreement must be between -2 and 2"
+                )
+            if not -1 <= rate <= 1:
+                raise ValueError(
+                    f"{row_where}.rate must be between -1 and 1"
+                )
+            if uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+            score = math.hypot(coverage, agreement, rate)
+            if previous_score is not None and score > previous_score:
+                raise ValueError(
+                    f"{row_where}: ranked rows must be ordered by "
+                    "descending score"
+                )
+            if (
+                previous_score is not None
+                and score == previous_score
+                and order <= previous_order
+            ):
+                raise ValueError(
+                    f"{row_where}: tied scores must keep the "
+                    "scenarios order"
+                )
+            previous_score = score
+            previous_order = order
+
+    return periods, reference, scenarios, data
+
+
+_RANK_HISTORY_SCHEMA = "climate-grid/rh-v1"
+_RANK_HISTORY_ITEM_KEYS = ("name", "result")
+
+
+def rank_history(items, *, minimum: int = 2) -> dict:
+    """Track per-scenario ranks across ordered evolution rankings.
+
+    ``items`` must be a list of at least two dicts, each with exactly
+    the keys ``name, result`` in that order.  ``name`` must be a
+    unique non-empty str and ``result`` a complete
+    :func:`evolution_rank` result (schema ``climate-grid/rce-rank-v1``),
+    validated against that contract; all results must share the same
+    ``reference`` and ``scenarios`` in the same order.  ``minimum``
+    must be a non-bool positive int.
+
+    For every scenario (in ``scenarios`` order) its ``rank`` is taken
+    from each item's result in item order; ``ranks`` keeps the ranks
+    as ints or ``None`` and ``changes`` holds, for every adjacent
+    pair, the later rank minus the earlier one when both are valid
+    and ``None`` otherwise.  ``count`` is the number of valid ranks.
+    When ``count < minimum``, ``mean``, ``stability`` and ``interval``
+    are all ``None``; otherwise ``mean`` is the mean of the valid
+    ranks, ``sd`` their population standard deviation
+    ``sqrt(sum((rank - mean) ** 2) / count)``, ``stability`` is
+    ``1 / (1 + sd)`` and ``interval`` is
+    ``[max(1, mean - sd), min(len(scenarios), mean + sd)]``.
+
+    The returned mapping uses the key order ``schema, names,
+    reference, scenarios, data``; ``schema`` is
+    ``climate-grid/rh-v1``, ``names`` echoes the item names in item
+    order and the two axes echo the shared result axes.  ``data``
+    follows the ``scenarios`` order; each row uses the key order
+    ``scenario, count, ranks, changes, mean, stability, interval``.
+    ``count`` and the ``ranks``/``changes`` members are ints or
+    ``None`` and every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names = []
+    results = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _RANK_HISTORY_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result "
+                "in order"
+            )
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+        names.append(name)
+        results.append(item["result"])
+
+    _periods, reference, scenarios, first_data = (
+        _validate_evolution_rank_result(
+            results[0], where="items[0].result"
+        )
+    )
+    all_data = [first_data]
+    for index in range(1, len(results)):
+        where = f"items[{index}].result"
+        _item_periods, item_reference, item_scenarios, data = (
+            _validate_evolution_rank_result(results[index], where=where)
+        )
+        if item_reference != reference or item_scenarios != scenarios:
+            raise ValueError(
+                f"{where} must share the reference and scenarios of "
+                "items[0].result in the same order"
+            )
+        all_data.append(data)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_scenarios = len(scenarios)
+    scenario_index = {
+        scenario: index for index, scenario in enumerate(scenarios)
+    }
+    ranks_by_scenario: list[list] = [[] for _ in range(n_scenarios)]
+    for data in all_data:
+        for row in data:
+            ranks_by_scenario[scenario_index[row["scenario"]]].append(
+                row["rank"]
+            )
+
+    rows = []
+    for s_index, scenario in enumerate(scenarios):
+        ranks = ranks_by_scenario[s_index]
+        changes = []
+        for index in range(1, len(ranks)):
+            previous = ranks[index - 1]
+            current = ranks[index]
+            if previous is None or current is None:
+                changes.append(None)
+            else:
+                changes.append(current - previous)
+        valid = [rank for rank in ranks if rank is not None]
+        count = len(valid)
+        if count < minimum:
+            mean = None
+            stability = None
+            interval = None
+        else:
+            mean_value = sum(valid) / count
+            sd = math.sqrt(
+                sum((rank - mean_value) ** 2 for rank in valid) / count
+            )
+            mean = _round_output(mean_value)
+            stability = _round_output(1 / (1 + sd))
+            interval = [
+                _round_output(float(max(1, mean_value - sd))),
+                _round_output(float(min(n_scenarios, mean_value + sd))),
+            ]
+        rows.append(
+            {
+                "scenario": scenario,
+                "count": count,
+                "ranks": list(ranks),
+                "changes": changes,
+                "mean": mean,
+                "stability": stability,
+                "interval": interval,
+            }
+        )
+
+    return {
+        "schema": _RANK_HISTORY_SCHEMA,
+        "names": names,
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "data": rows,
+    }
