@@ -21691,3 +21691,275 @@ def consistency(
             "conflict": counts["conflict"],
         },
     }
+
+
+_GRADE_HISTORY_SCHEMA = "climate-grid/rgh-v1"
+_GRADE_HISTORY_ITEM_KEYS = ("period", "result")
+_GRADE_HISTORY_OUTPUT_KEYS = ("schema", "periods", "scenarios", "data")
+_GRADE_HISTORY_ROW_KEYS = (
+    "scenario",
+    "total",
+    "valid",
+    "levels",
+    "count",
+    "transitions",
+    "changes",
+    "rate",
+)
+_GRADE_HISTORY_LEVELS = ("strong", "moderate", "conflict")
+
+
+def _validate_consistency_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list]:
+    """Validate a complete :func:`consistency` result.
+
+    Returns the scenario axis (taken from the ``scenario`` field of
+    each ``data`` row) and the ``data`` rows, checking the full
+    ``climate-grid/rc-grade-v1`` contract: key order, row order, the
+    ``level``/``conflict`` pairs and the recomputed ``summary``
+    counts.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _RC_GRADE_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, data, "
+            "summary in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _RC_GRADE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_RC_GRADE_SCHEMA!r}"
+        )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    scenarios: list[str] = []
+    seen_scenarios: set[str] = set()
+    counts = {"missing": 0, "strong": 0, "moderate": 0, "conflict": 0}
+    valid = 0
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _RC_GRADE_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, "
+                "level, conflict in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario == "":
+            raise ValueError(f"{row_where}.scenario must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(
+                f"duplicate {where}.data scenario: {scenario!r}"
+            )
+        seen_scenarios.add(scenario)
+        scenarios.append(scenario)
+
+        level = row["level"]
+        if not isinstance(level, str):
+            raise TypeError(f"{row_where}.level must be a str")
+        if level not in _RC_GRADE_LEVELS:
+            raise ValueError(
+                f"{row_where}.level must be one of missing, strong, "
+                "moderate, conflict"
+            )
+
+        conflict = row["conflict"]
+        if level == "missing":
+            if conflict is not None:
+                raise ValueError(
+                    f"{row_where}.conflict must be None when level "
+                    "is 'missing'"
+                )
+        else:
+            if not isinstance(conflict, bool):
+                raise TypeError(
+                    f"{row_where}.conflict must be a bool when level "
+                    f"is {level!r}"
+                )
+            if conflict != (level == "conflict"):
+                raise ValueError(
+                    f"{row_where}.conflict must be "
+                    f"{level == 'conflict'} when level is {level!r}"
+                )
+
+        counts[level] += 1
+        if level != "missing":
+            valid += 1
+
+    summary = result["summary"]
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where}.summary must be a dict")
+    if tuple(summary.keys()) != _RC_GRADE_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where}.summary must have exactly the keys total, "
+            "valid, missing, strong, moderate, conflict in order"
+        )
+    expected_summary = {
+        "total": len(scenarios),
+        "valid": valid,
+        "missing": counts["missing"],
+        "strong": counts["strong"],
+        "moderate": counts["moderate"],
+        "conflict": counts["conflict"],
+    }
+    for name in _RC_GRADE_SUMMARY_KEYS:
+        value = summary[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{where}.summary.{name} must be a non-bool int")
+        if value != expected_summary[name]:
+            raise ValueError(
+                f"{where}.summary.{name} must equal {expected_summary[name]}"
+            )
+
+    return scenarios, data
+
+
+def grade_history(items, *, minimum: int = 1) -> dict:
+    """Flatten per-period consistency grades into level-transition rows.
+
+    ``items`` must be a list of at least two mappings, each with
+    exactly the keys ``period, result`` in that order.  ``period`` is
+    a non-empty str unique across the items.  ``result`` is a complete
+    :func:`consistency` result (schema ``climate-grid/rc-grade-v1``)
+    with exactly the keys ``schema, data, summary`` in that order;
+    every member is validated against that contract, including the
+    ``data`` row order and key order (``scenario, level, conflict``),
+    each ``level``/``conflict`` pair (``missing`` carries ``None``;
+    ``strong`` and ``moderate`` carry ``False``; ``conflict`` carries
+    ``True``) and the recomputed ``summary`` counts.  Every result
+    must be non-empty (grade at least one scenario) and share the same
+    scenarios in the same order, taken from the first item.
+    ``minimum`` must be a non-bool positive int.
+
+    For each scenario the period ``level`` values are taken in item
+    order.  A transition is counted for a pair of adjacent periods
+    only when both levels are non-``missing``; ``count`` is the number
+    of such pairs and ``changes`` counts those whose two levels
+    differ.  ``transitions`` is a length-nine list flattened with the
+    earlier level as the primary order and the later level as the
+    secondary order, both over ``strong, moderate, conflict``
+    (``strong→strong`` first and ``conflict→conflict`` last).  When
+    ``count < minimum``, ``rate`` is ``None``; otherwise it is
+    ``changes / count``.
+
+    The returned mapping uses the key order ``schema, periods,
+    scenarios, data``; ``schema`` is ``climate-grid/rgh-v1``,
+    ``periods`` lists the item periods in order and ``scenarios``
+    echoes the shared scenario axis.  ``data`` follows the scenario
+    order; each row uses the key order ``scenario, total, valid,
+    levels, count, transitions, changes, rate``.  ``total`` is the
+    number of periods, ``valid`` is the number of non-``missing``
+    levels and ``levels`` lists the per-period levels (including
+    ``missing``) in period order.  Every count is a non-bool int and
+    ``rate`` is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    periods: list[str] = []
+    seen_periods: set[str] = set()
+    grids: list[list] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _GRADE_HISTORY_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys period, result "
+                "in order"
+            )
+
+        period = item["period"]
+        if not isinstance(period, str):
+            raise TypeError(f"{where}.period must be a str")
+        if period == "":
+            raise ValueError(f"{where}.period must be non-empty")
+        if period in seen_periods:
+            raise ValueError(f"duplicate period: {period!r}")
+        seen_periods.add(period)
+
+        scenarios, data = _validate_consistency_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not scenarios:
+            raise ValueError(
+                f"{where}.result.data must be non-empty"
+            )
+        if not grids:
+            first_scenarios = scenarios
+        elif scenarios != first_scenarios:
+            raise ValueError(
+                "all items must share the same result scenarios in the "
+                "same order, taken from the first item"
+            )
+
+        periods.append(period)
+        grids.append(data)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_periods = len(periods)
+    level_index = {
+        level: i for i, level in enumerate(_GRADE_HISTORY_LEVELS)
+    }
+    result_data = []
+    for s_index, scenario in enumerate(first_scenarios):
+        levels = [grid[s_index]["level"] for grid in grids]
+        valid = sum(level != "missing" for level in levels)
+
+        transitions = [0 for _ in range(9)]
+        count = 0
+        changes = 0
+        for earlier, later in zip(levels, levels[1:]):
+            if earlier == "missing" or later == "missing":
+                continue
+            count += 1
+            transitions[level_index[earlier] * 3 + level_index[later]] += 1
+            if earlier != later:
+                changes += 1
+
+        if count < minimum:
+            rate = None
+        else:
+            rate = _round_output(changes / count)
+
+        result_data.append(
+            {
+                "scenario": scenario,
+                "total": n_periods,
+                "valid": valid,
+                "levels": list(levels),
+                "count": count,
+                "transitions": transitions,
+                "changes": changes,
+                "rate": rate,
+            }
+        )
+
+    return {
+        "schema": _GRADE_HISTORY_SCHEMA,
+        "periods": periods,
+        "scenarios": list(first_scenarios),
+        "data": result_data,
+    }
