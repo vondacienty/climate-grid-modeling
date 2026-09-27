@@ -16760,8 +16760,9 @@ def _validate_region_delta_summary_result(
     flat ``data`` row list.  ``data`` must hold one row per
     scenario/region combination, grouped by scenario in scenario order;
     within each scenario the ranked rows (ranks 1..k in order, with
-    non-increasing magnitudes) come first, followed by the unranked
-    rows in regions-axis order, and each row's ``delta``, ``magnitude``,
+    non-increasing magnitudes; equal magnitudes must keep the
+    regions-axis order) come first, followed by the unranked rows in
+    regions-axis order, and each row's ``delta``, ``magnitude``,
     ``dispersion`` and ``rank`` members must be all present or all
     ``None``.
     """
@@ -16802,6 +16803,7 @@ def _validate_region_delta_summary_result(
         )
 
     region_set = set(regions)
+    region_order = {region: index for index, region in enumerate(regions)}
     row_index = 0
     for scenario in scenarios:
         seen_regions: set[str] = set()
@@ -16930,6 +16932,13 @@ def _validate_region_delta_summary_result(
                 raise ValueError(
                     f"{right[3]}.magnitude must not exceed the previous "
                     "ranked row's magnitude"
+                )
+            if right[2] == left[2] and (
+                region_order[right[1]] < region_order[left[1]]
+            ):
+                raise ValueError(
+                    f"{right[3]}: tied magnitudes must keep the regions "
+                    "axis order"
                 )
         if unranked != [r for r in regions if r in set(unranked)]:
             raise ValueError(
@@ -17076,5 +17085,154 @@ def rank_region_delta(summary, *, minimum: int = 1) -> dict:
         "reference": reference,
         "scenarios": list(scenarios[1:]),
         "regions": list(regions),
+        "data": rows,
+    }
+
+
+_REGION_DELTA_RANK_MULTI_SCHEMA = "climate-grid/rdr-multi-v1"
+_REGION_DELTA_RANK_MULTI_ITEM_KEYS = ("element", "summary")
+_REGION_DELTA_RANK_MULTI_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "scenarios",
+    "elements",
+    "regions",
+    "data",
+)
+_REGION_DELTA_RANK_MULTI_ROW_KEYS = (
+    "scenario",
+    "element",
+    "region",
+    "state",
+    "rank",
+    "magnitude",
+    "uncertainty",
+)
+
+
+def rank_region_delta_multi(items, *, minimum: int = 1) -> dict:
+    """Compare per-region ranks across scenarios for several elements.
+
+    ``items`` must be a non-empty list of mappings, each with exactly
+    the keys ``element, summary`` in that order.  ``element`` is a
+    unique non-empty str and ``summary`` is a complete
+    :func:`region_delta_summary` result (schema
+    ``climate-grid/rc-delta-summary-v1``).  Every summary must share the
+    same ``names``, ``scenarios`` and ``regions`` axes in the same order
+    (all taken from the first item) and must contain at least two
+    scenarios.  ``minimum`` must be a non-bool positive int.
+
+    Each item is processed with :func:`rank_region_delta` (using the
+    shared ``minimum``): the first scenario is the reference and every
+    remaining scenario/region pair yields a ``state`` of ``both``,
+    ``added``, ``dropped`` or ``missing`` with the rank difference,
+    magnitude difference and uncertainty present only for ``both``.
+
+    The returned mapping uses the key order ``schema, reference,
+    scenarios, elements, regions, data``; ``schema`` is
+    ``climate-grid/rdr-multi-v1``, ``reference``, ``scenarios`` and
+    ``regions`` are taken from the first item's
+    :func:`rank_region_delta` result and ``elements`` lists the item
+    elements in item order.  ``data`` is a flat list in
+    scenario-then-element-then-region order; each row uses the key
+    order ``scenario, element, region, state, rank, magnitude,
+    uncertainty`` and copies the corresponding single-element row with
+    its ``element`` added.  Every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    elements: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _REGION_DELTA_RANK_MULTI_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys element, summary in "
+                "order"
+            )
+
+        element = item["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{where}.element must be non-empty")
+        if element in elements:
+            raise ValueError(f"duplicate element: {element!r}")
+        elements.append(element)
+
+        names, scenarios, regions, _data = (
+            _validate_region_delta_summary_result(
+                item["summary"], where=f"{where}.summary"
+            )
+        )
+        if len(scenarios) < 2:
+            raise ValueError(
+                f"{where}.summary.scenarios must contain at least 2 "
+                "scenarios"
+            )
+        if index == 0:
+            first_names = names
+            first_scenarios = scenarios
+            first_regions = regions
+        else:
+            if names != first_names:
+                raise ValueError(
+                    "all summaries must share the same names in the same "
+                    "order, taken from the first item"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all summaries must share the same scenarios in the "
+                    "same order, taken from the first item"
+                )
+            if regions != first_regions:
+                raise ValueError(
+                    "all summaries must share the same regions in the "
+                    "same order, taken from the first item"
+                )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    results = [
+        rank_region_delta(item["summary"], minimum=minimum)
+        for item in items
+    ]
+
+    first = results[0]
+    rows = []
+    for scenario in first["scenarios"]:
+        for element, result in zip(elements, results):
+            for row in result["data"]:
+                if row["scenario"] != scenario:
+                    continue
+                rows.append(
+                    {
+                        "scenario": row["scenario"],
+                        "element": element,
+                        "region": row["region"],
+                        "state": row["state"],
+                        "rank": row["rank"],
+                        "magnitude": row["magnitude"],
+                        "uncertainty": row["uncertainty"],
+                    }
+                )
+
+    return {
+        "schema": _REGION_DELTA_RANK_MULTI_SCHEMA,
+        "reference": first["reference"],
+        "scenarios": list(first["scenarios"]),
+        "elements": elements,
+        "regions": list(first["regions"]),
         "data": rows,
     }
