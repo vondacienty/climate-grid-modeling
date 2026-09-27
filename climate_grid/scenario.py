@@ -19287,7 +19287,9 @@ def _validate_consensus_evolution(
     Returns the ``periods``, ``scenarios``, ``elements``, ``regions`` and
     ``bounds`` axes and the flat period-then-scenario ``data`` row list.
     Each row must carry a ``coverage`` of a finite non-bool number
-    between 0 and 1, a ``decision`` of ``None`` or one of ``"stable"``,
+    between 0 and 1 that is already rounded to 12 decimal places with
+    negative zero normalized to ``0.0``, a ``decision`` of ``None`` or
+    one of ``"stable"``,
     ``"uncertain"``, ``"fragile"`` and an ``agreement`` of ``None`` or a
     finite non-bool number between 0 and 1, ``None`` exactly when the
     decision is ``None``.  First-period rows must carry ``None``
@@ -19392,6 +19394,13 @@ def _validate_consensus_evolution(
         if not 0 <= coverage <= 1:
             raise ValueError(
                 f"{row_where}.coverage must be between 0 and 1"
+            )
+        if coverage != _round_output(coverage) or (
+            coverage == 0 and math.copysign(1.0, coverage) < 0
+        ):
+            raise ValueError(
+                f"{row_where}.coverage must be rounded to 12 decimal "
+                "places with negative zero normalized to 0.0"
             )
 
         decision = row["decision"]
@@ -19655,5 +19664,313 @@ def evolution_sum(items, *, minimum: int = 1) -> dict:
         "schema": _EVOLUTION_SUM_SCHEMA,
         "periods": list(first_periods),
         "scenarios": list(first_scenarios),
+        "data": rows,
+    }
+
+
+_EVOLUTION_SUM_KEYS = ("schema", "periods", "scenarios", "data")
+_EVOLUTION_SUM_ROW_KEYS = (
+    "element",
+    "region",
+    "scenario",
+    "count",
+    "coverage",
+    "moves",
+    "delta",
+    "rate",
+)
+_EVOLUTION_COMPARE_SCHEMA = "climate-grid/rce-compare-v1"
+
+
+def _validate_evolution_sum(
+    result: Any, *, where: str = "result"
+) -> tuple[list, list, list, dict]:
+    """Validate a complete :func:`evolution_sum` result.
+
+    Returns the ``periods`` and ``scenarios`` axes, the ``(element,
+    region)`` layers in first-appearance order and a lookup mapping
+    each ``(element, region, scenario)`` combination to its data row.
+    Rows must follow layer-then-scenario order with one row per layer
+    and scenario.  ``count`` must be a non-bool int between 0 and the
+    number of adjacent period pairs, ``coverage`` a finite non-bool
+    number between -1 and 1 and ``moves`` a list of exactly nine
+    non-negative non-bool ints summing to ``count``.  ``delta`` and
+    ``rate`` must be ``None`` together or finite non-bool numbers with
+    ``delta`` between -1 and 1 and ``rate`` between 0 and 1; both must
+    be ``None`` when ``count`` is zero.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _EVOLUTION_SUM_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, periods, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _EVOLUTION_SUM_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_EVOLUTION_SUM_SCHEMA!r}"
+        )
+
+    periods = _validate_string_list(
+        result["periods"], f"{where}.periods", minimum=2
+    )
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) == 0:
+        raise ValueError(f"{where}.data must be non-empty")
+
+    n_scenarios = len(scenarios)
+    if len(data) % n_scenarios != 0:
+        raise ValueError(
+            f"{where}.data must contain exactly one row per layer and "
+            "scenario"
+        )
+
+    max_pairs = len(periods) - 1
+    layers = []
+    seen_layers: set[tuple[str, str]] = set()
+    lookup = {}
+    for row_index, row in enumerate(data):
+        layer_index, scenario_index = divmod(row_index, n_scenarios)
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _EVOLUTION_SUM_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys element, "
+                "region, scenario, count, coverage, moves, delta, "
+                "rate in order"
+            )
+
+        element = row["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{row_where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{row_where}.element must be non-empty")
+
+        region = row["region"]
+        if not isinstance(region, str):
+            raise TypeError(f"{row_where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{row_where}.region must be non-empty")
+
+        combination = (element, region)
+        if scenario_index == 0:
+            if combination in seen_layers:
+                raise ValueError(
+                    f"{row_where} must group exactly one contiguous "
+                    "block of rows per element/region combination"
+                )
+            seen_layers.add(combination)
+            layers.append(combination)
+        elif combination != layers[layer_index]:
+            raise ValueError(
+                f"{row_where} must follow the layer-then-scenario "
+                "order of the preceding rows"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario != scenarios[scenario_index]:
+            raise ValueError(
+                f"{row_where}.scenario must be "
+                f"{scenarios[scenario_index]!r} for its position"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{row_where}.count must be non-negative")
+        if count > max_pairs:
+            raise ValueError(
+                f"{row_where}.count must not exceed the number of "
+                "adjacent period pairs"
+            )
+
+        coverage = row["coverage"]
+        if not isinstance(coverage, (int, float)) or isinstance(
+            coverage, bool
+        ):
+            raise TypeError(
+                f"{row_where}.coverage must be a finite non-bool int "
+                "or float"
+            )
+        if not _is_finite(coverage):
+            raise ValueError(f"{row_where}.coverage must be finite")
+        if not -1 <= coverage <= 1:
+            raise ValueError(
+                f"{row_where}.coverage must be between -1 and 1"
+            )
+
+        moves = row["moves"]
+        if not isinstance(moves, list):
+            raise TypeError(f"{row_where}.moves must be a list")
+        if len(moves) != 9:
+            raise ValueError(
+                f"{row_where}.moves must contain exactly 9 items"
+            )
+        for move_index, move in enumerate(moves):
+            if not isinstance(move, int) or isinstance(move, bool):
+                raise TypeError(
+                    f"{row_where}.moves[{move_index}] must be a "
+                    "non-bool int"
+                )
+            if move < 0:
+                raise ValueError(
+                    f"{row_where}.moves[{move_index}] must be "
+                    "non-negative"
+                )
+        if sum(moves) != count:
+            raise ValueError(
+                f"{row_where}.moves must sum to {row_where}.count"
+            )
+
+        delta = row["delta"]
+        if delta is not None:
+            if not isinstance(delta, (int, float)) or isinstance(
+                delta, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.delta must be a finite non-bool int "
+                    "or float or None"
+                )
+            if not _is_finite(delta):
+                raise ValueError(f"{row_where}.delta must be finite")
+            if not -1 <= delta <= 1:
+                raise ValueError(
+                    f"{row_where}.delta must be between -1 and 1"
+                )
+
+        rate = row["rate"]
+        if rate is not None:
+            if not isinstance(rate, (int, float)) or isinstance(
+                rate, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.rate must be a finite non-bool int "
+                    "or float or None"
+                )
+            if not _is_finite(rate):
+                raise ValueError(f"{row_where}.rate must be finite")
+            if not 0 <= rate <= 1:
+                raise ValueError(
+                    f"{row_where}.rate must be between 0 and 1"
+                )
+
+        if (delta is None) != (rate is None):
+            raise ValueError(
+                f"{row_where}.delta and rate must be None together"
+            )
+        if count == 0 and delta is not None:
+            raise ValueError(
+                f"{row_where}.delta and rate must be None when count "
+                "is zero"
+            )
+
+        lookup[(element, region, scenario)] = row
+
+    return periods, scenarios, layers, lookup
+
+
+def compare_evolution(result, reference) -> dict:
+    """Compare per-layer evolution summaries against a reference.
+
+    ``result`` must be a complete :func:`evolution_sum` result (schema
+    ``climate-grid/rce-v1``), validated against that contract, and
+    ``reference`` a non-empty str naming one of its ``scenarios``.
+
+    For every scenario other than the reference (in scenario order)
+    and every layer (in layer first-appearance order) the reference
+    scenario's row for the same layer is subtracted from the
+    scenario's row: ``count_delta`` and ``coverage_delta`` are the
+    differences of ``count`` and ``coverage``, ``moves_delta`` the
+    item-wise difference of the ``moves`` counts, and
+    ``agreement_delta``/``rate_delta`` the differences of ``delta``
+    and ``rate``, each ``None`` unless both sides are non-``None``.
+
+    The returned mapping uses the key order ``schema, periods,
+    reference, scenarios, layers, data``; ``schema`` is
+    ``climate-grid/rce-compare-v1``, ``periods`` echoes the result
+    periods unchanged, ``scenarios`` lists the compared scenarios
+    without the reference and ``layers`` carries one mapping per layer
+    with the keys ``element, region`` in that order.  ``data`` follows
+    scenario-then-layer order; each row uses the key order
+    ``scenario, element, region, count_delta, coverage_delta,
+    moves_delta, agreement_delta, rate_delta``.  ``count_delta`` and
+    the ``moves_delta`` counts are ints and every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/row/argument types and
+    ``ValueError`` for any other contract violation, including an
+    unknown ``reference``.
+    """
+    periods, scenarios, layers, lookup = _validate_evolution_sum(result)
+
+    if not isinstance(reference, str):
+        raise TypeError("reference must be a str")
+    if reference == "":
+        raise ValueError("reference must be non-empty")
+    if reference not in scenarios:
+        raise ValueError(f"unknown reference scenario: {reference!r}")
+
+    compared = [scenario for scenario in scenarios if scenario != reference]
+    rows = []
+    for scenario in compared:
+        for element, region in layers:
+            row = lookup[(element, region, scenario)]
+            base = lookup[(element, region, reference)]
+            delta = row["delta"]
+            base_delta = base["delta"]
+            if delta is None or base_delta is None:
+                agreement_delta = None
+            else:
+                agreement_delta = _round_output(delta - base_delta)
+            rate = row["rate"]
+            base_rate = base["rate"]
+            if rate is None or base_rate is None:
+                rate_delta = None
+            else:
+                rate_delta = _round_output(rate - base_rate)
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "element": element,
+                    "region": region,
+                    "count_delta": row["count"] - base["count"],
+                    "coverage_delta": _round_output(
+                        row["coverage"] - base["coverage"]
+                    ),
+                    "moves_delta": [
+                        move - base_move
+                        for move, base_move in zip(
+                            row["moves"], base["moves"]
+                        )
+                    ],
+                    "agreement_delta": agreement_delta,
+                    "rate_delta": rate_delta,
+                }
+            )
+
+    return {
+        "schema": _EVOLUTION_COMPARE_SCHEMA,
+        "periods": list(periods),
+        "reference": reference,
+        "scenarios": compared,
+        "layers": [
+            {"element": element, "region": region}
+            for element, region in layers
+        ],
         "data": rows,
     }
