@@ -17753,3 +17753,328 @@ def compare_region_weights(result, configs) -> dict:
         "regions": list(regions),
         "data": rows,
     }
+
+
+def _validate_region_weight_compare_result(
+    comparison: Any, *, where: str = "comparison"
+) -> tuple:
+    """Validate a complete :func:`compare_region_weights` result.
+
+    Returns the ``reference``, the ``configs`` list and the
+    ``scenarios``, ``elements`` and ``regions`` axes plus the flat
+    configuration-then-scenario-then-region ``data`` row list.
+    ``base_covered`` and ``covered`` must be non-bool non-negative ints
+    and ``rank``, ``magnitude`` and ``uncertainty`` must be either all
+    ``None`` or all finite non-bool numbers (the latter non-negative).
+    """
+    if not isinstance(comparison, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(comparison.keys()) != _REGION_WEIGHT_COMPARE_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, "
+            "configs, scenarios, elements, regions, data in order"
+        )
+
+    schema = comparison["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WEIGHT_COMPARE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WEIGHT_COMPARE_SCHEMA!r}"
+        )
+
+    reference = comparison["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        comparison["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        comparison["elements"], f"{where}.elements"
+    )
+    regions = _validate_string_list(comparison["regions"], f"{where}.regions")
+    n_elements = len(elements)
+
+    configs = comparison["configs"]
+    if not isinstance(configs, list):
+        raise TypeError(f"{where}.configs must be a list")
+    if len(configs) < 2:
+        raise ValueError(
+            f"{where}.configs must contain at least 2 entries"
+        )
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for index, config in enumerate(configs):
+        config_where = f"{where}.configs[{index}]"
+        if not isinstance(config, dict):
+            raise TypeError(f"{config_where} must be a dict")
+        if tuple(config.keys()) != ("name", "weights"):
+            raise ValueError(
+                f"{config_where} must have exactly the keys name, weights "
+                "in order"
+            )
+
+        name = config["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{config_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{config_where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate configuration name: {name!r}")
+        seen_names.add(name)
+
+        weights = _validate_weights(
+            config["weights"], n_elements, where=f"{config_where}.weights"
+        )
+        if not any(weight > 0 for weight in weights):
+            raise ValueError(
+                f"{config_where}.weights must contain at least one "
+                "positive item"
+            )
+        names.append(name)
+
+    if reference != names[0]:
+        raise ValueError(
+            f"{where}.reference must be the first configuration name"
+        )
+
+    data = comparison["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_scenarios = len(scenarios)
+    n_regions = len(regions)
+    if len(data) != (len(configs) - 1) * n_scenarios * n_regions:
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(configuration, scenario, region) triple, excluding the "
+            "reference configuration"
+        )
+
+    row_index = 0
+    for config_name in names[1:]:
+        for scenario in scenarios:
+            for region in regions:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _REGION_WEIGHT_COMPARE_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys config, "
+                        "scenario, region, base_covered, covered, rank, "
+                        "magnitude, uncertainty in order"
+                    )
+
+                if not isinstance(row["config"], str):
+                    raise TypeError(f"{row_where}.config must be a str")
+                if row["config"] != config_name:
+                    raise ValueError(
+                        f"{row_where}.config must be {config_name!r} for "
+                        "its position"
+                    )
+                if not isinstance(row["scenario"], str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row["scenario"] != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for "
+                        "its position"
+                    )
+                if not isinstance(row["region"], str):
+                    raise TypeError(f"{row_where}.region must be a str")
+                if row["region"] != region:
+                    raise ValueError(
+                        f"{row_where}.region must be {region!r} for its "
+                        "position"
+                    )
+
+                for count_name in ("base_covered", "covered"):
+                    count = row[count_name]
+                    if not isinstance(count, int) or isinstance(count, bool):
+                        raise TypeError(
+                            f"{row_where}.{count_name} must be a non-bool "
+                            "int"
+                        )
+                    if count < 0:
+                        raise ValueError(
+                            f"{row_where}.{count_name} must be non-negative"
+                        )
+
+                rank = row["rank"]
+                magnitude = row["magnitude"]
+                uncertainty = row["uncertainty"]
+                if rank is None or magnitude is None or uncertainty is None:
+                    if not (
+                        rank is None
+                        and magnitude is None
+                        and uncertainty is None
+                    ):
+                        raise ValueError(
+                            f"{row_where}.rank, magnitude and uncertainty "
+                            "must be all None or all numbers"
+                        )
+                else:
+                    _validate_number(
+                        rank, f"{row_where}.rank", nullable=False
+                    )
+                    _validate_number(
+                        magnitude, f"{row_where}.magnitude", nullable=False
+                    )
+                    _validate_number(
+                        uncertainty,
+                        f"{row_where}.uncertainty",
+                        nullable=False,
+                    )
+                    if uncertainty < 0:
+                        raise ValueError(
+                            f"{row_where}.uncertainty must be non-negative"
+                        )
+                row_index += 1
+
+    return reference, configs, scenarios, elements, regions, data
+
+
+_REGION_WEIGHT_SUMMARY_SCHEMA = "climate-grid/rws-v1"
+_REGION_WEIGHT_SUMMARY_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "configs",
+    "scenarios",
+    "elements",
+    "regions",
+    "data",
+)
+
+
+def weight_summary(comparison, *, minimum: int = 1) -> dict:
+    """Summarize weight-comparison rows per scenario and region.
+
+    ``comparison`` is validated exactly as a complete
+    :func:`compare_region_weights` result (schema
+    ``climate-grid/rwc-v1``).  ``minimum`` is a non-bool positive int.
+
+    For every scenario (in scenario order) and region (in region order),
+    the configuration rows whose ``rank``, ``magnitude`` and
+    ``uncertainty`` are all non-``None`` are collected and ``count`` is
+    their number.  When ``count`` is below ``minimum`` the seven
+    statistics are all ``None``; otherwise ``rank_min``/``rank_max`` and
+    ``magnitude_min``/``magnitude_max`` are the extremes, ``rank_std`` is
+    ``sqrt(Σ(rank - r̄)² / n)`` with ``r̄`` the arithmetic mean of the
+    collected ranks, ``magnitude_std`` is the same expression over the
+    magnitudes and ``uncertainty`` is ``hypot(*u) / n`` over the
+    collected uncertainties.
+
+    The returned mapping uses the key order ``schema, reference, configs,
+    scenarios, elements, regions, data``; ``schema`` is
+    ``climate-grid/rws-v1`` and the metadata echo ``comparison``
+    unchanged.  ``data`` is a flat list in scenario-then-region order;
+    each row uses the key order ``scenario, region, count, rank_min,
+    rank_max, magnitude_min, magnitude_max, rank_std, magnitude_std,
+    uncertainty``.  ``count`` is an int, the statistics are floats or
+    ``None`` and every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    reference, configs, scenarios, elements, regions, data = (
+        _validate_region_weight_compare_result(comparison)
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_scenarios = len(scenarios)
+    n_regions = len(regions)
+    n_configs = len(configs) - 1
+
+    rows = []
+    for s_index, scenario in enumerate(scenarios):
+        for r_index, region in enumerate(regions):
+            ranks = []
+            magnitudes = []
+            uncertainties = []
+            for c_index in range(n_configs):
+                row = data[
+                    (c_index * n_scenarios + s_index) * n_regions + r_index
+                ]
+                if row["rank"] is None:
+                    continue
+                ranks.append(float(row["rank"]))
+                magnitudes.append(float(row["magnitude"]))
+                uncertainties.append(float(row["uncertainty"]))
+            count = len(ranks)
+
+            if count < minimum:
+                rows.append(
+                    {
+                        "scenario": scenario,
+                        "region": region,
+                        "count": count,
+                        "rank_min": None,
+                        "rank_max": None,
+                        "magnitude_min": None,
+                        "magnitude_max": None,
+                        "rank_std": None,
+                        "magnitude_std": None,
+                        "uncertainty": None,
+                    }
+                )
+                continue
+
+            try:
+                rank_mean = math.fsum(ranks) / count
+                magnitude_mean = math.fsum(magnitudes) / count
+                rank_std = math.sqrt(
+                    math.fsum(
+                        (rank - rank_mean) ** 2 for rank in ranks
+                    )
+                    / count
+                )
+                magnitude_std = math.sqrt(
+                    math.fsum(
+                        (magnitude - magnitude_mean) ** 2
+                        for magnitude in magnitudes
+                    )
+                    / count
+                )
+                uncertainty = math.hypot(*uncertainties) / count
+            except OverflowError:
+                raise ValueError("results must be finite") from None
+            if not (
+                _is_finite(rank_std)
+                and _is_finite(magnitude_std)
+                and _is_finite(uncertainty)
+            ):
+                raise ValueError("results must be finite")
+
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "region": region,
+                    "count": count,
+                    "rank_min": _round_output(min(ranks)),
+                    "rank_max": _round_output(max(ranks)),
+                    "magnitude_min": _round_output(min(magnitudes)),
+                    "magnitude_max": _round_output(max(magnitudes)),
+                    "rank_std": _round_output(rank_std),
+                    "magnitude_std": _round_output(magnitude_std),
+                    "uncertainty": _round_output(uncertainty),
+                }
+            )
+
+    return {
+        "schema": _REGION_WEIGHT_SUMMARY_SCHEMA,
+        "reference": reference,
+        "configs": configs,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "data": rows,
+    }
