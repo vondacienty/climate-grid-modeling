@@ -21364,3 +21364,330 @@ def scale_rank_consensus(result, *, minimum: int = 2) -> dict:
         "scenarios": list(scenarios),
         "data": output_rows,
     }
+
+
+_SCALE_RANK_CONSENSUS_KEYS = (
+    "schema",
+    "scales",
+    "names",
+    "reference",
+    "scenarios",
+    "data",
+)
+_RC_GRADE_SCHEMA = "climate-grid/rc-grade-v1"
+_RC_GRADE_OUTPUT_KEYS = ("schema", "data", "summary")
+_RC_GRADE_ROW_KEYS = ("scenario", "level", "conflict")
+_RC_GRADE_LEVELS = ("missing", "strong", "moderate", "conflict")
+_RC_GRADE_SUMMARY_KEYS = (
+    "total",
+    "valid",
+    "missing",
+    "strong",
+    "moderate",
+    "conflict",
+)
+
+
+def _validate_scale_rank_consensus_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list]:
+    """Validate a complete :func:`scale_rank_consensus` result.
+
+    Returns the ``scenarios`` axis and the ``data`` rows, checking the
+    full ``climate-grid/rh-consensus-v1`` generation contract: key
+    order, the echoed axes, positional scenario matching, the
+    ``count``/``coverage`` bounds and their recomputed relationship,
+    the all-``None`` or all-present ``mean_rank, dispersion,
+    stability_change, interval`` invariant and the recomputation of
+    ``dispersion`` (and the rounding) of every present row.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _SCALE_RANK_CONSENSUS_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scales, "
+            "names, reference, scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _SCALE_RANK_CONSENSUS_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_SCALE_RANK_CONSENSUS_SCHEMA!r}"
+        )
+
+    scales = _validate_string_list(
+        result["scales"], f"{where}.scales", minimum=2
+    )
+    names = _validate_string_list(
+        result["names"], f"{where}.names", minimum=2
+    )
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios", minimum=0
+    )
+    if reference in scenarios:
+        raise ValueError(
+            f"{where}.scenarios must not contain the reference "
+            f"scenario {reference!r}"
+        )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    n_scales = len(scales)
+    n_scenarios = len(scenarios)
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _SCALE_RANK_CONSENSUS_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, "
+                "count, coverage, mean_rank, dispersion, "
+                "stability_change, interval in order"
+            )
+
+        scenario = row["scenario"]
+        if not isinstance(scenario, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if scenario != scenarios[row_index]:
+            raise ValueError(
+                f"{row_where}.scenario {scenario!r} must equal "
+                f"{where}.scenarios[{row_index}] "
+                f"({scenarios[row_index]!r})"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if not 0 <= count <= n_scales:
+            raise ValueError(
+                f"{row_where}.count must be between 0 and the number "
+                "of scales"
+            )
+
+        coverage = row["coverage"]
+        _validate_number(coverage, f"{row_where}.coverage", nullable=False)
+        if not 0 <= coverage <= 1:
+            raise ValueError(
+                f"{row_where}.coverage must be between 0 and 1"
+            )
+        if coverage != _round_output(count / n_scales):
+            raise ValueError(
+                f"{row_where}.coverage must equal count divided by "
+                "the number of scales"
+            )
+
+        mean_rank = row["mean_rank"]
+        dispersion = row["dispersion"]
+        stability_change = row["stability_change"]
+        interval = row["interval"]
+        members = (mean_rank, dispersion, stability_change, interval)
+        present = [value is not None for value in members]
+        if any(present) and not all(present):
+            raise ValueError(
+                f"{row_where}: mean_rank, dispersion, "
+                "stability_change and interval must be all None or "
+                "all present"
+            )
+        if not any(present):
+            continue
+
+        if count < 1:
+            raise ValueError(
+                f"{row_where}.count must be positive when mean_rank, "
+                "dispersion, stability_change and interval are present"
+            )
+
+        _validate_number(
+            mean_rank, f"{row_where}.mean_rank", nullable=False
+        )
+        if not 1 <= mean_rank <= n_scenarios:
+            raise ValueError(
+                f"{row_where}.mean_rank must be a valid scenario rank"
+            )
+        if mean_rank != _round_output(mean_rank):
+            raise ValueError(
+                f"{row_where}.mean_rank must be rounded to 12 digits"
+            )
+
+        _validate_number(
+            dispersion, f"{row_where}.dispersion", nullable=False
+        )
+        if dispersion < 0:
+            raise ValueError(
+                f"{row_where}.dispersion must be non-negative"
+            )
+
+        _validate_number(
+            stability_change,
+            f"{row_where}.stability_change",
+            nullable=False,
+        )
+        if not -1 <= stability_change <= 1:
+            raise ValueError(
+                f"{row_where}.stability_change must be between -1 and 1"
+            )
+        if stability_change != _round_output(stability_change):
+            raise ValueError(
+                f"{row_where}.stability_change must be rounded to "
+                "12 digits"
+            )
+
+        if not isinstance(interval, list):
+            raise TypeError(f"{row_where}.interval must be a list")
+        if len(interval) != 2:
+            raise ValueError(
+                f"{row_where}.interval must contain exactly 2 items"
+            )
+        _validate_number(
+            interval[0], f"{row_where}.interval[0]", nullable=False
+        )
+        _validate_number(
+            interval[1], f"{row_where}.interval[1]", nullable=False
+        )
+        if not 1 <= interval[0] <= interval[1] <= n_scenarios:
+            raise ValueError(
+                f"{row_where}.interval bounds must be valid ranks "
+                "with the lower bound first"
+            )
+        if interval[0] != _round_output(interval[0]) or interval[
+            1
+        ] != _round_output(interval[1]):
+            raise ValueError(
+                f"{row_where}.interval bounds must be rounded to "
+                "12 digits"
+            )
+        expected_dispersion = _round_output(
+            (interval[1] - interval[0]) / 2
+        )
+        if dispersion != expected_dispersion:
+            raise ValueError(
+                f"{row_where}.dispersion must equal half the "
+                "interval width"
+            )
+
+    return scenarios, data
+
+
+def consistency(
+    result, *, coverage: float = 0.5, spread: float = 1.0, change: float = 0.25
+) -> dict:
+    """Grade per-scenario consistency of a cross-scale rank consensus.
+
+    ``result`` must be a complete :func:`scale_rank_consensus` result
+    (schema ``climate-grid/rh-consensus-v1``), validated against that
+    generation contract.  ``coverage`` must be a finite non-bool
+    number between 0 and 1 and ``spread`` and ``change`` finite
+    non-bool non-negative numbers.
+
+    For every consensus row (in ``scenarios`` order) the scenario is
+    invalid when any of ``mean_rank``, ``dispersion``,
+    ``stability_change`` and ``interval`` is ``None`` or the row
+    ``coverage`` is below the ``coverage`` threshold; invalid rows
+    grade as ``missing`` with ``conflict`` ``None``.  A valid row
+    grades as ``conflict`` (``conflict`` ``True``) when
+    ``dispersion`` exceeds ``spread`` or
+    ``abs(stability_change)`` exceeds ``change``.  Otherwise, when
+    the row coverage is 1, ``dispersion`` is at most half of
+    ``spread`` and the absolute stability change is at most half of
+    ``change``, the row grades as ``strong``; every remaining valid
+    row grades as ``moderate``.  ``strong`` and ``moderate`` rows
+    carry ``conflict`` ``False``.
+
+    The returned mapping uses the key order ``schema, data,
+    summary``; ``schema`` is ``climate-grid/rc-grade-v1``.  ``data``
+    follows the scenario order; each row uses the key order
+    ``scenario, level, conflict``.  ``summary`` uses the key order
+    ``total, valid, missing, strong, moderate, conflict`` and every
+    value is a non-bool int.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    scenarios, data = _validate_scale_rank_consensus_result(result)
+
+    for name, threshold in (
+        ("coverage", coverage),
+        ("spread", spread),
+        ("change", change),
+    ):
+        if not isinstance(threshold, (int, float)) or isinstance(
+            threshold, bool
+        ):
+            raise TypeError(f"{name} must be a non-bool number")
+        if not _is_finite(threshold):
+            raise ValueError(f"{name} must be finite")
+    if not 0 <= coverage <= 1:
+        raise ValueError("coverage must be between 0 and 1")
+    if spread < 0:
+        raise ValueError("spread must be non-negative")
+    if change < 0:
+        raise ValueError("change must be non-negative")
+
+    rows = []
+    valid = 0
+    counts = {"missing": 0, "strong": 0, "moderate": 0, "conflict": 0}
+    for row in data:
+        mean_rank = row["mean_rank"]
+        dispersion = row["dispersion"]
+        stability_change = row["stability_change"]
+        interval = row["interval"]
+        if (
+            mean_rank is None
+            or dispersion is None
+            or stability_change is None
+            or interval is None
+            or row["coverage"] < coverage
+        ):
+            level = "missing"
+            conflict = None
+        else:
+            valid += 1
+            if dispersion > spread or abs(stability_change) > change:
+                level = "conflict"
+                conflict = True
+            elif (
+                row["coverage"] == 1
+                and dispersion <= spread / 2
+                and abs(stability_change) <= change / 2
+            ):
+                level = "strong"
+                conflict = False
+            else:
+                level = "moderate"
+                conflict = False
+        counts[level] += 1
+        rows.append(
+            {
+                "scenario": row["scenario"],
+                "level": level,
+                "conflict": conflict,
+            }
+        )
+
+    return {
+        "schema": _RC_GRADE_SCHEMA,
+        "data": rows,
+        "summary": {
+            "total": len(scenarios),
+            "valid": valid,
+            "missing": counts["missing"],
+            "strong": counts["strong"],
+            "moderate": counts["moderate"],
+            "conflict": counts["conflict"],
+        },
+    }
