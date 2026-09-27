@@ -16233,6 +16233,26 @@ _REGION_DELTA_RANK_AGGREGATE_ROW_KEYS = (
     "magnitude",
     "uncertainty",
 )
+_REGION_WEIGHT_COMPARE_SCHEMA = "climate-grid/rwc-v1"
+_REGION_WEIGHT_COMPARE_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "configs",
+    "scenarios",
+    "elements",
+    "regions",
+    "data",
+)
+_REGION_WEIGHT_COMPARE_ROW_KEYS = (
+    "config",
+    "scenario",
+    "region",
+    "base_covered",
+    "covered",
+    "rank",
+    "magnitude",
+    "uncertainty",
+)
 
 
 def _validate_region_consensus_result(
@@ -17547,5 +17567,121 @@ def aggregate_region_delta(
         "elements": list(elements),
         "regions": list(regions),
         "weights": list(weights),
+        "data": rows,
+    }
+
+
+def compare_region_weights(result, configs) -> dict:
+    """Compare element-weight configurations on region-delta aggregates.
+
+    ``result`` and each configuration's ``weights`` are validated exactly
+    as in :func:`aggregate_region_delta` (``result`` is a complete
+    :func:`rank_region_delta_multi` result, schema
+    ``climate-grid/rdr-multi-v1``; each ``weights`` list has one finite
+    non-bool non-negative number per ``result.elements`` entry, in element
+    order, with at least one positive item).  ``configs`` is a list of at
+    least two dicts; each dict must have exactly the keys ``name,
+    weights`` in that order and ``name`` must be a unique non-empty str.
+
+    Every configuration is aggregated exactly as in
+    :func:`aggregate_region_delta` with ``min_elements=1``; the first
+    configuration is the baseline.  For every remaining configuration (in
+    input order), scenario (in scenario order) and region (in region
+    order) the configuration row is paired with the baseline row for the
+    same scenario and region.  When either side carries ``None`` for
+    ``rank_change``, ``magnitude`` or ``uncertainty``, the output ``rank``,
+    ``magnitude`` and ``uncertainty`` are all ``None``; otherwise ``rank``
+    and ``magnitude`` are the configuration value minus the baseline value
+    and ``uncertainty`` is ``hypot(u0, u1)`` over the baseline and
+    configuration uncertainties.
+
+    The returned mapping uses the key order ``schema, reference, configs,
+    scenarios, elements, regions, data``; ``schema`` is
+    ``climate-grid/rwc-v1``, ``reference`` is the first configuration
+    name, ``configs`` echoes the input configurations and ``scenarios``,
+    ``elements`` and ``regions`` echo the result axes.  ``data`` is a flat
+    list in configuration-then-scenario-then-region order (the baseline
+    configuration is not emitted); each row uses the key order ``config,
+    scenario, region, base_covered, covered, rank, magnitude,
+    uncertainty``.  ``base_covered`` and ``covered`` are the baseline and
+    configuration ``covered`` ints copied verbatim, ``rank``,
+    ``magnitude`` and ``uncertainty`` are floats or ``None`` and every
+    output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including non-finite
+    compared values.
+    """
+    reference, scenarios, elements, regions, data = (
+        _validate_region_delta_rank_multi_result(result)
+    )
+    n_elements = len(elements)
+    names = _validate_rank_configs(configs, n_elements, minimum=2)
+
+    # Aggregate every configuration exactly as in aggregate_region_delta
+    # with min_elements=1; the first configuration is the baseline.  The
+    # aggregate rows follow the flat scenario-then-region order.
+    aggregated = [
+        aggregate_region_delta(result, config["weights"], min_elements=1)[
+            "data"
+        ]
+        for config in configs
+    ]
+    base_rows = aggregated[0]
+
+    rows = []
+    for config, config_rows in zip(configs[1:], aggregated[1:]):
+        for base_row, row in zip(base_rows, config_rows):
+            if any(
+                value is None
+                for value in (
+                    base_row["rank_change"],
+                    base_row["magnitude"],
+                    base_row["uncertainty"],
+                    row["rank_change"],
+                    row["magnitude"],
+                    row["uncertainty"],
+                )
+            ):
+                rank = magnitude = uncertainty = None
+            else:
+                rank = row["rank_change"] - base_row["rank_change"]
+                magnitude = row["magnitude"] - base_row["magnitude"]
+                uncertainty = math.hypot(
+                    base_row["uncertainty"], row["uncertainty"]
+                )
+                if not (
+                    _is_finite(rank)
+                    and _is_finite(magnitude)
+                    and _is_finite(uncertainty)
+                ):
+                    raise ValueError("compared results must be finite")
+                rank = _round_output(rank)
+                magnitude = _round_output(magnitude)
+                uncertainty = _round_output(uncertainty)
+            rows.append(
+                {
+                    "config": config["name"],
+                    "scenario": row["scenario"],
+                    "region": row["region"],
+                    "base_covered": base_row["covered"],
+                    "covered": row["covered"],
+                    "rank": rank,
+                    "magnitude": magnitude,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _REGION_WEIGHT_COMPARE_SCHEMA,
+        "reference": names[0],
+        "configs": [
+            {"name": config["name"], "weights": list(config["weights"])}
+            for config in configs
+        ],
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
         "data": rows,
     }
