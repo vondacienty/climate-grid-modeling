@@ -17456,7 +17456,33 @@ def aggregate_region_delta(
     if min_elements < 1:
         raise ValueError("min_elements must be positive")
 
-    n_scenarios = len(scenarios)
+    rows = _region_delta_aggregate_rows(
+        scenarios, elements, regions, data, weights, min_elements
+    )
+
+    return {
+        "schema": _REGION_DELTA_RANK_AGGREGATE_SCHEMA,
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "weights": list(weights),
+        "data": rows,
+    }
+
+
+def _region_delta_aggregate_rows(
+    scenarios, elements, regions, data, weights, min_elements: int
+) -> list[dict]:
+    """Per-scenario/per-region aggregate rows in scenario-then-region order.
+
+    Implements the aggregation described in :func:`aggregate_region_delta`
+    for already-validated inputs: positive-weight elements whose row has
+    ``state`` ``both`` are included and ``covered`` is their count; below
+    ``min_elements`` the three stats are ``None``.  Raises ``ValueError``
+    when an aggregated value is not finite.
+    """
+    n_elements = len(elements)
     n_regions = len(regions)
     rows = []
     for s_index, scenario in enumerate(scenarios):
@@ -17540,12 +17566,190 @@ def aggregate_region_delta(
                 }
             )
 
+    return rows
+
+
+_REGION_WEIGHT_COMPARE_SCHEMA = "climate-grid/rwc-v1"
+_REGION_WEIGHT_COMPARE_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "configs",
+    "scenarios",
+    "elements",
+    "regions",
+    "data",
+)
+_REGION_WEIGHT_COMPARE_ROW_KEYS = (
+    "config",
+    "scenario",
+    "region",
+    "base_covered",
+    "covered",
+    "rank",
+    "magnitude",
+    "uncertainty",
+)
+
+
+def compare_region_weights(result, configs) -> dict:
+    """Compare region-delta aggregations under alternative weight sets.
+
+    ``result`` is validated exactly as in :func:`aggregate_region_delta`
+    (a complete :func:`rank_region_delta_multi` result, schema
+    ``climate-grid/rdr-multi-v1``).  ``configs`` is a list of at least two
+    dicts; each dict must have exactly the keys ``name, weights`` in that
+    order.  ``name`` is a unique non-empty str and ``weights`` follows the
+    :func:`aggregate_region_delta` weights contract: one finite non-bool
+    non-negative number per ``result.elements`` entry, in element order,
+    with at least one positive item.
+
+    Each configuration is aggregated exactly as in
+    :func:`aggregate_region_delta` with ``min_elements`` 1; the first
+    configuration is the reference.  For every remaining configuration (in
+    input order), then every scenario (in scenario order) and region (in
+    region order), the two aggregations are paired: ``base_covered`` and
+    ``covered`` echo the reference and current ``covered`` counts.  When
+    either side has ``rank_change``, ``magnitude`` or ``uncertainty`` equal
+    to ``None``, the output ``rank``, ``magnitude`` and ``uncertainty`` are
+    all ``None``; otherwise ``rank`` is current minus reference
+    ``rank_change``, ``magnitude`` is current minus reference ``magnitude``
+    and ``uncertainty`` is ``hypot(reference_uncertainty,
+    current_uncertainty)``.
+
+    The returned mapping uses the key order ``schema, reference, configs,
+    scenarios, elements, regions, data``; ``schema`` is
+    ``climate-grid/rwc-v1``, ``reference`` is the first configuration name,
+    ``configs`` echoes the input configurations unchanged and the
+    ``scenarios``, ``elements`` and ``regions`` axes echo ``result``.
+    ``data`` is a flat list in configuration-then-scenario-then-region
+    order (only the non-reference configurations); each row uses the key
+    order ``config, scenario, region, base_covered, covered, rank,
+    magnitude, uncertainty``.  ``base_covered`` and ``covered`` are ints,
+    ``rank``, ``magnitude`` and ``uncertainty`` are floats or ``None`` and
+    every output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including non-finite
+    results.
+    """
+    _reference, scenarios, elements, regions, data = (
+        _validate_region_delta_rank_multi_result(result)
+    )
+    n_elements = len(elements)
+
+    if not isinstance(configs, list):
+        raise TypeError("configs must be a list")
+    if len(configs) < 2:
+        raise ValueError("configs must contain at least 2 entries")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    weights_by_config: list[list] = []
+    for index, config in enumerate(configs):
+        where = f"configs[{index}]"
+        if not isinstance(config, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(config.keys()) != ("name", "weights"):
+            raise ValueError(
+                f"{where} must have exactly the keys name, weights in order"
+            )
+
+        name = config["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate configuration name: {name!r}")
+        seen_names.add(name)
+
+        weights = _validate_weights(
+            config["weights"], n_elements, where=f"{where}.weights"
+        )
+        if not any(weight > 0 for weight in weights):
+            raise ValueError(
+                f"{where}.weights must contain at least one positive item"
+            )
+
+        names.append(name)
+        weights_by_config.append(weights)
+
+    aggregate_rows = [
+        _region_delta_aggregate_rows(
+            scenarios, elements, regions, data, weights, 1
+        )
+        for weights in weights_by_config
+    ]
+
+    n_regions = len(regions)
+    base_rows = aggregate_rows[0]
+    rows = []
+    for config_index in range(1, len(configs)):
+        config_name = names[config_index]
+        current_rows = aggregate_rows[config_index]
+        for s_index, scenario in enumerate(scenarios):
+            for r_index, region in enumerate(regions):
+                position = s_index * n_regions + r_index
+                base_row = base_rows[position]
+                current_row = current_rows[position]
+
+                base_rank = base_row["rank_change"]
+                base_magnitude = base_row["magnitude"]
+                base_uncertainty = base_row["uncertainty"]
+                current_rank = current_row["rank_change"]
+                current_magnitude = current_row["magnitude"]
+                current_uncertainty = current_row["uncertainty"]
+
+                if (
+                    base_rank is None
+                    or base_magnitude is None
+                    or base_uncertainty is None
+                    or current_rank is None
+                    or current_magnitude is None
+                    or current_uncertainty is None
+                ):
+                    rank = None
+                    magnitude_delta = None
+                    uncertainty_delta = None
+                else:
+                    rank = current_rank - base_rank
+                    magnitude_delta = current_magnitude - base_magnitude
+                    try:
+                        uncertainty_delta = math.hypot(
+                            base_uncertainty, current_uncertainty
+                        )
+                    except OverflowError:
+                        raise ValueError("results must be finite") from None
+                    if not (
+                        _is_finite(rank)
+                        and _is_finite(magnitude_delta)
+                        and _is_finite(uncertainty_delta)
+                    ):
+                        raise ValueError("results must be finite")
+                    rank = _round_output(rank)
+                    magnitude_delta = _round_output(magnitude_delta)
+                    uncertainty_delta = _round_output(uncertainty_delta)
+
+                rows.append(
+                    {
+                        "config": config_name,
+                        "scenario": scenario,
+                        "region": region,
+                        "base_covered": base_row["covered"],
+                        "covered": current_row["covered"],
+                        "rank": rank,
+                        "magnitude": magnitude_delta,
+                        "uncertainty": uncertainty_delta,
+                    }
+                )
+
     return {
-        "schema": _REGION_DELTA_RANK_AGGREGATE_SCHEMA,
-        "reference": reference,
+        "schema": _REGION_WEIGHT_COMPARE_SCHEMA,
+        "reference": names[0],
+        "configs": configs,
         "scenarios": list(scenarios),
         "elements": list(elements),
         "regions": list(regions),
-        "weights": list(weights),
         "data": rows,
     }
