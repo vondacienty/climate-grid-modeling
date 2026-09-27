@@ -16212,6 +16212,25 @@ _REGION_DELTA_RANK_MULTI_ROW_KEYS = (
     "magnitude",
     "uncertainty",
 )
+_REGION_DELTA_RANK_MULTI_STATES = ("both", "added", "dropped", "missing")
+_REGION_DELTA_AGGREGATE_SCHEMA = "climate-grid/rdr-aggregate-v1"
+_REGION_DELTA_AGGREGATE_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "scenarios",
+    "elements",
+    "regions",
+    "weights",
+    "data",
+)
+_REGION_DELTA_AGGREGATE_ROW_KEYS = (
+    "scenario",
+    "region",
+    "covered",
+    "rank_change",
+    "magnitude",
+    "uncertainty",
+)
 
 
 def _validate_region_consensus_result(
@@ -17232,5 +17251,315 @@ def rank_region_delta_multi(items, *, minimum: int = 1) -> dict:
         "scenarios": list(scenarios),
         "elements": elements,
         "regions": list(regions),
+        "data": rows,
+    }
+
+
+def _validate_region_delta_rank_multi_result(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`rank_region_delta_multi` result.
+
+    Returns the ``reference``, ``scenarios``, ``elements`` and ``regions``
+    axes and the flat ``data`` row list.  ``data`` must hold one row per
+    ``(scenario, element, region)`` triple in
+    scenario-then-element-then-region order and every row must follow the
+    ``climate-grid/rdr-multi-v1`` contract, including the
+    ``state == "both"`` versus all-``None`` ``rank``/``magnitude``/
+    ``uncertainty`` combination.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_DELTA_RANK_MULTI_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, "
+            "scenarios, elements, regions, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_DELTA_RANK_MULTI_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_DELTA_RANK_MULTI_SCHEMA!r}"
+        )
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    if reference in scenarios:
+        raise ValueError(
+            f"{where}.reference must not appear in {where}.scenarios"
+        )
+    elements = _validate_string_list(
+        result["elements"], f"{where}.elements"
+    )
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios) * len(elements) * len(regions):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(scenario, element, region) combination"
+        )
+
+    row_index = 0
+    for scenario in scenarios:
+        for element in elements:
+            for region in regions:
+                row_where = f"{where}.data[{row_index}]"
+                row = data[row_index]
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _REGION_DELTA_RANK_MULTI_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys scenario, "
+                        "element, region, state, rank, magnitude, "
+                        "uncertainty in order"
+                    )
+                if not isinstance(row["scenario"], str):
+                    raise TypeError(f"{row_where}.scenario must be a str")
+                if row["scenario"] != scenario:
+                    raise ValueError(
+                        f"{row_where}.scenario must be {scenario!r} for "
+                        "its scenario-then-element-then-region position"
+                    )
+                if not isinstance(row["element"], str):
+                    raise TypeError(f"{row_where}.element must be a str")
+                if row["element"] != element:
+                    raise ValueError(
+                        f"{row_where}.element must be {element!r} for "
+                        "its scenario-then-element-then-region position"
+                    )
+                if not isinstance(row["region"], str):
+                    raise TypeError(f"{row_where}.region must be a str")
+                if row["region"] != region:
+                    raise ValueError(
+                        f"{row_where}.region must be {region!r} for "
+                        "its scenario-then-element-then-region position"
+                    )
+
+                state = row["state"]
+                if not isinstance(state, str):
+                    raise TypeError(f"{row_where}.state must be a str")
+                if state not in _REGION_DELTA_RANK_MULTI_STATES:
+                    raise ValueError(
+                        f"{row_where}.state must be one of 'both', "
+                        "'added', 'dropped', 'missing'"
+                    )
+
+                rank = row["rank"]
+                if rank is not None and (
+                    not isinstance(rank, int) or isinstance(rank, bool)
+                ):
+                    raise TypeError(
+                        f"{row_where}.rank must be a non-bool int or None"
+                    )
+                _validate_number(
+                    row["magnitude"], f"{row_where}.magnitude", nullable=True
+                )
+                _validate_number(
+                    row["uncertainty"],
+                    f"{row_where}.uncertainty",
+                    nullable=True,
+                )
+                uncertainty = row["uncertainty"]
+                if uncertainty is not None and uncertainty < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+
+                present = (
+                    rank is not None,
+                    row["magnitude"] is not None,
+                    uncertainty is not None,
+                )
+                if any(present) and not all(present):
+                    raise ValueError(
+                        f"{row_where}: rank, magnitude and uncertainty "
+                        "must be all None or all present"
+                    )
+                if all(present) != (state == "both"):
+                    raise ValueError(
+                        f"{row_where}: rank, magnitude and uncertainty "
+                        "must be present exactly when state is 'both'"
+                    )
+                row_index += 1
+
+    return reference, scenarios, elements, regions, data
+
+
+def aggregate_region_delta(result, weights, *, min_elements: int = 1) -> dict:
+    """Aggregate per-element region rank deltas into scenario/region rows.
+
+    ``result`` must be a complete :func:`rank_region_delta_multi` result
+    (schema ``climate-grid/rdr-multi-v1``) with exactly the keys
+    ``schema, reference, scenarios, elements, regions, data`` in that
+    order; every member is validated against that contract, including
+    the scenario-then-element-then-region ``data`` row order, each
+    row's key order ``scenario, element, region, state, rank,
+    magnitude, uncertainty`` and the ``state == "both"`` versus
+    all-``None`` ``rank``/``magnitude``/``uncertainty`` combination.
+    ``weights`` is a list with one item per ``result.elements`` entry,
+    in element order; each item must be a finite non-bool non-negative
+    number and at least one item must be positive.  ``min_elements``
+    must be a non-bool positive int.
+
+    For every scenario (in scenario order) and every region (in region
+    order) the elements with a positive weight and ``state == "both"``
+    are included; ``covered`` is the number of included elements.  When
+    ``covered`` is below ``min_elements``, ``rank_change``,
+    ``magnitude`` and ``uncertainty`` are all ``None``.  Otherwise the
+    included weights are divided by the largest one into coefficients
+    ``a`` and, with ``A = fsum(a)``, ``rank_change`` is
+    ``fsum(a × rank) / A``, ``magnitude`` is ``fsum(a × magnitude) / A``
+    and ``uncertainty`` is ``hypot(a × uncertainty) / A`` over the
+    included elements.
+
+    The returned mapping uses the key order ``schema, reference,
+    scenarios, elements, regions, weights, data``; ``schema`` is
+    ``climate-grid/rdr-aggregate-v1`` and ``reference``, ``scenarios``,
+    ``elements``, ``regions`` and ``weights`` echo the inputs.
+    ``data`` is a flat list in scenario-then-region order; each row
+    uses the key order ``scenario, region, covered, rank_change,
+    magnitude, uncertainty``.  ``covered`` is an int, ``rank_change``,
+    ``magnitude`` and ``uncertainty`` are floats or ``None`` and every
+    output float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation or a non-finite
+    result.
+    """
+    reference, scenarios, elements, regions, data = (
+        _validate_region_delta_rank_multi_result(result)
+    )
+
+    if not isinstance(weights, list):
+        raise TypeError("weights must be a list")
+    if len(weights) != len(elements):
+        raise ValueError(
+            f"weights must have one item per result element "
+            f"({len(elements)} expected)"
+        )
+    for index, weight in enumerate(weights):
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise TypeError(
+                f"weights[{index}] must be a finite non-bool int or float"
+            )
+        if not _is_finite(weight):
+            raise ValueError(f"weights[{index}] must be finite")
+        if weight < 0:
+            raise ValueError(f"weights[{index}] must be non-negative")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError("weights must contain at least one positive item")
+
+    if not isinstance(min_elements, int) or isinstance(min_elements, bool):
+        raise TypeError("min_elements must be a non-bool int")
+    if min_elements < 1:
+        raise ValueError("min_elements must be positive")
+
+    n_elements = len(elements)
+    n_regions = len(regions)
+
+    rows = []
+    for s_index, scenario in enumerate(scenarios):
+        for r_index, region in enumerate(regions):
+            included = [
+                (
+                    weights[e_index],
+                    data[
+                        (s_index * n_elements + e_index) * n_regions
+                        + r_index
+                    ],
+                )
+                for e_index in range(n_elements)
+                if weights[e_index] > 0
+                and data[
+                    (s_index * n_elements + e_index) * n_regions + r_index
+                ]["state"]
+                == "both"
+            ]
+            covered = len(included)
+            if covered < min_elements:
+                rows.append(
+                    {
+                        "scenario": scenario,
+                        "region": region,
+                        "covered": covered,
+                        "rank_change": None,
+                        "magnitude": None,
+                        "uncertainty": None,
+                    }
+                )
+                continue
+
+            max_weight = max(weight for weight, _row in included)
+            coeffs = [weight / max_weight for weight, _row in included]
+            coeff_total = math.fsum(coeffs)
+            row_where = f"data[{scenario!r}][{region!r}]"
+            try:
+                rank_change = (
+                    math.fsum(
+                        coeff * row["rank"]
+                        for coeff, (_weight, row) in zip(coeffs, included)
+                    )
+                    / coeff_total
+                )
+                magnitude = (
+                    math.fsum(
+                        coeff * row["magnitude"]
+                        for coeff, (_weight, row) in zip(coeffs, included)
+                    )
+                    / coeff_total
+                )
+                uncertainty = (
+                    math.hypot(
+                        *[
+                            coeff * row["uncertainty"]
+                            for coeff, (_weight, row) in zip(
+                                coeffs, included
+                            )
+                        ]
+                    )
+                    / coeff_total
+                )
+            except OverflowError:
+                raise ValueError(
+                    f"{row_where} results must be finite"
+                ) from None
+            if not (
+                _is_finite(rank_change)
+                and _is_finite(magnitude)
+                and _is_finite(uncertainty)
+            ):
+                raise ValueError(f"{row_where} results must be finite")
+
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "region": region,
+                    "covered": covered,
+                    "rank_change": _round_output(rank_change),
+                    "magnitude": _round_output(magnitude),
+                    "uncertainty": _round_output(uncertainty),
+                }
+            )
+
+    return {
+        "schema": _REGION_DELTA_AGGREGATE_SCHEMA,
+        "reference": reference,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "weights": list(weights),
         "data": rows,
     }
