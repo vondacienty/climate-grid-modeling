@@ -18092,3 +18092,271 @@ def weight_summary(comparison, *, minimum: int = 1) -> dict:
         "regions": list(regions),
         "data": rows,
     }
+
+
+_REGION_WEIGHT_ROBUSTNESS_SCHEMA = "climate-grid/rws-robust-v1"
+_REGION_WEIGHT_SUMMARY_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "configs",
+    "scenarios",
+    "elements",
+    "regions",
+    "data",
+)
+_REGION_WEIGHT_SUMMARY_STAT_KEYS = _REGION_WEIGHT_SUMMARY_ROW_KEYS[3:]
+
+
+def _validate_region_weight_summary(
+    summary: Any, *, where: str = "summary"
+) -> tuple:
+    """Validate a complete :func:`weight_summary` result.
+
+    Returns the ``scenarios``, ``elements`` and ``regions`` axes and the
+    flat scenario-then-region ``data`` row list.  Each row must carry a
+    non-bool int ``count`` between zero and the non-reference
+    configuration count and either all-``None`` or all-finite
+    ``rank_min``/``rank_max``/``magnitude_min``/``magnitude_max``/
+    ``rank_std``/``magnitude_std``/``uncertainty`` statistics (the
+    latter non-negative).
+    """
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _REGION_WEIGHT_SUMMARY_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, "
+            "configs, scenarios, elements, regions, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WEIGHT_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WEIGHT_SUMMARY_SCHEMA!r}"
+        )
+
+    reference = summary["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        summary["elements"], f"{where}.elements"
+    )
+    regions = _validate_string_list(
+        summary["regions"], f"{where}.regions"
+    )
+    n_elements = len(elements)
+
+    configs = summary["configs"]
+    if not isinstance(configs, list):
+        raise TypeError(f"{where}.configs must be a list")
+    if len(configs) < 2:
+        raise ValueError(f"{where}.configs must contain at least 2 entries")
+
+    names: list[str] = []
+    for index, config in enumerate(configs):
+        config_where = f"{where}.configs[{index}]"
+        if not isinstance(config, dict):
+            raise TypeError(f"{config_where} must be a dict")
+        if tuple(config.keys()) != ("name", "weights"):
+            raise ValueError(
+                f"{config_where} must have exactly the keys name, weights "
+                "in order"
+            )
+
+        name = config["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{config_where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{config_where}.name must be non-empty")
+        if name in names:
+            raise ValueError(f"duplicate configuration name: {name!r}")
+
+        weights = _validate_weights(
+            config["weights"], n_elements, where=f"{config_where}.weights"
+        )
+        if not any(weight > 0 for weight in weights):
+            raise ValueError(
+                f"{config_where}.weights must contain at least one "
+                "positive item"
+            )
+        names.append(name)
+
+    if reference != names[0]:
+        raise ValueError(
+            f"{where}.reference must be the first {where}.configs name"
+        )
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    n_scenarios = len(scenarios)
+    n_regions = len(regions)
+    if len(data) != n_scenarios * n_regions:
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(scenario, region) pair"
+        )
+
+    n_configs = len(configs) - 1
+    row_index = 0
+    for scenario in scenarios:
+        for region in regions:
+            row_where = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{row_where} must be a dict")
+            if tuple(row.keys()) != _REGION_WEIGHT_SUMMARY_ROW_KEYS:
+                raise ValueError(
+                    f"{row_where} must have exactly the keys scenario, "
+                    "region, count, rank_min, rank_max, magnitude_min, "
+                    "magnitude_max, rank_std, magnitude_std, uncertainty "
+                    "in order"
+                )
+
+            if not isinstance(row["scenario"], str):
+                raise TypeError(f"{row_where}.scenario must be a str")
+            if row["scenario"] != scenario:
+                raise ValueError(
+                    f"{row_where}.scenario must be {scenario!r} for its "
+                    "position"
+                )
+            if not isinstance(row["region"], str):
+                raise TypeError(f"{row_where}.region must be a str")
+            if row["region"] != region:
+                raise ValueError(
+                    f"{row_where}.region must be {region!r} for its "
+                    "position"
+                )
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{row_where}.count must be a non-bool int")
+            if count < 0 or count > n_configs:
+                raise ValueError(
+                    f"{row_where}.count must be between 0 and the "
+                    "non-reference configuration count"
+                )
+
+            stats = [row[key] for key in _REGION_WEIGHT_SUMMARY_STAT_KEYS]
+            if any(value is None for value in stats):
+                if any(value is not None for value in stats):
+                    raise ValueError(
+                        f"{row_where} statistics must be all None or all "
+                        "numbers"
+                    )
+            else:
+                for key, value in zip(
+                    _REGION_WEIGHT_SUMMARY_STAT_KEYS, stats
+                ):
+                    _validate_number(
+                        value, f"{row_where}.{key}", nullable=False
+                    )
+                if row["uncertainty"] < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty must be non-negative"
+                    )
+            row_index += 1
+
+    return scenarios, elements, regions, data
+
+
+def weight_robustness(summary, *, minimum: int = 1) -> dict:
+    """Compute per-scenario/region robustness scores from a weight summary.
+
+    ``summary`` must be a complete :func:`weight_summary` result (schema
+    ``climate-grid/rws-v1``) with exactly the keys ``schema, reference,
+    configs, scenarios, elements, regions, data`` in that order; every
+    member is validated against that contract, including the flat
+    scenario-then-region ``data`` row order, each row's key order
+    ``scenario, region, count, rank_min, rank_max, magnitude_min,
+    magnitude_max, rank_std, magnitude_std, uncertainty`` and the
+    all-present or all-``None`` statistic combination.  ``minimum``
+    must be a non-bool positive int.
+
+    For every scenario (in scenario order) and region (in region order),
+    when ``count`` is below ``minimum`` or any of the seven statistics
+    is ``None`` the ``score`` and ``interval`` are both ``None``.
+    Otherwise ``span`` is ``magnitude_max - magnitude_min``, ``score``
+    is ``hypot(rank_std, magnitude_std, span)`` and ``interval`` is
+    ``[max(0, score - uncertainty), score + uncertainty]``.
+
+    The returned mapping uses the key order ``schema, scenarios,
+    elements, regions, data``; ``schema`` is
+    ``climate-grid/rws-robust-v1`` and the ``scenarios``, ``elements``
+    and ``regions`` axes echo the summary unchanged.  ``data`` is a
+    flat list in scenario-then-region order; each row uses the key
+    order ``scenario, region, count, score, interval``.  ``count`` is
+    an int, ``score`` is a float or ``None`` and ``interval`` is a
+    two-item float list or ``None``; every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    scenarios, elements, regions, data = _validate_region_weight_summary(
+        summary
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    rows = []
+    for row in data:
+        count = row["count"]
+        if count < minimum or any(
+            row[key] is None for key in _REGION_WEIGHT_SUMMARY_STAT_KEYS
+        ):
+            score = None
+            interval = None
+        else:
+            rank_std = float(row["rank_std"])
+            magnitude_std = float(row["magnitude_std"])
+            span = float(row["magnitude_max"]) - float(
+                row["magnitude_min"]
+            )
+            uncertainty = float(row["uncertainty"])
+            try:
+                score_value = math.hypot(rank_std, magnitude_std, span)
+            except OverflowError:
+                raise ValueError(
+                    "robustness results must be finite"
+                ) from None
+            lower = max(0.0, score_value - uncertainty)
+            upper = score_value + uncertainty
+            if not (
+                _is_finite(score_value)
+                and _is_finite(lower)
+                and _is_finite(upper)
+            ):
+                raise ValueError("robustness results must be finite")
+            score = _round_output(score_value)
+            interval = [_round_output(lower), _round_output(upper)]
+
+        rows.append(
+            {
+                "scenario": row["scenario"],
+                "region": row["region"],
+                "count": count,
+                "score": score,
+                "interval": interval,
+            }
+        )
+
+    return {
+        "schema": _REGION_WEIGHT_ROBUSTNESS_SCHEMA,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "data": rows,
+    }
