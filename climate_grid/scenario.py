@@ -18938,6 +18938,15 @@ _REGION_WEIGHT_CONSENSUS_ROW_KEYS = (
     "agreement",
 )
 _REGION_WEIGHT_EVOLUTION_ITEM_KEYS = ("period", "result")
+_REGION_WEIGHT_EVOLUTION_OUTPUT_KEYS = (
+    "schema",
+    "periods",
+    "scenarios",
+    "elements",
+    "regions",
+    "bounds",
+    "data",
+)
 _REGION_WEIGHT_EVOLUTION_ROW_KEYS = (
     "period",
     "scenario",
@@ -19262,5 +19271,389 @@ def consensus_evolution(items) -> dict:
         "elements": list(elements),
         "regions": list(regions),
         "bounds": list(bounds),
+        "data": rows,
+    }
+
+
+_EVOLUTION_SUM_SCHEMA = "climate-grid/rce-v1"
+_EVOLUTION_SUM_ITEM_KEYS = ("element", "region", "result")
+
+
+def _validate_consensus_evolution(
+    result: Any, *, where: str = "result"
+) -> tuple[list, list, list, list, list, list]:
+    """Validate a complete :func:`consensus_evolution` result.
+
+    Returns the ``periods``, ``scenarios``, ``elements``, ``regions`` and
+    ``bounds`` axes and the flat period-then-scenario ``data`` row list.
+    Each row must carry a ``coverage`` of a finite non-bool number
+    between 0 and 1, a ``decision`` of ``None`` or one of ``"stable"``,
+    ``"uncertain"``, ``"fragile"`` and an ``agreement`` of ``None`` or a
+    finite non-bool number between 0 and 1, ``None`` exactly when the
+    decision is ``None``.  First-period rows must carry ``None``
+    ``agreement_delta`` and ``changed``; later rows carry both as
+    ``None`` when either adjacent period lacks a decision and agreement,
+    and otherwise the delta must be the current minus the previous
+    ``agreement`` and ``changed`` must report whether the ``decision``
+    changed.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_WEIGHT_EVOLUTION_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, periods, "
+            "scenarios, elements, regions, bounds, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WEIGHT_EVOLUTION_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WEIGHT_EVOLUTION_SCHEMA!r}"
+        )
+
+    periods = _validate_string_list(
+        result["periods"], f"{where}.periods", minimum=2
+    )
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        result["elements"], f"{where}.elements"
+    )
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    bounds = result["bounds"]
+    if not isinstance(bounds, list):
+        raise TypeError(f"{where}.bounds must be a list")
+    if len(bounds) != 2:
+        raise ValueError(f"{where}.bounds must contain exactly 2 items")
+    for index, bound in enumerate(bounds):
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            raise TypeError(
+                f"{where}.bounds[{index}] must be a finite non-bool int "
+                "or float"
+            )
+        if not _is_finite(bound):
+            raise ValueError(f"{where}.bounds[{index}] must be finite")
+        if bound < 0:
+            raise ValueError(f"{where}.bounds[{index}] must be non-negative")
+    if bounds[1] <= bounds[0]:
+        raise ValueError(f"{where}.bounds must be strictly increasing")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(periods) * len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per period and "
+            "scenario"
+        )
+
+    n_scenarios = len(scenarios)
+    for row_index, row in enumerate(data):
+        period_index, scenario_index = divmod(row_index, n_scenarios)
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _REGION_WEIGHT_EVOLUTION_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys period, "
+                "scenario, coverage, decision, agreement, "
+                "agreement_delta, changed in order"
+            )
+
+        if not isinstance(row["period"], str):
+            raise TypeError(f"{row_where}.period must be a str")
+        if row["period"] != periods[period_index]:
+            raise ValueError(
+                f"{row_where}.period must be {periods[period_index]!r} "
+                "for its position"
+            )
+        if not isinstance(row["scenario"], str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if row["scenario"] != scenarios[scenario_index]:
+            raise ValueError(
+                f"{row_where}.scenario must be "
+                f"{scenarios[scenario_index]!r} for its position"
+            )
+
+        coverage = row["coverage"]
+        if not isinstance(coverage, (int, float)) or isinstance(
+            coverage, bool
+        ):
+            raise TypeError(
+                f"{row_where}.coverage must be a finite non-bool int or "
+                "float"
+            )
+        if not _is_finite(coverage):
+            raise ValueError(f"{row_where}.coverage must be finite")
+        if not 0 <= coverage <= 1:
+            raise ValueError(
+                f"{row_where}.coverage must be between 0 and 1"
+            )
+
+        decision = row["decision"]
+        agreement = row["agreement"]
+        if decision is None:
+            if agreement is not None:
+                raise ValueError(
+                    f"{row_where}.agreement must be None when decision "
+                    "is None"
+                )
+        else:
+            if not isinstance(decision, str):
+                raise TypeError(
+                    f"{row_where}.decision must be a str or None"
+                )
+            if decision not in _REGION_WEIGHT_DIGEST_DECISIONS:
+                raise ValueError(
+                    f"{row_where}.decision must be one of stable, "
+                    "uncertain, fragile or None"
+                )
+            if not isinstance(agreement, (int, float)) or isinstance(
+                agreement, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.agreement must be a finite non-bool "
+                    "int or float or None"
+                )
+            if not _is_finite(agreement):
+                raise ValueError(f"{row_where}.agreement must be finite")
+            if not 0 <= agreement <= 1:
+                raise ValueError(
+                    f"{row_where}.agreement must be between 0 and 1"
+                )
+
+        agreement_delta = row["agreement_delta"]
+        changed = row["changed"]
+        if period_index == 0:
+            if agreement_delta is not None or changed is not None:
+                raise ValueError(
+                    f"{row_where}.agreement_delta and changed must be "
+                    "None for the first period"
+                )
+            continue
+
+        previous = data[row_index - n_scenarios]
+        prev_decision = previous["decision"]
+        prev_agreement = previous["agreement"]
+        if (
+            decision is None
+            or agreement is None
+            or prev_decision is None
+            or prev_agreement is None
+        ):
+            if agreement_delta is not None or changed is not None:
+                raise ValueError(
+                    f"{row_where}.agreement_delta and changed must be "
+                    "None when either adjacent period lacks a decision "
+                    "and agreement"
+                )
+            continue
+
+        if not isinstance(agreement_delta, (int, float)) or isinstance(
+            agreement_delta, bool
+        ):
+            raise TypeError(
+                f"{row_where}.agreement_delta must be a finite non-bool "
+                "int or float or None"
+            )
+        if not _is_finite(agreement_delta):
+            raise ValueError(
+                f"{row_where}.agreement_delta must be finite"
+            )
+        if agreement_delta != _round_output(agreement - prev_agreement):
+            raise ValueError(
+                f"{row_where}.agreement_delta must be the agreement "
+                "minus the previous period's agreement"
+            )
+        if not isinstance(changed, bool):
+            raise TypeError(f"{row_where}.changed must be a bool or None")
+        if changed != (decision != prev_decision):
+            raise ValueError(
+                f"{row_where}.changed must report whether the decision "
+                "changed from the previous period"
+            )
+
+    return periods, scenarios, elements, regions, bounds, data
+
+
+def evolution_sum(items, *, minimum: int = 1) -> dict:
+    """Summarize per-layer consensus evolution into scenario rows.
+
+    ``items`` must be a non-empty list of mappings, each with exactly
+    the keys ``element, region, result`` in that order.  ``element`` and
+    ``region`` are non-empty strs whose combination is unique across
+    items and ``result`` is a complete :func:`consensus_evolution`
+    result (schema ``climate-grid/rc-evolution-v1``) whose ``elements``
+    and ``regions`` are exactly ``[element]`` and ``[region]``,
+    validated against that contract.  Every item's result must share the
+    same ``periods``, ``scenarios`` and ``bounds`` in the same order.
+    ``minimum`` must be a non-bool positive int.
+
+    For every item (in item order) and scenario (in scenario order) the
+    adjacent period pairs are scanned; a pair counts only when both
+    periods carry a non-``None`` ``decision`` and ``agreement``.
+    ``count`` is the number of valid pairs and ``moves`` counts the
+    valid pairs at each of the nine previous-then-current ``decision``
+    combinations, ordered previous-state-major over ``stable,
+    uncertain, fragile``.  ``coverage`` is the last period's
+    ``coverage`` minus the first period's.  When ``count < minimum``,
+    ``delta`` and ``rate`` are ``None``; otherwise ``delta`` is the mean
+    of the ``agreement`` after minus before over the valid pairs and
+    ``rate`` is the number of pairs whose ``decision`` changed divided
+    by ``count``.
+
+    The returned mapping uses the key order ``schema, periods,
+    scenarios, data``; ``schema`` is ``climate-grid/rce-v1`` and the two
+    axes echo the shared item axes.  ``data`` follows item-then-scenario
+    order; each row uses the key order ``element, region, scenario,
+    count, coverage, moves, delta, rate``.  ``count`` and the ``moves``
+    counts are ints and every output float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    layers = []
+    validated: list[list] = []
+    seen_combinations: set[tuple[str, str]] = set()
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _EVOLUTION_SUM_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys element, region, "
+                "result in order"
+            )
+
+        element = item["element"]
+        if not isinstance(element, str):
+            raise TypeError(f"{where}.element must be a str")
+        if element == "":
+            raise ValueError(f"{where}.element must be non-empty")
+
+        region = item["region"]
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{where}.region must be non-empty")
+
+        combination = (element, region)
+        if combination in seen_combinations:
+            raise ValueError(
+                f"duplicate items element/region combination: "
+                f"{element!r}, {region!r}"
+            )
+        seen_combinations.add(combination)
+
+        periods, scenarios, elements, regions, bounds, data = (
+            _validate_consensus_evolution(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if elements != [element]:
+            raise ValueError(
+                f"{where}.result.elements must be [{element!r}]"
+            )
+        if regions != [region]:
+            raise ValueError(
+                f"{where}.result.regions must be [{region!r}]"
+            )
+        if not validated:
+            first_periods = periods
+            first_scenarios = scenarios
+            first_bounds = bounds
+        elif (
+            periods != first_periods
+            or scenarios != first_scenarios
+            or bounds != first_bounds
+        ):
+            raise ValueError(
+                f"{where}.result must share the periods, scenarios and "
+                "bounds of items[0].result in the same order"
+            )
+
+        layers.append((element, region))
+        validated.append(data)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    decision_index = {
+        decision: position
+        for position, decision in enumerate(_REGION_WEIGHT_DIGEST_DECISIONS)
+    }
+    n_periods = len(first_periods)
+    n_scenarios = len(first_scenarios)
+    rows = []
+    for (element, region), data in zip(layers, validated):
+        for scenario_index, scenario in enumerate(first_scenarios):
+            period_rows = [
+                data[period_index * n_scenarios + scenario_index]
+                for period_index in range(n_periods)
+            ]
+            count = 0
+            moves = [0] * 9
+            changed_count = 0
+            delta_sum = 0.0
+            for period_index in range(1, n_periods):
+                prev_row = period_rows[period_index - 1]
+                row = period_rows[period_index]
+                prev_decision = prev_row["decision"]
+                prev_agreement = prev_row["agreement"]
+                decision = row["decision"]
+                agreement = row["agreement"]
+                if (
+                    prev_decision is None
+                    or prev_agreement is None
+                    or decision is None
+                    or agreement is None
+                ):
+                    continue
+                count += 1
+                moves[
+                    decision_index[prev_decision] * 3
+                    + decision_index[decision]
+                ] += 1
+                if decision != prev_decision:
+                    changed_count += 1
+                delta_sum += agreement - prev_agreement
+            coverage = _round_output(
+                period_rows[-1]["coverage"] - period_rows[0]["coverage"]
+            )
+            if count < minimum:
+                delta = None
+                rate = None
+            else:
+                delta = _round_output(delta_sum / count)
+                rate = _round_output(changed_count / count)
+            rows.append(
+                {
+                    "element": element,
+                    "region": region,
+                    "scenario": scenario,
+                    "count": count,
+                    "coverage": coverage,
+                    "moves": moves,
+                    "delta": delta,
+                    "rate": rate,
+                }
+            )
+
+    return {
+        "schema": _EVOLUTION_SUM_SCHEMA,
+        "periods": list(first_periods),
+        "scenarios": list(first_scenarios),
         "data": rows,
     }
