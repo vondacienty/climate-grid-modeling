@@ -22345,3 +22345,283 @@ def grade_windows(history, windows, *, minimum: int = 1) -> dict:
         "scenarios": list(scenarios),
         "data": rows,
     }
+
+
+_GRADE_WINDOW_CHANGES_SCHEMA = "climate-grid/rw-change-v1"
+_GRADE_WINDOW_CHANGES_PAIR_KEYS = ("left", "right")
+_GRADE_WINDOW_CHANGES_OUTPUT_KEYS = ("schema", "pairs", "scenarios", "data")
+_GRADE_WINDOW_CHANGES_ROW_KEYS = (
+    "scenario",
+    "count",
+    "deltas",
+    "mean",
+    "peak",
+)
+
+
+def _validate_grade_windows_result(
+    result: Any,
+) -> tuple[list[str], list[str], list[list[tuple[Any, Any]]]]:
+    """Validate a complete :func:`grade_windows` result structurally.
+
+    Returns the window names in data order, the shared scenario order
+    and, per window, the per-scenario ``(stability, trend)`` pairs.
+    Checks the ``climate-grid/rw`` contract: key order, the
+    ``windows`` axis, the window-then-scenario row blocks and the
+    member types/nullability, but not the window computations.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+    if tuple(result.keys()) != _GRADE_WINDOWS_OUTPUT_KEYS:
+        raise ValueError(
+            "result must have exactly the keys schema, windows, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError("result.schema must be a str")
+    if schema != _GRADE_WINDOWS_SCHEMA:
+        raise ValueError(f"result.schema must be {_GRADE_WINDOWS_SCHEMA!r}")
+
+    windows = result["windows"]
+    if not isinstance(windows, list):
+        raise TypeError("result.windows must be a list")
+    window_names: list[str] = []
+    for w_index, window in enumerate(windows):
+        where = f"result.windows[{w_index}]"
+        if not isinstance(window, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(window.keys()) != _GRADE_WINDOWS_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, start, end "
+                "in order"
+            )
+        name = window["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        window_names.append(name)
+    if len(set(window_names)) != len(window_names):
+        raise ValueError("result.windows must have unique names")
+
+    scenarios = _validate_string_list(result["scenarios"], "result.scenarios")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError("result.data must be a list")
+
+    n_windows = len(window_names)
+    n_scenarios = len(scenarios)
+    if len(data) != n_windows * n_scenarios:
+        raise ValueError(
+            "result.data must contain one row per window and scenario"
+        )
+
+    pairs_by_window: list[list[tuple[Any, Any]]] = []
+    for w_index in range(n_windows):
+        window_pairs: list[tuple[Any, Any]] = []
+        for s_index in range(n_scenarios):
+            row_index = w_index * n_scenarios + s_index
+            where = f"result.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{where} must be a dict")
+            if tuple(row.keys()) != _GRADE_WINDOWS_ROW_KEYS:
+                raise ValueError(
+                    f"{where} must have exactly the keys window, scenario, "
+                    "valid, count, transitions, stability, trend in order"
+                )
+
+            window = row["window"]
+            if not isinstance(window, str):
+                raise TypeError(f"{where}.window must be a str")
+            if window != window_names[w_index]:
+                raise ValueError(
+                    f"{where}.window must be {window_names[w_index]!r} for "
+                    "its window-order position"
+                )
+            scenario = row["scenario"]
+            if not isinstance(scenario, str):
+                raise TypeError(f"{where}.scenario must be a str")
+            if scenario != scenarios[s_index]:
+                raise ValueError(
+                    f"{where}.scenario must be {scenarios[s_index]!r} for "
+                    "its scenario-order position"
+                )
+
+            valid = row["valid"]
+            if not isinstance(valid, int) or isinstance(valid, bool):
+                raise TypeError(f"{where}.valid must be a non-bool int")
+            if valid < 0:
+                raise ValueError(f"{where}.valid must be non-negative")
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{where}.count must be a non-bool int")
+            if count < 0:
+                raise ValueError(f"{where}.count must be non-negative")
+            if count > max(valid - 1, 0):
+                raise ValueError(
+                    f"{where}.count must not exceed {where}.valid - 1"
+                )
+
+            transitions = row["transitions"]
+            if not isinstance(transitions, list):
+                raise TypeError(f"{where}.transitions must be a list")
+            if len(transitions) != 9:
+                raise ValueError(
+                    f"{where}.transitions must contain exactly 9 items"
+                )
+            for t_index, transition in enumerate(transitions):
+                transition_where = f"{where}.transitions[{t_index}]"
+                if not isinstance(transition, int) or isinstance(
+                    transition, bool
+                ):
+                    raise TypeError(
+                        f"{transition_where} must be a non-bool int"
+                    )
+                if transition < 0:
+                    raise ValueError(
+                        f"{transition_where} must be non-negative"
+                    )
+
+            stability = row["stability"]
+            trend = row["trend"]
+            _validate_number(stability, f"{where}.stability", nullable=True)
+            _validate_number(trend, f"{where}.trend", nullable=True)
+            window_pairs.append((stability, trend))
+        pairs_by_window.append(window_pairs)
+
+    return window_names, scenarios, pairs_by_window
+
+
+def grade_window_changes(result, *, minimum: int = 1) -> dict:
+    """Measure per-scenario stability/trend changes between windows.
+
+    ``result`` must be a complete :func:`grade_windows` result (schema
+    ``climate-grid/rw``), validated against that contract: key order,
+    the ``windows``/``scenarios`` axes and the window-then-scenario
+    data blocks, spanning at least two windows.  ``minimum`` must be a
+    non-bool positive int.
+
+    For every scenario (in scenario order) the adjacent window pairs
+    (in window order) yield a ``deltas`` member per pair: when both
+    rows of the pair carry non-``None`` ``stability`` and ``trend``
+    values, the member is ``[later stability - earlier stability,
+    later trend - earlier trend]``; otherwise it is ``[None, None]``.
+    ``count`` is the number of non-``None`` delta pairs.  When
+    ``count < minimum``, ``mean`` and ``peak`` are both ``None``;
+    otherwise ``mean`` is the arithmetic mean of the stability and
+    trend delta columns (a two-item list) and ``peak`` is the maximum
+    of each absolute-delta column (likewise a two-item list).
+
+    The returned mapping uses the key order ``schema, pairs,
+    scenarios, data``; ``schema`` is ``climate-grid/rw-change-v1``.
+    ``pairs`` follows the window order, each with the keys
+    ``left, right`` holding the adjacent window names, and
+    ``scenarios`` echoes the input scenario order.  ``data`` follows
+    the scenario order; each row uses the key order
+    ``scenario, count, deltas, mean, peak`` and ``deltas`` has the
+    same length as ``pairs``.  Every output float is ``round(x, 12)``
+    with negative zero normalized to ``0.0``; a derived non-finite
+    value raises ``ValueError``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/argument/member types
+    and ``ValueError`` for any other contract violation.
+    """
+    windows, scenarios, pairs_by_window = _validate_grade_windows_result(
+        result
+    )
+    if len(windows) < 2:
+        raise ValueError("result must span at least two windows")
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    pairs = [
+        {"left": windows[index], "right": windows[index + 1]}
+        for index in range(len(windows) - 1)
+    ]
+
+    rows = []
+    for s_index, scenario in enumerate(scenarios):
+        deltas: list = []
+        stability_values = []
+        trend_values = []
+        for w_index in range(len(windows) - 1):
+            left_stability, left_trend = pairs_by_window[w_index][s_index]
+            right_stability, right_trend = pairs_by_window[w_index + 1][
+                s_index
+            ]
+            if (
+                left_stability is None
+                or left_trend is None
+                or right_stability is None
+                or right_trend is None
+            ):
+                deltas.append([None, None])
+                continue
+
+            stability_delta = float(right_stability - left_stability)
+            trend_delta = float(right_trend - left_trend)
+            if not _is_finite(stability_delta) or not _is_finite(
+                trend_delta
+            ):
+                raise ValueError(
+                    "derived window-change values must be finite"
+                )
+            stability_delta = _round_output(stability_delta)
+            trend_delta = _round_output(trend_delta)
+            deltas.append([stability_delta, trend_delta])
+            stability_values.append(stability_delta)
+            trend_values.append(trend_delta)
+
+        count = len(stability_values)
+        if count < minimum:
+            mean = None
+            peak = None
+        else:
+            stability_mean = sum(stability_values) / count
+            trend_mean = sum(trend_values) / count
+            stability_peak = max(abs(value) for value in stability_values)
+            trend_peak = max(abs(value) for value in trend_values)
+            if not all(
+                _is_finite(value)
+                for value in (
+                    stability_mean,
+                    trend_mean,
+                    stability_peak,
+                    trend_peak,
+                )
+            ):
+                raise ValueError(
+                    "derived window-change statistics must be finite"
+                )
+            mean = [
+                _round_output(stability_mean),
+                _round_output(trend_mean),
+            ]
+            peak = [
+                _round_output(stability_peak),
+                _round_output(trend_peak),
+            ]
+
+        rows.append(
+            {
+                "scenario": scenario,
+                "count": count,
+                "deltas": deltas,
+                "mean": mean,
+                "peak": peak,
+            }
+        )
+
+    return {
+        "schema": _GRADE_WINDOW_CHANGES_SCHEMA,
+        "pairs": pairs,
+        "scenarios": list(scenarios),
+        "data": rows,
+    }
