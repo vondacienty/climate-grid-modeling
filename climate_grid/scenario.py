@@ -18383,6 +18383,23 @@ def weight_robustness(summary, *, minimum: int = 1) -> dict:
 
 
 _REGION_WEIGHT_DIGEST_SCHEMA = "climate-grid/rws-digest-v1"
+_REGION_WEIGHT_DIGEST_OUTPUT_KEYS = (
+    "schema",
+    "scenarios",
+    "elements",
+    "regions",
+    "bounds",
+    "data",
+)
+_REGION_WEIGHT_DIGEST_ROW_KEYS = (
+    "scenario",
+    "valid",
+    "missing",
+    "stable",
+    "uncertain",
+    "fragile",
+    "decision",
+)
 _REGION_WEIGHT_ROBUSTNESS_OUTPUT_KEYS = (
     "schema",
     "scenarios",
@@ -18409,7 +18426,9 @@ def _validate_region_weight_robustness(
     non-bool non-negative int ``count`` and either both ``score`` and
     ``interval`` ``None`` or a finite non-negative ``score`` with a
     two-item finite non-negative ``interval`` whose lower bound does not
-    exceed its upper bound.
+    exceed its upper bound; a non-``None`` ``interval`` requires a
+    non-``None`` ``score``, and a ``count`` of ``0`` requires both
+    ``score`` and ``interval`` to be ``None``.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -18486,6 +18505,11 @@ def _validate_region_weight_robustness(
                 raise ValueError(
                     f"{row_where}: score and interval must be both None "
                     "or both present"
+                )
+            if count == 0 and (score is not None or interval is not None):
+                raise ValueError(
+                    f"{row_where}: score and interval must be None when "
+                    "count is 0"
                 )
             if score is None:
                 row_index += 1
@@ -18627,6 +18651,286 @@ def robustness_digest(result, bounds, *, minimum: int = 1) -> dict:
 
     return {
         "schema": _REGION_WEIGHT_DIGEST_SCHEMA,
+        "scenarios": list(scenarios),
+        "elements": list(elements),
+        "regions": list(regions),
+        "bounds": list(bounds),
+        "data": rows,
+    }
+
+
+_DIGEST_CONSENSUS_SCHEMA = "climate-grid/rc-v1"
+_DIGEST_CONSENSUS_OUTPUT_KEYS = (
+    "schema",
+    "scenarios",
+    "elements",
+    "regions",
+    "bounds",
+    "data",
+)
+_DIGEST_CONSENSUS_ROW_KEYS = (
+    "scenario",
+    "valid",
+    "missing",
+    "votes",
+    "decision",
+    "agreement",
+)
+_DIGEST_CONSENSUS_DECISION_INDEX = {
+    "stable": 0,
+    "uncertain": 1,
+    "fragile": 2,
+}
+
+
+def _validate_robustness_digest_result(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`robustness_digest` result.
+
+    Returns the ``scenarios``, ``elements`` and ``regions`` axes, the
+    ``bounds`` pair and the per-scenario ``data`` row list.  Each row
+    must use the key order ``scenario, valid, missing, stable,
+    uncertain, fragile, decision``; the five counts are non-bool
+    non-negative ints and ``decision`` is either ``None`` (when the
+    digest's own ``minimum`` was not met) or one of ``stable``,
+    ``uncertain`` or ``fragile`` consistent with the fragile-first,
+    uncertain-second classification of the tallies.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REGION_WEIGHT_DIGEST_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scenarios, "
+            "elements, regions, bounds, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REGION_WEIGHT_DIGEST_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REGION_WEIGHT_DIGEST_SCHEMA!r}"
+        )
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+    elements = _validate_string_list(
+        result["elements"], f"{where}.elements"
+    )
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    bounds = result["bounds"]
+    if not isinstance(bounds, list):
+        raise TypeError(f"{where}.bounds must be a list")
+    if len(bounds) != 2:
+        raise ValueError(f"{where}.bounds must contain exactly 2 items")
+    for index, bound in enumerate(bounds):
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            raise TypeError(
+                f"{where}.bounds[{index}] must be a finite non-bool int "
+                "or float"
+            )
+        if not _is_finite(bound):
+            raise ValueError(f"{where}.bounds[{index}] must be finite")
+        if bound < 0:
+            raise ValueError(f"{where}.bounds[{index}] must be non-negative")
+    if bounds[1] <= bounds[0]:
+        raise ValueError(f"{where}.bounds must be strictly increasing")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    for s_index, scenario in enumerate(scenarios):
+        row_where = f"{where}.data[{s_index}]"
+        row = data[s_index]
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _REGION_WEIGHT_DIGEST_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, valid, "
+                "missing, stable, uncertain, fragile, decision in order"
+            )
+
+        if not isinstance(row["scenario"], str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        if row["scenario"] != scenario:
+            raise ValueError(
+                f"{row_where}.scenario must be {scenario!r} for its position"
+            )
+
+        for key in ("valid", "missing", "stable", "uncertain", "fragile"):
+            value = row[key]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{row_where}.{key} must be a non-bool int")
+            if value < 0:
+                raise ValueError(f"{row_where}.{key} must be non-negative")
+
+        if row["stable"] + row["uncertain"] + row["fragile"] != row["valid"]:
+            raise ValueError(
+                f"{row_where}: stable, uncertain and fragile must sum to "
+                "valid"
+            )
+        if row["valid"] + row["missing"] != len(regions):
+            raise ValueError(
+                f"{row_where}: valid and missing must sum to the number of "
+                "regions"
+            )
+
+        decision = row["decision"]
+        if decision is None:
+            pass
+        elif not isinstance(decision, str):
+            raise TypeError(f"{row_where}.decision must be a str or None")
+        elif row["valid"] == 0:
+            raise ValueError(
+                f"{row_where}.decision must be None when valid is 0"
+            )
+        else:
+            if decision not in _DIGEST_CONSENSUS_DECISION_INDEX:
+                raise ValueError(
+                    f"{row_where}.decision must be one of stable, "
+                    "uncertain or fragile"
+                )
+            if row["fragile"] > 0:
+                expected = "fragile"
+            elif row["uncertain"] > 0:
+                expected = "uncertain"
+            else:
+                expected = "stable"
+            if decision != expected:
+                raise ValueError(
+                    f"{row_where}.decision must be {expected!r} for the "
+                    "row tallies"
+                )
+
+    return scenarios, elements, regions, bounds, data
+
+
+def digest_consensus(results, *, minimum: int = 1) -> dict:
+    """Combine robustness digests by majority vote per scenario.
+
+    ``results`` must be a list of at least two complete
+    :func:`robustness_digest` results (schema
+    ``climate-grid/rws-digest-v1``), each with exactly the keys
+    ``schema, scenarios, elements, regions, bounds, data`` in that
+    order; every member is validated against that contract, including
+    the per-scenario ``data`` row order, each row's key order
+    ``scenario, valid, missing, stable, uncertain, fragile, decision``
+    and the consistency of its counts and decision.  Every result must
+    share the same ``scenarios``, ``elements``, ``regions`` and
+    ``bounds`` in the same order; the output axes are taken from the
+    first result.  ``minimum`` must be a non-bool positive int.
+
+    For each scenario (in scenario order) every result with a
+    non-``None`` ``decision`` casts one vote: ``valid`` is the number
+    of votes, ``missing`` is the number of results minus ``valid`` and
+    ``votes`` is the ``[stable, uncertain, fragile]`` tally in that
+    order.  When ``valid`` is below ``minimum`` the row's ``decision``
+    and ``agreement`` are both ``None``; otherwise the highest tally
+    wins, with ties resolved in favour of ``fragile``, then
+    ``uncertain``, then ``stable``, and ``agreement`` is the highest
+    tally divided by ``valid``.
+
+    The returned mapping uses the key order ``schema, scenarios,
+    elements, regions, bounds, data``; ``schema`` is
+    ``climate-grid/rc-v1`` and the four axes echo the first result.
+    ``data`` is ordered by scenario; each row uses the key order
+    ``scenario, valid, missing, votes, decision, agreement`` where
+    ``valid`` and ``missing`` are ints, ``votes`` is a three-item int
+    list in ``stable, uncertain, fragile`` order and ``agreement`` is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(results, list):
+        raise TypeError("results must be a list")
+    if len(results) < 2:
+        raise ValueError("results must contain at least 2 items")
+
+    first_axes = None
+    validated = []
+    for index, result in enumerate(results):
+        scenarios, elements, regions, bounds, data = (
+            _validate_robustness_digest_result(
+                result, where=f"results[{index}]"
+            )
+        )
+        if first_axes is None:
+            first_axes = (scenarios, elements, regions, bounds)
+        else:
+            first_scenarios, first_elements, first_regions, first_bounds = (
+                first_axes
+            )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all results must share the same scenarios in the same "
+                    "order, taken from the first result"
+                )
+            if elements != first_elements:
+                raise ValueError(
+                    "all results must share the same elements in the same "
+                    "order, taken from the first result"
+                )
+            if regions != first_regions:
+                raise ValueError(
+                    "all results must share the same regions in the same "
+                    "order, taken from the first result"
+                )
+            if bounds != first_bounds:
+                raise ValueError(
+                    "all results must share the same bounds in the same "
+                    "order, taken from the first result"
+                )
+        validated.append(data)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    scenarios, elements, regions, bounds = first_axes
+    rows = []
+    for s_index, scenario in enumerate(scenarios):
+        votes = [0, 0, 0]
+        for data in validated:
+            decision = data[s_index]["decision"]
+            if decision is not None:
+                votes[_DIGEST_CONSENSUS_DECISION_INDEX[decision]] += 1
+
+        valid = sum(votes)
+        missing = len(results) - valid
+        if valid < minimum:
+            decision = None
+            agreement = None
+        else:
+            # Ties prefer fragile, then uncertain, then stable: the
+            # highest vote-list index wins an equal tally.
+            winner_index = max(range(3), key=lambda index: (votes[index], index))
+            decision = ("stable", "uncertain", "fragile")[winner_index]
+            agreement = _round_output(votes[winner_index] / valid)
+
+        rows.append(
+            {
+                "scenario": scenario,
+                "valid": valid,
+                "missing": missing,
+                "votes": votes,
+                "decision": decision,
+                "agreement": agreement,
+            }
+        )
+
+    return {
+        "schema": _DIGEST_CONSENSUS_SCHEMA,
         "scenarios": list(scenarios),
         "elements": list(elements),
         "regions": list(regions),
