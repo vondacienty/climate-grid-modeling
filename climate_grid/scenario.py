@@ -22416,6 +22416,10 @@ def _validate_grade_windows(result: Any) -> tuple[list[dict], list[str], list[di
             raise TypeError(f"{where}.start must be a str")
         if not isinstance(end, str):
             raise TypeError(f"{where}.end must be a str")
+        if start == "":
+            raise ValueError(f"{where}.start must be non-empty")
+        if end == "":
+            raise ValueError(f"{where}.end must be non-empty")
 
         out_windows.append({"name": name, "start": start, "end": end})
 
@@ -22665,6 +22669,329 @@ def grade_window_changes(result, *, minimum: int = 1) -> dict:
     return {
         "schema": _GRADE_WINDOW_CHANGE_SCHEMA,
         "pairs": pairs,
+        "scenarios": list(scenarios),
+        "data": data,
+    }
+
+
+_GRADE_WINDOW_CHANGE_AGGREGATE_SCHEMA = "climate-grid/rw-aggregate-v1"
+_GRADE_WINDOW_CHANGE_AGGREGATE_ROW_KEYS = (
+    "scenario",
+    "count",
+    "cumulative",
+    "total",
+    "interval",
+)
+
+
+def _validate_grade_window_changes(
+    result: Any,
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Validate a complete :func:`grade_window_changes` result.
+
+    Returns the fresh ``pairs`` mappings, the ``scenarios`` axis and
+    the data rows (in scenario order), checking the
+    ``climate-grid/rw-change-v1`` contract: key order, the
+    pairs/scenarios axes, the scenario-order rows and the internal
+    ``count``/``deltas``/``mean``/``peak`` invariants of every row.
+    A delta item is either two finite non-bool numbers or
+    ``[None, None]``; ``count`` must equal the number of valid items
+    and a present ``mean``/``peak`` must match the recomputed column
+    summaries.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+    if tuple(result.keys()) != _GRADE_WINDOW_CHANGE_OUTPUT_KEYS:
+        raise ValueError(
+            "result must have exactly the keys schema, pairs, "
+            "scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError("result.schema must be a str")
+    if schema != _GRADE_WINDOW_CHANGE_SCHEMA:
+        raise ValueError(
+            f"result.schema must be {_GRADE_WINDOW_CHANGE_SCHEMA!r}"
+        )
+
+    pairs = result["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError("result.pairs must be a list")
+    if not pairs:
+        raise ValueError("result.pairs must be non-empty")
+    out_pairs: list[dict] = []
+    for index, pair in enumerate(pairs):
+        where = f"result.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(pair.keys()) != _GRADE_WINDOW_CHANGE_PAIR_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys left, right "
+                "in order"
+            )
+        left = pair["left"]
+        right = pair["right"]
+        if not isinstance(left, str):
+            raise TypeError(f"{where}.left must be a str")
+        if not isinstance(right, str):
+            raise TypeError(f"{where}.right must be a str")
+        if left == "":
+            raise ValueError(f"{where}.left must be non-empty")
+        if right == "":
+            raise ValueError(f"{where}.right must be non-empty")
+        out_pairs.append({"left": left, "right": right})
+
+    scenarios = result["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError("result.scenarios must be a list")
+    if not scenarios:
+        raise ValueError("result.scenarios must be non-empty")
+    out_scenarios: list[str] = []
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        where = f"result.scenarios[{index}]"
+        if not isinstance(scenario, str):
+            raise TypeError(f"{where} must be a str")
+        if scenario == "":
+            raise ValueError(f"{where} must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(f"duplicate result scenario: {scenario!r}")
+        seen_scenarios.add(scenario)
+        out_scenarios.append(scenario)
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError("result.data must be a list")
+    if len(data) != len(out_scenarios):
+        raise ValueError(
+            "result.data must contain exactly one row per scenario"
+        )
+
+    n_pairs = len(out_pairs)
+    out_rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        where = f"result.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(row.keys()) != _GRADE_WINDOW_CHANGE_ROW_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys scenario, count, "
+                "deltas, mean, peak in order"
+            )
+
+        scenario_name = row["scenario"]
+        if not isinstance(scenario_name, str):
+            raise TypeError(f"{where}.scenario must be a str")
+        expected_scenario = out_scenarios[row_index]
+        if scenario_name != expected_scenario:
+            raise ValueError(
+                f"{where}.scenario {scenario_name!r} must follow "
+                f"scenario order (expected {expected_scenario!r})"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{where}.count must be non-negative")
+
+        deltas = row["deltas"]
+        if not isinstance(deltas, list):
+            raise TypeError(f"{where}.deltas must be a list")
+        if len(deltas) != n_pairs:
+            raise ValueError(
+                f"{where}.deltas must contain exactly one item per "
+                "window pair"
+            )
+        stability_changes: list[float] = []
+        trend_changes: list[float] = []
+        for delta_index, delta in enumerate(deltas):
+            delta_where = f"{where}.deltas[{delta_index}]"
+            if not isinstance(delta, list):
+                raise TypeError(f"{delta_where} must be a list")
+            if len(delta) != 2:
+                raise ValueError(
+                    f"{delta_where} must contain exactly 2 items"
+                )
+            stability_change, trend_change = delta
+            if stability_change is None or trend_change is None:
+                if stability_change is not None or trend_change is not None:
+                    raise ValueError(
+                        f"{delta_where} must be two finite numbers or "
+                        "[None, None]"
+                    )
+                continue
+            _validate_number(
+                stability_change, f"{delta_where}[0]", nullable=False
+            )
+            _validate_number(
+                trend_change, f"{delta_where}[1]", nullable=False
+            )
+            stability_changes.append(stability_change)
+            trend_changes.append(trend_change)
+
+        if count != len(stability_changes):
+            raise ValueError(
+                f"{where}.count must equal the number of valid deltas"
+            )
+
+        mean = row["mean"]
+        peak = row["peak"]
+        if mean is None or peak is None:
+            if mean is not None or peak is not None:
+                raise ValueError(
+                    f"{where}.mean and {where}.peak must be None "
+                    "together"
+                )
+        else:
+            if count == 0:
+                raise ValueError(
+                    f"{where}.mean and {where}.peak must be None when "
+                    "count is zero"
+                )
+            for summary_name, summary in (("mean", mean), ("peak", peak)):
+                summary_where = f"{where}.{summary_name}"
+                if not isinstance(summary, list):
+                    raise TypeError(f"{summary_where} must be a list")
+                if len(summary) != 2:
+                    raise ValueError(
+                        f"{summary_where} must contain exactly 2 items"
+                    )
+                for item_index, item in enumerate(summary):
+                    _validate_number(
+                        item,
+                        f"{summary_where}[{item_index}]",
+                        nullable=False,
+                    )
+            expected_mean = [
+                _round_output(sum(stability_changes) / count),
+                _round_output(sum(trend_changes) / count),
+            ]
+            expected_peak = [
+                _round_output(max(abs(v) for v in stability_changes)),
+                _round_output(max(abs(v) for v in trend_changes)),
+            ]
+            if mean != expected_mean:
+                raise ValueError(
+                    f"{where}.mean must equal the mean of the valid "
+                    "delta columns"
+                )
+            if peak != expected_peak:
+                raise ValueError(
+                    f"{where}.peak must equal the maximum absolute "
+                    "value of the valid delta columns"
+                )
+
+        out_rows.append(row)
+
+    return out_pairs, out_scenarios, out_rows
+
+
+def aggregate_grade_changes(result, *, minimum: int = 1) -> dict:
+    """Accumulate stability/trend changes across adjacent window pairs.
+
+    ``result`` must be a complete :func:`grade_window_changes` result
+    (schema ``climate-grid/rw-change-v1``), validated against that
+    contract: key order, the ``pairs``/``scenarios`` axes and the
+    scenario-order data rows with their ``count``/``deltas``/``mean``/
+    ``peak`` invariants.  ``minimum`` must be a non-bool positive int.
+
+    For every scenario, the ``deltas`` items are processed in pair
+    order.  A valid item (two finite numbers) accumulates into the
+    running per-column totals; a missing item (``[None, None]``)
+    yields a ``[None, None]`` cumulative entry and leaves the running
+    totals unchanged.  ``count`` is the number of valid items.  When
+    ``count < minimum``, ``total`` and ``interval`` are both ``None``;
+    otherwise ``total`` is the accumulated total of each column and
+    ``interval`` is, in stability then trend order, the ``[min, max]``
+    of the cumulative path including the origin ``0.0``.
+
+    The returned mapping uses the key order ``schema, pairs,
+    scenarios, data``; ``schema`` is
+    ``climate-grid/rw-aggregate-v1``.  ``pairs`` and ``scenarios``
+    echo the input axes in their original order.  ``data`` follows
+    scenario order; each row uses the key order ``scenario, count,
+    cumulative, total, interval`` and ``cumulative`` has one entry per
+    window pair.  Accumulation uses ``math.fsum`` and a non-finite
+    derived value raises ``ValueError``.  Every float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    pairs, scenarios, rows = _validate_grade_window_changes(result)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    def _accumulate(values: list) -> float:
+        try:
+            total = math.fsum(values)
+        except OverflowError:
+            # Huge int deltas overflow float accumulation.
+            raise ValueError(
+                "accumulated change values must be finite"
+            ) from None
+        if not _is_finite(total):
+            raise ValueError("accumulated change values must be finite")
+        return _round_output(total)
+
+    data = []
+    for row_index, scenario in enumerate(scenarios):
+        row = rows[row_index]
+        stability_changes: list = []
+        trend_changes: list = []
+        cumulative: list = []
+        stability_total = 0.0
+        trend_total = 0.0
+        stability_path: list = []
+        trend_path: list = []
+        for delta in row["deltas"]:
+            if delta[0] is None:
+                cumulative.append([None, None])
+                continue
+            stability_changes.append(delta[0])
+            trend_changes.append(delta[1])
+            stability_total = _accumulate(stability_changes)
+            trend_total = _accumulate(trend_changes)
+            cumulative.append([stability_total, trend_total])
+            stability_path.append(stability_total)
+            trend_path.append(trend_total)
+
+        count = len(stability_changes)
+        if count < minimum:
+            total = None
+            interval = None
+        else:
+            total = [stability_total, trend_total]
+            interval = [
+                [
+                    _round_output(min([0.0] + stability_path)),
+                    _round_output(max([0.0] + stability_path)),
+                ],
+                [
+                    _round_output(min([0.0] + trend_path)),
+                    _round_output(max([0.0] + trend_path)),
+                ],
+            ]
+
+        data.append(
+            {
+                "scenario": scenario,
+                "count": count,
+                "cumulative": cumulative,
+                "total": total,
+                "interval": interval,
+            }
+        )
+
+    return {
+        "schema": _GRADE_WINDOW_CHANGE_AGGREGATE_SCHEMA,
+        "pairs": [dict(pair) for pair in pairs],
         "scenarios": list(scenarios),
         "data": data,
     }
