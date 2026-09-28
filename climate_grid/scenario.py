@@ -26079,3 +26079,342 @@ def rank_groups(result, *, minimum: int = 2) -> dict:
         "scenarios": list(scenarios),
         "data": data_rows,
     }
+
+
+_GROUP_RANK_STABILITY_SCHEMA = "climate-grid/ggs-v1"
+_GROUP_RANK_STABILITY_RESULT_KEYS = _EVOLUTION_GROUP_RANK_RESULT_KEYS
+_GROUP_RANK_STABILITY_ROW_KEYS = (
+    "group",
+    "total",
+    "valid",
+    "coverage",
+    "mean",
+    "std",
+    "uncertainty",
+    "rank",
+)
+
+
+def _validate_group_rank_result(
+    result: Any, *, where: str = "result"
+) -> tuple[str, list[str], list[str], dict[tuple[str, str], dict]]:
+    """Validate a complete :func:`rank_groups` result.
+
+    Checks the ``climate-grid/gec-group-rank-v1`` contract: key order,
+    the reference/group/scenario axes, the flat scenario-then-rank
+    ``data`` order (valid rows, ranked consecutively from 1, followed
+    by the invalid rows) and each row's key order
+    ``scenario, group, count, mean, slope, uncertainty, rank``.
+    ``mean``, ``slope`` and ``uncertainty`` are ``None`` together
+    exactly when ``rank`` is; otherwise they are finite two-item
+    columns with non-negative ``uncertainty`` entries.
+
+    Returns the reference, the groups, the scenarios and a mapping of
+    ``(scenario, group)`` to the row.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _GROUP_RANK_STABILITY_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, "
+            "groups, scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _EVOLUTION_GROUP_RANK_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_EVOLUTION_GROUP_RANK_SCHEMA!r}"
+        )
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    groups = _validate_string_list(result["groups"], f"{where}.groups")
+    if reference in groups:
+        raise ValueError(
+            f"{where}.reference must not appear in {where}.groups"
+        )
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    n_groups = len(groups)
+    n_scenarios = len(scenarios)
+    expected_rows = n_groups * n_scenarios
+    if len(data) != expected_rows:
+        raise ValueError(
+            f"{where}.data must have {expected_rows} rows (one per "
+            "scenario/group combination, in scenario-then-rank order)"
+        )
+
+    rows_by_key: dict[tuple[str, str], dict] = {}
+    row_index = 0
+    for scenario in scenarios:
+        scenario_groups: list[str] = []
+        seen_invalid = False
+        valid_count = 0
+        for _ in range(n_groups):
+            target = f"{where}.data[{row_index}]"
+            row = data[row_index]
+            if not isinstance(row, dict):
+                raise TypeError(f"{target} must be a dict")
+            if tuple(row.keys()) != _EVOLUTION_GROUP_RANK_ROW_KEYS:
+                raise ValueError(
+                    f"{target} must have exactly the keys scenario, group, "
+                    "count, mean, slope, uncertainty, rank in order"
+                )
+
+            row_scenario = row["scenario"]
+            if not isinstance(row_scenario, str):
+                raise TypeError(f"{target}.scenario must be a str")
+            if row_scenario != scenario:
+                raise ValueError(
+                    f"{target}.scenario must be {scenario!r} for its "
+                    "scenario-then-rank position"
+                )
+
+            group = row["group"]
+            if not isinstance(group, str):
+                raise TypeError(f"{target}.group must be a str")
+            if group not in groups:
+                raise ValueError(
+                    f"{target}.group must be an entry of {where}.groups"
+                )
+            if group in scenario_groups:
+                raise ValueError(
+                    f"duplicate {where}.data row for group {group!r} in "
+                    f"scenario {scenario!r}"
+                )
+            scenario_groups.append(group)
+
+            count = row["count"]
+            if not isinstance(count, int) or isinstance(count, bool):
+                raise TypeError(f"{target}.count must be a non-bool int")
+            if count < 0:
+                raise ValueError(f"{target}.count must be non-negative")
+
+            rank = row["rank"]
+            mean = row["mean"]
+            slope = row["slope"]
+            uncertainty = row["uncertainty"]
+
+            if rank is None:
+                seen_invalid = True
+            else:
+                if seen_invalid:
+                    raise ValueError(
+                        f"{target}: ranked rows must precede rows with rank "
+                        "None within each scenario block"
+                    )
+                if not isinstance(rank, int) or isinstance(rank, bool):
+                    raise TypeError(f"{target}.rank must be a non-bool int")
+                valid_count += 1
+                if rank != valid_count:
+                    raise ValueError(
+                        f"{target}.rank must be {valid_count} for the ranked "
+                        "rows in consecutive order from 1"
+                    )
+                if rank > n_groups:
+                    raise ValueError(
+                        f"{target}.rank must not exceed the number of groups"
+                    )
+                if count < 1:
+                    raise ValueError(
+                        f"{target}.count must be positive for a ranked row"
+                    )
+
+            stat_fields = ("mean", "slope", "uncertainty")
+            none_flags = [
+                row[name] is None for name in stat_fields
+            ]
+            if any(none_flags) and not all(none_flags):
+                raise ValueError(
+                    f"{target}: mean, slope and uncertainty must be all None "
+                    "or all present"
+                )
+            if all(none_flags) != (rank is None):
+                raise ValueError(
+                    f"{target}: mean, slope and uncertainty must be None "
+                    "exactly when rank is None"
+                )
+
+            if rank is not None:
+                for column_key, column in (
+                    ("mean", mean),
+                    ("slope", slope),
+                    ("uncertainty", uncertainty),
+                ):
+                    if not isinstance(column, list):
+                        raise TypeError(f"{target}.{column_key} must be a list")
+                    if len(column) != 2:
+                        raise ValueError(
+                            f"{target}.{column_key} must contain exactly 2 "
+                            "items"
+                        )
+                    for column_index, value in enumerate(column):
+                        _validate_number(
+                            value,
+                            f"{target}.{column_key}[{column_index}]",
+                            nullable=False,
+                        )
+                        if column_key == "uncertainty" and value < 0:
+                            raise ValueError(
+                                f"{target}.uncertainty[{column_index}] must "
+                                "be non-negative"
+                            )
+
+            rows_by_key[(scenario, group)] = row
+            row_index += 1
+
+    return reference, groups, scenarios, rows_by_key
+
+
+def group_rank_stability(result, *, minimum: int = 1) -> dict:
+    """Aggregate each group's cross-scenario ranks from a rank result.
+
+    ``result`` must be a complete :func:`rank_groups` result (schema
+    ``climate-grid/gec-group-rank-v1``); every member is validated
+    against that contract, including the flat scenario-then-rank
+    ``data`` order and each row's key order ``scenario, group, count,
+    mean, slope, uncertainty, rank``.  ``minimum`` must be a non-bool
+    positive int.
+
+    For every group (in group order) the scenarios are taken as the
+    aggregation axis: ``total`` is the number of scenarios and
+    ``valid`` is the number whose row has a non-``None`` ``rank``;
+    ``coverage`` is ``valid / total``.  When ``valid < minimum`` the
+    group's ``mean``, ``std``, ``uncertainty`` and ``rank`` are all
+    ``None``.  Otherwise, writing the valid rows' ranks as ``r``,
+    ``mean`` is ``sum(r) / valid``, ``std`` is
+    ``sqrt(sum((r - mean) ** 2) / valid)`` and ``uncertainty`` is
+    ``hypot`` of both ``uncertainty`` entries of every valid row,
+    divided by ``valid``.
+
+    Valid groups are ranked, from 1, by the unrounded ``mean`` rank in
+    ascending order; ties keep the group order.  Invalid groups follow
+    in their original group order with ``rank`` of ``None``.
+
+    The returned mapping uses the key order ``schema, reference,
+    groups, scenarios, data``; ``schema`` is
+    ``climate-grid/ggs-v1`` and ``reference``, ``groups`` and
+    ``scenarios`` echo the result metadata unchanged.  ``data`` is a
+    flat list of rows in the ranked order; each row uses the key order
+    ``group, total, valid, coverage, mean, std, uncertainty, rank``.
+    ``total``, ``valid`` and ``rank`` are ints (``rank`` may be
+    ``None``); every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0`` and a non-finite derived value raises
+    ``ValueError``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    reference, groups, scenarios, rows_by_key = _validate_group_rank_result(
+        result
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    valid_groups: list[dict] = []
+    invalid_groups: list[dict] = []
+    for group in groups:
+        ranks: list[int] = []
+        uncertainties: list[float] = []
+        for scenario in scenarios:
+            row = rows_by_key[(scenario, group)]
+            if row["rank"] is None:
+                continue
+            ranks.append(row["rank"])
+            uncertainties.extend(
+                float(value) for value in row["uncertainty"]
+            )
+
+        total = len(scenarios)
+        valid = len(ranks)
+        coverage = _round_output(valid / total)
+
+        if valid < minimum:
+            invalid_groups.append(
+                {
+                    "group": group,
+                    "total": total,
+                    "valid": valid,
+                    "coverage": coverage,
+                    "mean": None,
+                    "std": None,
+                    "uncertainty": None,
+                    "rank": None,
+                }
+            )
+            continue
+
+        mean_rank = sum(ranks) / valid
+        try:
+            std_rank = math.sqrt(
+                sum((rank - mean_rank) ** 2 for rank in ranks) / valid
+            )
+            uncertainty = math.hypot(*uncertainties) / valid
+        except OverflowError:
+            raise ValueError(
+                f"data for group {group!r} results must be finite"
+            ) from None
+        if not _is_finite(mean_rank) or not _is_finite(std_rank):
+            raise ValueError(
+                f"data for group {group!r} results must be finite"
+            )
+        if not _is_finite(uncertainty):
+            raise ValueError(
+                f"data for group {group!r} results must be finite"
+            )
+
+        valid_groups.append(
+            {
+                "group": group,
+                "total": total,
+                "valid": valid,
+                "coverage": coverage,
+                "mean": _round_output(mean_rank),
+                "std": _round_output(std_rank),
+                "uncertainty": _round_output(uncertainty),
+                "mean_raw": mean_rank,
+            }
+        )
+
+    # The sort is stable, so equal means keep the original groups order.
+    valid_groups.sort(key=lambda item: item["mean_raw"])
+
+    data_rows: list[dict] = []
+    for rank, item in enumerate(valid_groups, start=1):
+        data_rows.append(
+            {
+                "group": item["group"],
+                "total": item["total"],
+                "valid": item["valid"],
+                "coverage": item["coverage"],
+                "mean": item["mean"],
+                "std": item["std"],
+                "uncertainty": item["uncertainty"],
+                "rank": rank,
+            }
+        )
+    for item in invalid_groups:
+        data_rows.append(item)
+
+    return {
+        "schema": _GROUP_RANK_STABILITY_SCHEMA,
+        "reference": reference,
+        "groups": list(groups),
+        "scenarios": list(scenarios),
+        "data": data_rows,
+    }
