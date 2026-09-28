@@ -28917,3 +28917,320 @@ def migration_panel(items, *, minimum: int = 2) -> dict:
         "groups": list(groups),
         "data": data_rows,
     }
+
+
+_MIGRATION_PANEL_DELTA_SCHEMA = "climate-grid/mp-delta-v1"
+_MIGRATION_PANEL_DELTA_KEYS = (
+    "schema",
+    "windows",
+    "regions",
+    "scales",
+    "groups",
+    "pairs",
+    "data",
+)
+_MIGRATION_PANEL_DELTA_PAIR_KEYS = ("name", "left", "right")
+_MIGRATION_PANEL_DELTA_ROW_KEYS = (
+    "pair",
+    "left",
+    "right",
+    "group",
+    "count",
+    "coverage_delta",
+    "change_delta",
+    "uncertainty",
+)
+
+
+def _validate_migration_panel(
+    panel: Any, *, where: str = "panel"
+) -> tuple[list[str], list[str], list[str], list[str], dict]:
+    """Validate a complete :func:`migration_panel` result.
+
+    Returns the ``windows``, ``regions``, ``scales`` and ``groups`` axes
+    and the ``data`` rows keyed by ``(region, group)``, checking the
+    ``climate-grid/mp-v1`` contract: key order, the schema, the axes,
+    the region-then-group row order, each row's key order
+    ``region, group, n, coverage, change, uncertainty`` and the row
+    invariants.  ``n`` is a non-bool int between 0 and the number of
+    windows; ``coverage``, ``change`` and ``uncertainty`` are either all
+    ``None`` or all finite numbers rounded to 12 digits (``coverage``
+    between 0 and 1, ``change`` between -1 and 1, ``uncertainty``
+    non-negative).
+    """
+    if not isinstance(panel, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(panel.keys()) != _MIGRATION_PANEL_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, windows, regions, "
+            "scales, groups, data in order"
+        )
+
+    schema = panel["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MIGRATION_PANEL_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_MIGRATION_PANEL_SCHEMA!r}"
+        )
+
+    windows = _validate_string_list(
+        panel["windows"], f"{where}.windows", minimum=2
+    )
+    regions = _validate_string_list(panel["regions"], f"{where}.regions")
+    scales = _validate_string_list(panel["scales"], f"{where}.scales", minimum=2)
+    groups = _validate_string_list(panel["groups"], f"{where}.groups")
+
+    data = panel["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(regions) * len(groups):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per region/group "
+            "combination"
+        )
+
+    n_windows = len(windows)
+    rows: dict[tuple[str, str], dict] = {}
+    for row_index, row in enumerate(data):
+        region = regions[row_index // len(groups)]
+        group = groups[row_index % len(groups)]
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _MIGRATION_PANEL_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys region, group, n, "
+                "coverage, change, uncertainty in order"
+            )
+
+        if not isinstance(row["region"], str):
+            raise TypeError(f"{row_where}.region must be a str")
+        if row["region"] != region:
+            raise ValueError(
+                f"{row_where}.region {row['region']!r} must follow the "
+                f"region-then-group order (expected {region!r})"
+            )
+        if not isinstance(row["group"], str):
+            raise TypeError(f"{row_where}.group must be a str")
+        if row["group"] != group:
+            raise ValueError(
+                f"{row_where}.group {row['group']!r} must follow the "
+                f"region-then-group order (expected {group!r})"
+            )
+
+        n = row["n"]
+        if not isinstance(n, int) or isinstance(n, bool):
+            raise TypeError(f"{row_where}.n must be a non-bool int")
+        if n < 0 or n > n_windows:
+            raise ValueError(
+                f"{row_where}.n must be between 0 and the number of windows "
+                f"({n_windows})"
+            )
+
+        coverage = row["coverage"]
+        change = row["change"]
+        uncertainty = row["uncertainty"]
+        values_present = [
+            value is not None for value in (coverage, change, uncertainty)
+        ]
+        if any(values_present) and not all(values_present):
+            raise ValueError(
+                f"{row_where}.coverage, change and uncertainty must all be "
+                "None or all be present"
+            )
+        if coverage is not None:
+            _validate_number(coverage, f"{row_where}.coverage", nullable=False)
+            if not 0 <= coverage <= 1:
+                raise ValueError(
+                    f"{row_where}.coverage must be between 0 and 1"
+                )
+            if coverage != _round_output(coverage):
+                raise ValueError(
+                    f"{row_where}.coverage must be rounded to 12 digits"
+                )
+            _validate_number(change, f"{row_where}.change", nullable=False)
+            if not -1 <= change <= 1:
+                raise ValueError(
+                    f"{row_where}.change must be between -1 and 1"
+                )
+            if change != _round_output(change):
+                raise ValueError(
+                    f"{row_where}.change must be rounded to 12 digits"
+                )
+            _validate_number(
+                uncertainty, f"{row_where}.uncertainty", nullable=False
+            )
+            if uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+            if uncertainty != _round_output(uncertainty):
+                raise ValueError(
+                    f"{row_where}.uncertainty must be rounded to 12 digits"
+                )
+
+        rows[(region, group)] = row
+
+    return windows, regions, scales, groups, rows
+
+
+def panel_delta(panel, pairs, *, minimum: int = 1) -> dict:
+    """Compare paired regions of a :func:`migration_panel` result.
+
+    ``panel`` must be a complete :func:`migration_panel` result (schema
+    ``climate-grid/mp-v1``); every member is validated against that
+    contract, including the region-then-group ``data`` row order, each
+    row's key order ``region, group, n, coverage, change, uncertainty``
+    and the count / value invariants.
+
+    ``pairs`` must be a non-empty list; each item must be a dict with
+    exactly the keys ``name, left, right`` in that order, all non-empty
+    ``str`` values.  Pair names must be unique and ``left``/``right``
+    must be two different names from ``panel.regions``.  ``minimum``
+    must be a non-bool positive int.
+
+    For each pair (in pair order) and group (in the groups axis order)
+    one flat row is emitted.  Writing ``L``/``R`` for the left/right
+    region rows, ``count`` is ``min(L.n, R.n)``.  When ``count`` is
+    below ``minimum`` or either row's ``coverage``, ``change`` or
+    ``uncertainty`` is ``None``, ``coverage_delta``, ``change_delta``
+    and ``uncertainty`` are all ``None``.  Otherwise
+    ``coverage_delta`` is ``R.coverage - L.coverage``,
+    ``change_delta`` is ``R.change - L.change`` and ``uncertainty`` is
+    ``hypot(L.uncertainty, R.uncertainty)``.
+
+    The returned mapping uses the key order ``schema, windows, regions,
+    scales, groups, pairs, data``; ``schema`` is
+    ``climate-grid/mp-delta-v1`` and the axes echo ``panel`` unchanged.
+    ``pairs`` is a copy of the input list (with copied item dicts) and
+    ``data`` is a flat list in pair-then-group order; each row uses the
+    key order ``pair, left, right, group, count, coverage_delta,
+    change_delta, uncertainty``.  ``count`` is an int and every output
+    float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``; a non-finite derived value raises ``ValueError``.  The
+    inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    windows, regions, scales, groups, rows = _validate_migration_panel(
+        panel, where="panel"
+    )
+
+    if not isinstance(pairs, list):
+        raise TypeError("pairs must be a list")
+    if len(pairs) == 0:
+        raise ValueError("pairs must be non-empty")
+    seen_pairs: set[str] = set()
+    for index, pair in enumerate(pairs):
+        pair_where = f"pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if tuple(pair.keys()) != _MIGRATION_PANEL_DELTA_PAIR_KEYS:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys name, left, "
+                "right in order"
+            )
+        name = pair["name"]
+        left = pair["left"]
+        right = pair["right"]
+        for key, value in (("name", name), ("left", left), ("right", right)):
+            if not isinstance(value, str):
+                raise TypeError(f"{pair_where}.{key} must be a str")
+            if value == "":
+                raise ValueError(f"{pair_where}.{key} must be non-empty")
+        if name in seen_pairs:
+            raise ValueError(f"duplicate pairs name: {name!r}")
+        seen_pairs.add(name)
+        for key, value in (("left", left), ("right", right)):
+            if value not in regions:
+                raise ValueError(
+                    f"{pair_where}.{key} must be a name in panel.regions"
+                )
+        if left == right:
+            raise ValueError(
+                f"{pair_where}.left and {pair_where}.right must be "
+                "different regions"
+            )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    data_rows: list[dict] = []
+    for pair in pairs:
+        name = pair["name"]
+        left = pair["left"]
+        right = pair["right"]
+        for group in groups:
+            left_row = rows[(left, group)]
+            right_row = rows[(right, group)]
+            count = min(left_row["n"], right_row["n"])
+            if count < minimum or (
+                left_row["coverage"] is None
+                or left_row["change"] is None
+                or left_row["uncertainty"] is None
+                or right_row["coverage"] is None
+                or right_row["change"] is None
+                or right_row["uncertainty"] is None
+            ):
+                coverage_delta = None
+                change_delta = None
+                uncertainty = None
+            else:
+                coverage_value = (
+                    right_row["coverage"] - left_row["coverage"]
+                )
+                change_value = right_row["change"] - left_row["change"]
+                try:
+                    uncertainty_value = math.hypot(
+                        left_row["uncertainty"], right_row["uncertainty"]
+                    )
+                except OverflowError:
+                    raise ValueError(
+                        f"derived statistics for pair {name!r}, group "
+                        f"{group!r} must be finite"
+                    ) from None
+                if not _is_finite(coverage_value) or not _is_finite(
+                    change_value
+                ) or not _is_finite(uncertainty_value):
+                    raise ValueError(
+                        f"derived statistics for pair {name!r}, group "
+                        f"{group!r} must be finite"
+                    )
+                coverage_delta = _round_output(coverage_value)
+                change_delta = _round_output(change_value)
+                uncertainty = _round_output(uncertainty_value)
+
+            data_rows.append(
+                {
+                    "pair": name,
+                    "left": left,
+                    "right": right,
+                    "group": group,
+                    "count": count,
+                    "coverage_delta": coverage_delta,
+                    "change_delta": change_delta,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _MIGRATION_PANEL_DELTA_SCHEMA,
+        "windows": windows,
+        "regions": regions,
+        "scales": scales,
+        "groups": groups,
+        "pairs": [
+            {
+                "name": pair["name"],
+                "left": pair["left"],
+                "right": pair["right"],
+            }
+            for pair in pairs
+        ],
+        "data": data_rows,
+    }
