@@ -23411,6 +23411,14 @@ def grade_compare(items, *, minimum: int = 2) -> dict:
 
 _GRADE_SCALE_SUMMARY_SCHEMA = "climate-grid/rwc-scale-v1"
 _GRADE_SCALE_SUMMARY_ITEM_KEYS = ("scale", "result")
+_GRADE_SCALE_SUMMARY_ROW_KEYS = (
+    "scenario",
+    "valid",
+    "missing",
+    "mean",
+    "std",
+    "band",
+)
 
 
 def _validate_grade_compare(
@@ -23802,6 +23810,481 @@ def grade_scale_summary(items, *, minimum: int = 2) -> dict:
     return {
         "schema": _GRADE_SCALE_SUMMARY_SCHEMA,
         "scales": scales,
+        "names": list(first_names),
+        "pairs": [dict(pair) for pair in first_pairs],
+        "scenarios": list(first_scenarios),
+        "data": data,
+    }
+
+
+_GRADE_SCALE_EVOLUTION_SCHEMA = "climate-grid/rwc-evolution-v1"
+_GRADE_SCALE_EVOLUTION_ITEM_KEYS = ("period", "result")
+_GRADE_SCALE_EVOLUTION_OUTPUT_KEYS = (
+    "schema",
+    "periods",
+    "scales",
+    "names",
+    "pairs",
+    "scenarios",
+    "data",
+)
+_GRADE_SCALE_EVOLUTION_ROW_KEYS = (
+    "scenario",
+    "count",
+    "mean",
+    "std",
+    "slope",
+    "band",
+)
+
+
+def _validate_grade_scale_summary(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list[dict], list[str], list[dict]]:
+    """Validate a complete :func:`grade_scale_summary` result.
+
+    Returns the fresh ``scales`` and ``names`` axes, the fresh
+    ``pairs`` mappings, the ``scenarios`` axis and the data rows (in
+    scenario order), checking the ``climate-grid/rwc-scale-v1``
+    contract: key order, the scales/names/pairs/scenarios axes, the
+    scenario-order rows and the internal
+    ``valid``/``missing``/``mean``/``std``/``band`` invariants of every
+    row.  ``mean``, ``std`` and ``band`` are ``None`` together and must
+    be ``None`` when ``valid`` is zero; when present they are two-item
+    stability/trend columns with non-negative ``std`` entries and
+    ``band`` bounds in ``[lower, upper]`` order.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != (
+        "schema",
+        "scales",
+        "names",
+        "pairs",
+        "scenarios",
+        "data",
+    ):
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scales, names, "
+            "pairs, scenarios, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _GRADE_SCALE_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_GRADE_SCALE_SUMMARY_SCHEMA!r}"
+        )
+
+    scales = result["scales"]
+    if not isinstance(scales, list):
+        raise TypeError(f"{where}.scales must be a list")
+    if len(scales) < 2:
+        raise ValueError(f"{where}.scales must contain at least 2 items")
+    out_scales: list[str] = []
+    seen_scales: set[str] = set()
+    for index, scale in enumerate(scales):
+        scale_where = f"{where}.scales[{index}]"
+        if not isinstance(scale, str):
+            raise TypeError(f"{scale_where} must be a str")
+        if scale == "":
+            raise ValueError(f"{scale_where} must be non-empty")
+        if scale in seen_scales:
+            raise ValueError(f"duplicate {where} scale: {scale!r}")
+        seen_scales.add(scale)
+        out_scales.append(scale)
+
+    names = result["names"]
+    if not isinstance(names, list):
+        raise TypeError(f"{where}.names must be a list")
+    if len(names) < 2:
+        raise ValueError(f"{where}.names must contain at least 2 items")
+    out_names: list[str] = []
+    seen_names: set[str] = set()
+    for index, name in enumerate(names):
+        name_where = f"{where}.names[{index}]"
+        if not isinstance(name, str):
+            raise TypeError(f"{name_where} must be a str")
+        if name == "":
+            raise ValueError(f"{name_where} must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate {where} name: {name!r}")
+        seen_names.add(name)
+        out_names.append(name)
+
+    pairs = result["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError(f"{where}.pairs must be a list")
+    if not pairs:
+        raise ValueError(f"{where}.pairs must be non-empty")
+    out_pairs: list[dict] = []
+    for index, pair in enumerate(pairs):
+        pair_where = f"{where}.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if tuple(pair.keys()) != _GRADE_WINDOW_CHANGE_PAIR_KEYS:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys left, right "
+                "in order"
+            )
+        left = pair["left"]
+        right = pair["right"]
+        if not isinstance(left, str):
+            raise TypeError(f"{pair_where}.left must be a str")
+        if not isinstance(right, str):
+            raise TypeError(f"{pair_where}.right must be a str")
+        if left == "":
+            raise ValueError(f"{pair_where}.left must be non-empty")
+        if right == "":
+            raise ValueError(f"{pair_where}.right must be non-empty")
+        out_pairs.append({"left": left, "right": right})
+
+    scenarios = result["scenarios"]
+    if not isinstance(scenarios, list):
+        raise TypeError(f"{where}.scenarios must be a list")
+    if not scenarios:
+        raise ValueError(f"{where}.scenarios must be non-empty")
+    out_scenarios: list[str] = []
+    seen_scenarios: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        scenario_where = f"{where}.scenarios[{index}]"
+        if not isinstance(scenario, str):
+            raise TypeError(f"{scenario_where} must be a str")
+        if scenario == "":
+            raise ValueError(f"{scenario_where} must be non-empty")
+        if scenario in seen_scenarios:
+            raise ValueError(
+                f"duplicate {where} scenario: {scenario!r}"
+            )
+        seen_scenarios.add(scenario)
+        out_scenarios.append(scenario)
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(out_scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    n_scales = len(out_scales)
+    out_rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _GRADE_SCALE_SUMMARY_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, valid, "
+                "missing, mean, std, band in order"
+            )
+
+        scenario_name = row["scenario"]
+        if not isinstance(scenario_name, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        expected_scenario = out_scenarios[row_index]
+        if scenario_name != expected_scenario:
+            raise ValueError(
+                f"{row_where}.scenario {scenario_name!r} must follow "
+                f"scenario order (expected {expected_scenario!r})"
+            )
+
+        valid = row["valid"]
+        if not isinstance(valid, int) or isinstance(valid, bool):
+            raise TypeError(f"{row_where}.valid must be a non-bool int")
+        if valid < 0:
+            raise ValueError(f"{row_where}.valid must be non-negative")
+        missing = row["missing"]
+        if not isinstance(missing, int) or isinstance(missing, bool):
+            raise TypeError(f"{row_where}.missing must be a non-bool int")
+        if missing < 0:
+            raise ValueError(f"{row_where}.missing must be non-negative")
+        if valid + missing != n_scales:
+            raise ValueError(
+                f"{row_where}.valid and {row_where}.missing must sum to "
+                "the number of scales"
+            )
+
+        mean = row["mean"]
+        std = row["std"]
+        band = row["band"]
+        if mean is None or std is None or band is None:
+            if mean is not None or std is not None or band is not None:
+                raise ValueError(
+                    f"{row_where}.mean, {row_where}.std and "
+                    f"{row_where}.band must be None together"
+                )
+            out_rows.append(row)
+            continue
+        if valid == 0:
+            raise ValueError(
+                f"{row_where}.mean, {row_where}.std and {row_where}.band "
+                "must be None when valid is zero"
+            )
+
+        for column_key, column in (("mean", mean), ("std", std)):
+            if not isinstance(column, list):
+                raise TypeError(f"{row_where}.{column_key} must be a list")
+            if len(column) != 2:
+                raise ValueError(
+                    f"{row_where}.{column_key} must contain exactly 2 items"
+                )
+            for column_index, value in enumerate(column):
+                _validate_number(
+                    value,
+                    f"{row_where}.{column_key}[{column_index}]",
+                    nullable=False,
+                )
+                if column_key == "std" and value < 0:
+                    raise ValueError(
+                        f"{row_where}.std[{column_index}] must be "
+                        "non-negative"
+                    )
+
+        if not isinstance(band, list):
+            raise TypeError(f"{row_where}.band must be a list")
+        if len(band) != 2:
+            raise ValueError(
+                f"{row_where}.band must contain exactly 2 items"
+            )
+        for column_index, bounds in enumerate(band):
+            bounds_where = f"{row_where}.band[{column_index}]"
+            if not isinstance(bounds, list):
+                raise TypeError(f"{bounds_where} must be a list")
+            if len(bounds) != 2:
+                raise ValueError(
+                    f"{bounds_where} must contain exactly 2 items"
+                )
+            _validate_number(
+                bounds[0], f"{bounds_where}[0]", nullable=False
+            )
+            _validate_number(
+                bounds[1], f"{bounds_where}[1]", nullable=False
+            )
+            if bounds[0] > bounds[1]:
+                raise ValueError(
+                    f"{bounds_where} must be in [lower, upper] order"
+                )
+
+        out_rows.append(row)
+
+    return out_scales, out_names, out_pairs, out_scenarios, out_rows
+
+
+def grade_scale_evolution(items, *, minimum: int = 2) -> dict:
+    """Track summarized grade changes across periods.
+
+    ``items`` must be a list of at least two mappings, each with
+    exactly the keys ``period, result`` in that order.  ``period`` is a
+    unique non-empty str and ``result`` is a complete
+    :func:`grade_scale_summary` result (schema
+    ``climate-grid/rwc-scale-v1``), validated against that contract.
+    Every item's result must share the same ``scales``, ``names``,
+    ``pairs`` and ``scenarios`` in the same order; all four axes are
+    taken from the first item's result.  ``minimum`` must be a
+    non-bool int of at least two.
+
+    For every scenario (in scenario order), the item rows whose
+    ``mean``, ``std`` and ``band`` are all present are collected, using
+    the item index ``x``; ``count`` (``n``) is the number of collected
+    rows.  When ``n < minimum``, ``mean``, ``std``, ``slope`` and
+    ``band`` are all ``None``; otherwise, for each of the two columns
+    (stability then trend):
+
+    * ``mean`` is ``M = fsum(m) / n``;
+    * ``std`` is
+      ``P = sqrt(fsum(s ** 2 + (m - M) ** 2) / n)``;
+    * ``slope`` is the least-squares slope
+      ``B = fsum((x - x_bar) * (m - M)) / fsum((x - x_bar) ** 2)``
+      with ``x_bar = fsum(x) / n``;
+    * ``band`` is the ``[min lower bound, max upper bound]`` of the
+      collected bands.
+
+    The returned mapping uses the key order ``schema, periods, scales,
+    names, pairs, scenarios, data``; ``schema`` is
+    ``climate-grid/rwc-evolution-v1``.  ``periods`` lists the item
+    periods in input order, while ``scales``, ``names``, ``pairs`` and
+    ``scenarios`` echo the first item's result axes.  ``data`` follows
+    scenario order; each row uses the key order ``scenario, count,
+    mean, std, slope, band``.  ``count`` is an int and ``mean``,
+    ``std`` and ``slope`` are two-item float lists while ``band`` is a
+    two-item list of ``[min, max]`` bounds; all four are ``None``
+    together.  Every float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0`` and a non-finite derived value raises
+    ``ValueError``.  The input is not modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    periods: list[str] = []
+    validated: list[list[dict]] = []
+    seen_periods: set[str] = set()
+    first_scales: list[str] = []
+    first_names: list[str] = []
+    first_pairs: list[dict] = []
+    first_scenarios: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _GRADE_SCALE_EVOLUTION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys period, result in order"
+            )
+
+        period = item["period"]
+        if not isinstance(period, str):
+            raise TypeError(f"{where}.period must be a str")
+        if period == "":
+            raise ValueError(f"{where}.period must be non-empty")
+        if period in seen_periods:
+            raise ValueError(f"duplicate items period: {period!r}")
+        seen_periods.add(period)
+
+        scales, names, pairs, scenarios, rows = (
+            _validate_grade_scale_summary(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated:
+            first_scales = scales
+            first_names = names
+            first_pairs = pairs
+            first_scenarios = scenarios
+        else:
+            if scales != first_scales:
+                raise ValueError(
+                    "all items must share the same result scales in the "
+                    "same order, taken from the first item"
+                )
+            if names != first_names:
+                raise ValueError(
+                    "all items must share the same result names in the "
+                    "same order, taken from the first item"
+                )
+            if pairs != first_pairs:
+                raise ValueError(
+                    "all items must share the same result pairs in the "
+                    "same order, taken from the first item"
+                )
+            if scenarios != first_scenarios:
+                raise ValueError(
+                    "all items must share the same result scenarios in the "
+                    "same order, taken from the first item"
+                )
+
+        periods.append(period)
+        validated.append(rows)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 2:
+        raise ValueError("minimum must be at least 2")
+
+    data: list[dict] = []
+    for scenario_index, scenario in enumerate(first_scenarios):
+        xs: list[float] = []
+        means: tuple[list, list] = ([], [])
+        stds: tuple[list, list] = ([], [])
+        lower_bounds: tuple[list, list] = ([], [])
+        upper_bounds: tuple[list, list] = ([], [])
+        for item_index, rows in enumerate(validated):
+            row = rows[scenario_index]
+            if (
+                row["mean"] is None
+                or row["std"] is None
+                or row["band"] is None
+            ):
+                continue
+            xs.append(float(item_index))
+            for column in range(2):
+                means[column].append(row["mean"][column])
+                stds[column].append(row["std"][column])
+                lower_bounds[column].append(row["band"][column][0])
+                upper_bounds[column].append(row["band"][column][1])
+
+        count = len(xs)
+
+        if count < minimum:
+            mean = None
+            std = None
+            slope = None
+            band = None
+        else:
+            mean = []
+            std = []
+            slope = []
+            band = []
+            x_bar = math.fsum(xs) / count
+            denominator = math.fsum((x - x_bar) ** 2 for x in xs)
+            for column in range(2):
+                column_means = means[column]
+                column_stds = stds[column]
+                try:
+                    mean_value = math.fsum(column_means) / count
+                    variance_value = (
+                        math.fsum(
+                            std_value * std_value
+                            + (value - mean_value) ** 2
+                            for value, std_value in zip(
+                                column_means, column_stds
+                            )
+                        )
+                        / count
+                    )
+                    slope_value = (
+                        math.fsum(
+                            (x - x_bar) * (value - mean_value)
+                            for x, value in zip(xs, column_means)
+                        )
+                        / denominator
+                    )
+                except (OverflowError, ZeroDivisionError):
+                    raise ValueError(
+                        "grade scale evolution statistics must yield "
+                        "finite statistics"
+                    ) from None
+                std_value = math.sqrt(variance_value)
+                if (
+                    not _is_finite(mean_value)
+                    or not _is_finite(std_value)
+                    or not _is_finite(slope_value)
+                ):
+                    raise ValueError(
+                        "grade scale evolution statistics must yield "
+                        "finite statistics"
+                    )
+                mean.append(_round_output(mean_value))
+                std.append(_round_output(std_value))
+                slope.append(_round_output(slope_value))
+                band.append(
+                    [
+                        _round_output(min(lower_bounds[column])),
+                        _round_output(max(upper_bounds[column])),
+                    ]
+                )
+
+        data.append(
+            {
+                "scenario": scenario,
+                "count": count,
+                "mean": mean,
+                "std": std,
+                "slope": slope,
+                "band": band,
+            }
+        )
+
+    return {
+        "schema": _GRADE_SCALE_EVOLUTION_SCHEMA,
+        "periods": periods,
+        "scales": list(first_scales),
         "names": list(first_names),
         "pairs": [dict(pair) for pair in first_pairs],
         "scenarios": list(first_scenarios),
