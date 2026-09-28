@@ -27933,3 +27933,293 @@ def compare_migration(items, *, minimum: int = 2) -> dict:
         "groups": list(groups),
         "data": data_rows,
     }
+
+
+_MIGRATION_SUMMARY_SCHEMA = "climate-grid/mcs-v1"
+_MIGRATION_SUMMARY_ITEM_KEYS = ("name", "result")
+_MIGRATION_SUMMARY_KEYS = ("schema", "labels", "names", "groups", "data")
+_MIGRATION_SUMMARY_ROW_KEYS = (
+    "group",
+    "n",
+    "missing",
+    "span",
+    "delta",
+    "uncertainty",
+)
+
+
+def _validate_migration_compare_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list[dict]]:
+    """Validate a complete :func:`compare_migration` result.
+
+    Returns the ``names`` and ``groups`` axes and the ``data`` rows,
+    checking the ``climate-grid/mc2-v1`` contract: key order, the
+    schema, the axes, the one-row-per-group order and each row's key
+    order ``group, n, missing, span, agreement, uncertainty``.  ``n``
+    and ``missing`` are non-bool ints with ``n + missing`` equal to the
+    number of names; ``span``, ``agreement`` and ``uncertainty`` are
+    ``None`` together, otherwise ``span`` is a non-negative non-bool
+    int, ``agreement`` is a finite number between 0 and 1 rounded to 12
+    digits and ``uncertainty`` is a non-negative finite number rounded
+    to 12 digits.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _MIGRATION_COMPARE_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, names, groups, "
+            "data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MIGRATION_COMPARE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_MIGRATION_COMPARE_SCHEMA!r}"
+        )
+
+    names = _validate_string_list(result["names"], f"{where}.names", minimum=2)
+    groups = _validate_string_list(result["groups"], f"{where}.groups")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(groups):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per group"
+        )
+
+    total = len(names)
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _MIGRATION_COMPARE_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys group, n, missing, "
+                "span, agreement, uncertainty in order"
+            )
+
+        group = row["group"]
+        if not isinstance(group, str):
+            raise TypeError(f"{row_where}.group must be a str")
+        if group != groups[row_index]:
+            raise ValueError(
+                f"{row_where}.group {group!r} must follow the groups axis "
+                f"order (expected {groups[row_index]!r})"
+            )
+
+        n = row["n"]
+        missing = row["missing"]
+        if not isinstance(n, int) or isinstance(n, bool):
+            raise TypeError(f"{row_where}.n must be a non-bool int")
+        if not isinstance(missing, int) or isinstance(missing, bool):
+            raise TypeError(f"{row_where}.missing must be a non-bool int")
+        if n < 0 or missing < 0 or n + missing != total:
+            raise ValueError(
+                f"{row_where}.n and {row_where}.missing must be "
+                f"non-negative and sum to {total}"
+            )
+
+        span = row["span"]
+        agreement = row["agreement"]
+        uncertainty = row["uncertainty"]
+        members = (span, agreement, uncertainty)
+        present = [value is not None for value in members]
+        if any(present) and not all(present):
+            raise ValueError(
+                f"{row_where}: span, agreement and uncertainty must be all "
+                "None or all present"
+            )
+        if not any(present):
+            continue
+
+        if n < 1:
+            raise ValueError(
+                f"{row_where}: span, agreement and uncertainty must be None "
+                "when n is zero"
+            )
+
+        if not isinstance(span, int) or isinstance(span, bool):
+            raise TypeError(f"{row_where}.span must be a non-bool int")
+        if span < 0:
+            raise ValueError(f"{row_where}.span must be non-negative")
+
+        _validate_number(
+            agreement, f"{row_where}.agreement", nullable=False
+        )
+        if not 0 <= agreement <= 1:
+            raise ValueError(
+                f"{row_where}.agreement must be between 0 and 1"
+            )
+        if agreement != _round_output(agreement):
+            raise ValueError(
+                f"{row_where}.agreement must be rounded to 12 digits"
+            )
+
+        _validate_number(
+            uncertainty, f"{row_where}.uncertainty", nullable=False
+        )
+        if uncertainty < 0:
+            raise ValueError(
+                f"{row_where}.uncertainty must be non-negative"
+            )
+        if uncertainty != _round_output(uncertainty):
+            raise ValueError(
+                f"{row_where}.uncertainty must be rounded to 12 digits"
+            )
+
+    return names, groups, data
+
+
+def migration_summary(items, *, minimum: int = 2) -> dict:
+    """Summarize migration comparisons across named collections.
+
+    ``items`` must be a list of at least two mappings, each with
+    exactly the keys ``name, result`` in that order.  ``name`` is a
+    unique non-empty str and ``result`` is a complete
+    :func:`compare_migration` result (schema ``climate-grid/mc2-v1``)
+    sharing the first item's ``names`` and ``groups`` axes in the same
+    order.  ``minimum`` must be a non-bool positive int.
+
+    For every group (in the groups axis order) the rows whose ``span``,
+    ``agreement`` and ``uncertainty`` are all not ``None`` are
+    collected across the items in item order: ``n`` is their count and
+    ``missing`` is the total item count minus ``n``.  When
+    ``n < minimum``, ``span``, ``delta`` and ``uncertainty`` are all
+    ``None``.  Otherwise ``span`` is ``[minimum span, maximum span]``,
+    ``delta`` is the last collected row's ``agreement`` minus the first
+    collected row's ``agreement`` and ``uncertainty`` is the ``hypot``
+    of the collected rows' ``uncertainty`` values divided by ``n``.
+
+    The returned mapping uses the key order ``schema, labels, names,
+    groups, data``; ``schema`` is ``climate-grid/mcs-v1``, ``labels``
+    lists the item names in item order and ``names`` and ``groups``
+    echo the first item's result axes.  ``data`` follows the groups
+    axis order.  Each row uses the key order ``group, n, missing,
+    span, delta, uncertainty``; ``n`` and ``missing`` are ints and
+    ``span`` is ``None`` or a two-item list of ints.  Every output
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``
+    and a non-finite derived value raises ``ValueError``.  The inputs
+    are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    labels: list[str] = []
+    seen_names: set[str] = set()
+    validated_rows: list[dict[str, dict]] = []
+    names: list[str] = []
+    groups: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _MIGRATION_SUMMARY_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate item name: {name!r}")
+        seen_names.add(name)
+
+        item_names, item_groups, data = _validate_migration_compare_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not validated_rows:
+            names = item_names
+            groups = item_groups
+        else:
+            if item_names != names:
+                raise ValueError(
+                    "all items must share the same result names in the "
+                    "same order, taken from the first item"
+                )
+            if item_groups != groups:
+                raise ValueError(
+                    "all items must share the same result groups in the "
+                    "same order, taken from the first item"
+                )
+
+        labels.append(name)
+        validated_rows.append({row["group"]: row for row in data})
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    total = len(items)
+    data_rows: list[dict] = []
+    for group in groups:
+        present_rows = [
+            rows[group]
+            for rows in validated_rows
+            if rows[group]["span"] is not None
+            and rows[group]["agreement"] is not None
+            and rows[group]["uncertainty"] is not None
+        ]
+        n = len(present_rows)
+        missing = total - n
+        if n < minimum:
+            data_rows.append(
+                {
+                    "group": group,
+                    "n": n,
+                    "missing": missing,
+                    "span": None,
+                    "delta": None,
+                    "uncertainty": None,
+                }
+            )
+            continue
+
+        spans = [row["span"] for row in present_rows]
+        agreements = [row["agreement"] for row in present_rows]
+        uncertainties = [row["uncertainty"] for row in present_rows]
+        delta_value = agreements[-1] - agreements[0]
+        try:
+            uncertainty_value = math.hypot(*uncertainties) / n
+        except OverflowError:
+            raise ValueError(
+                f"derived statistics for group {group!r} must be finite"
+            ) from None
+        if not _is_finite(delta_value) or not _is_finite(
+            uncertainty_value
+        ):
+            raise ValueError(
+                f"derived statistics for group {group!r} must be finite"
+            )
+
+        data_rows.append(
+            {
+                "group": group,
+                "n": n,
+                "missing": missing,
+                "span": [min(spans), max(spans)],
+                "delta": _round_output(delta_value),
+                "uncertainty": _round_output(uncertainty_value),
+            }
+        )
+
+    return {
+        "schema": _MIGRATION_SUMMARY_SCHEMA,
+        "labels": labels,
+        "names": list(names),
+        "groups": list(groups),
+        "data": data_rows,
+    }
