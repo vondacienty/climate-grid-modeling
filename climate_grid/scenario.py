@@ -27022,9 +27022,10 @@ def group_migration(items, *, minimum: int = 1) -> dict:
                                 f"derived statistics for group {group!r} "
                                 "must be finite"
                             )
+                        u = _round_output(u)
                         deltas.append(d)
                         uncertainties.append(u)
-                changes.append([d, _round_output(u) if u is not None else None])
+                changes.append([d, u])
 
             valid = len(deltas)
             base_row = {
@@ -27096,6 +27097,14 @@ def group_migration(items, *, minimum: int = 1) -> dict:
 
 
 _MIGRATION_CONSENSUS_SCHEMA = "climate-grid/gmc-v1"
+_MIGRATION_CONSENSUS_RESULT_KEYS = (
+    "schema",
+    "scales",
+    "regions",
+    "reference",
+    "groups",
+    "data",
+)
 _MIGRATION_CONSENSUS_ROW_KEYS = (
     "group",
     "covered",
@@ -27123,7 +27132,9 @@ def _validate_group_migration_result(
     number of non-``None`` pairs; ranked rows run consecutively from 1
     within each region, sorted by their unrounded ``mean_abs`` with the
     group order breaking ties, and precede the ``rank`` ``None`` rows,
-    which keep the original group order.
+    which keep the original group order.  Ranked rows must carry an
+    ``uncertainty`` equal to the ``hypot`` of the non-``None`` changes
+    uncertainties divided by ``valid``, rounded to 12 digits.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -27232,6 +27243,7 @@ def _validate_group_migration_result(
                 )
 
             deltas: list[int] = []
+            change_uncertainties: list[float] = []
             for c_index, pair in enumerate(changes):
                 pair_where = f"{row_where}.changes[{c_index}]"
                 if not isinstance(pair, list):
@@ -27267,6 +27279,7 @@ def _validate_group_migration_result(
                         f"{pair_where}[1] must be rounded to 12 digits"
                     )
                 deltas.append(delta)
+                change_uncertainties.append(pair_uncertainty)
 
             if valid != len(deltas):
                 raise ValueError(
@@ -27339,6 +27352,20 @@ def _validate_group_migration_result(
             if uncertainty != _round_output(uncertainty):
                 raise ValueError(
                     f"{row_where}.uncertainty must be rounded to 12 digits"
+                )
+            try:
+                expected_uncertainty = math.hypot(
+                    *change_uncertainties
+                ) / valid
+            except OverflowError:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be finite"
+                ) from None
+            if uncertainty != _round_output(expected_uncertainty):
+                raise ValueError(
+                    f"{row_where}.uncertainty must equal the hypot of the "
+                    "changes uncertainties divided by valid, rounded to "
+                    "12 digits"
                 )
             sort_key = (mean_abs_value, order)
             if last_sort_key is not None and sort_key < last_sort_key:
@@ -27492,5 +27519,407 @@ def migration_consensus(result, *, minimum: int = 1) -> dict:
         "regions": list(regions),
         "reference": reference,
         "groups": list(groups),
+        "data": data_rows,
+    }
+
+
+_MIGRATION_COMPARE_SCHEMA = "climate-grid/mc2-v1"
+_MIGRATION_COMPARE_ITEM_KEYS = ("name", "result")
+_MIGRATION_COMPARE_RESULT_KEYS = ("schema", "names", "groups", "data")
+_MIGRATION_COMPARE_ROW_KEYS = (
+    "group",
+    "n",
+    "missing",
+    "span",
+    "agreement",
+    "uncertainty",
+)
+
+
+def _validate_migration_consensus_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], str, list[str], list[dict]]:
+    """Validate a complete :func:`migration_consensus` result.
+
+    Returns the ``scales`` and ``regions`` axes, the ``reference``
+    group, the ``groups`` axis and the flat ``data`` rows, checking the
+    ``climate-grid/gmc-v1`` contract: key order, the schema, the axes,
+    the ranked-then-unranked row order, each row's key order
+    ``group, covered, signs, agreement, magnitude, uncertainty, rank``
+    and the internal invariants: ``covered`` equals the number of
+    regions whose rank is not ``None``, ``signs`` is a three-entry list
+    of non-negative ints and, for ranked rows, runs consecutively from 1
+    ordered by the row ``magnitude`` with the group order breaking ties,
+    ``agreement`` equals ``max(signs) / sum(signs)`` rounded to 12
+    digits, and ``magnitude`` and ``uncertainty`` are finite numbers
+    rounded to 12 digits.  Unranked rows keep the original group order
+    and carry ``None`` for ``agreement``, ``magnitude`` and
+    ``uncertainty``.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _MIGRATION_CONSENSUS_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scales, "
+            "regions, reference, groups, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MIGRATION_CONSENSUS_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_MIGRATION_CONSENSUS_SCHEMA!r}"
+        )
+
+    scales = _validate_string_list(
+        result["scales"], f"{where}.scales", minimum=2
+    )
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    groups = _validate_string_list(result["groups"], f"{where}.groups")
+    if reference in groups:
+        raise ValueError(
+            f"{where}.reference must not appear in {where}.groups"
+        )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(groups):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per group"
+        )
+
+    group_index = {group: index for index, group in enumerate(groups)}
+    seen_groups: set[str] = set()
+    rank_count = 0
+    null_phase = False
+    invalid_order = -1
+    last_sort_key: tuple[float, int] | None = None
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _MIGRATION_CONSENSUS_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys group, covered, "
+                "signs, agreement, magnitude, uncertainty, rank in order"
+            )
+
+        group = row["group"]
+        if not isinstance(group, str):
+            raise TypeError(f"{row_where}.group must be a str")
+        if group not in group_index:
+            raise ValueError(
+                f"{row_where}.group {group!r} must appear in {where}.groups"
+            )
+        if group in seen_groups:
+            raise ValueError(
+                f"{row_where}: group {group!r} appears more than once"
+            )
+        seen_groups.add(group)
+        order = group_index[group]
+
+        covered = row["covered"]
+        if not isinstance(covered, int) or isinstance(covered, bool):
+            raise TypeError(f"{row_where}.covered must be a non-bool int")
+        if not 0 <= covered <= len(regions):
+            raise ValueError(
+                f"{row_where}.covered must be between 0 and the number "
+                "of regions"
+            )
+
+        signs = row["signs"]
+        if not isinstance(signs, list):
+            raise TypeError(f"{row_where}.signs must be a list")
+        if len(signs) != 3:
+            raise ValueError(
+                f"{row_where}.signs must contain exactly 3 entries"
+            )
+        for s_index, sign in enumerate(signs):
+            if not isinstance(sign, int) or isinstance(sign, bool):
+                raise TypeError(
+                    f"{row_where}.signs[{s_index}] must be a non-bool int"
+                )
+            if sign < 0:
+                raise ValueError(
+                    f"{row_where}.signs[{s_index}] must be non-negative"
+                )
+
+        agreement = row["agreement"]
+        magnitude = row["magnitude"]
+        uncertainty = row["uncertainty"]
+        rank = row["rank"]
+        present = [
+            value is not None for value in (agreement, magnitude, uncertainty)
+        ]
+        rank_present = rank is not None
+        if any(present) and not all(present):
+            raise ValueError(
+                f"{row_where}: agreement, magnitude and uncertainty must "
+                "be all None or all present"
+            )
+        if any(present) != rank_present:
+            raise ValueError(
+                f"{row_where}: agreement, magnitude and uncertainty must "
+                "be present exactly when rank is not None"
+            )
+
+        if not rank_present:
+            if null_phase and order <= invalid_order:
+                raise ValueError(
+                    f"{row_where}: unranked rows must keep the original "
+                    "group order"
+                )
+            null_phase = True
+            invalid_order = order
+            continue
+
+        if null_phase:
+            raise ValueError(
+                f"{row_where}: ranked rows must precede rows with rank None"
+            )
+        if covered < 1:
+            raise ValueError(
+                f"{row_where}.covered must be positive when rank is not None"
+            )
+        if not isinstance(rank, int) or isinstance(rank, bool):
+            raise TypeError(
+                f"{row_where}.rank must be a non-bool int or None"
+            )
+        rank_count += 1
+        if rank != rank_count:
+            raise ValueError(
+                f"{row_where}.rank must run consecutively from 1"
+            )
+
+        signs_sum = sum(signs)
+        if signs_sum < 1:
+            raise ValueError(
+                f"{row_where}.signs must contain at least one counted sign"
+            )
+        _validate_number(
+            agreement, f"{row_where}.agreement", nullable=False
+        )
+        if not 0.0 <= float(agreement) <= 1.0:
+            raise ValueError(
+                f"{row_where}.agreement must be between 0 and 1"
+            )
+        agreement_value = max(signs) / signs_sum
+        if agreement != _round_output(agreement_value):
+            raise ValueError(
+                f"{row_where}.agreement must equal max(signs) / sum(signs), "
+                "rounded to 12 digits"
+            )
+
+        _validate_number(
+            magnitude, f"{row_where}.magnitude", nullable=False
+        )
+        if magnitude < 0:
+            raise ValueError(
+                f"{row_where}.magnitude must be non-negative"
+            )
+        if magnitude != _round_output(magnitude):
+            raise ValueError(
+                f"{row_where}.magnitude must be rounded to 12 digits"
+            )
+
+        _validate_number(
+            uncertainty, f"{row_where}.uncertainty", nullable=False
+        )
+        if uncertainty < 0:
+            raise ValueError(
+                f"{row_where}.uncertainty must be non-negative"
+            )
+        if uncertainty != _round_output(uncertainty):
+            raise ValueError(
+                f"{row_where}.uncertainty must be rounded to 12 digits"
+            )
+
+        sort_key = (float(magnitude), order)
+        if last_sort_key is not None and sort_key < last_sort_key:
+            raise ValueError(
+                f"{row_where}: ranked rows must be ordered by magnitude "
+                "with the group order breaking ties"
+            )
+        last_sort_key = sort_key
+
+    return scales, regions, reference, groups, data
+
+
+def compare_migration(items, *, minimum: int = 2) -> dict:
+    """Compare the group migration consensus of several scenarios.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a unique
+    non-empty str and ``result`` is a complete :func:`migration_consensus`
+    result (schema ``climate-grid/gmc-v1``); every member is validated
+    against that contract and all results must share the same
+    ``scales``, ``regions``, ``reference`` and ``groups`` axes in the
+    same order, taken from the first item.  ``minimum`` must be a
+    non-bool positive int.
+
+    For every group (in the groups axis order) the item rows whose
+    ``rank`` is not ``None`` are collected: ``n`` is their count and
+    ``missing`` is the total item count minus ``n``.  When
+    ``n < minimum``, ``span``, ``agreement`` and ``uncertainty`` are all
+    ``None``.  Otherwise ``span`` is the largest rank minus the
+    smallest, the three-entry ``signs`` lists of the collected rows are
+    summed column by column into ``s``, ``agreement`` is
+    ``max(s) / sum(s)`` and ``uncertainty`` is the ``hypot`` of the
+    collected rows' ``uncertainty`` values divided by ``n``.
+
+    The returned mapping uses the key order ``schema, names, groups,
+    data``; ``schema`` is ``climate-grid/mc2-v1``, ``names`` and
+    ``groups`` echo the inputs and ``data`` follows the groups order.
+    Each row uses the key order ``group, n, missing, span, agreement,
+    uncertainty``; ``n`` and ``missing`` are ints and ``span`` is an int
+    or ``None``.  Every output float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0`` and a non-finite result raises
+    ``ValueError``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    first_scales: list[str] | None = None
+    first_regions: list[str] | None = None
+    first_reference: str = ""
+    first_groups: list[str] = []
+    rows_by_item: list[dict[str, dict]] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _MIGRATION_COMPARE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate item name: {name!r}")
+        seen_names.add(name)
+
+        scales, regions, reference, groups, rows = (
+            _validate_migration_consensus_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if first_scales is None:
+            first_scales = scales
+            first_regions = regions
+            first_reference = reference
+            first_groups = groups
+        else:
+            if scales != first_scales:
+                raise ValueError(
+                    "all items must share the same result scales in the "
+                    "same order, taken from the first item"
+                )
+            if regions != first_regions:
+                raise ValueError(
+                    "all items must share the same result regions in the "
+                    "same order, taken from the first item"
+                )
+            if reference != first_reference:
+                raise ValueError(
+                    "all items must share the same result reference, taken "
+                    "from the first item"
+                )
+            if groups != first_groups:
+                raise ValueError(
+                    "all items must share the same result groups in the "
+                    "same order, taken from the first item"
+                )
+
+        names.append(name)
+        rows_by_item.append({row["group"]: row for row in rows})
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    total = len(items)
+    data_rows: list[dict] = []
+    for group in first_groups:
+        ranks: list[int] = []
+        signs_sums = [0, 0, 0]
+        uncertainties: list[float] = []
+        for group_rows in rows_by_item:
+            row = group_rows[group]
+            if row["rank"] is None:
+                continue
+            ranks.append(int(row["rank"]))
+            for s_index in range(3):
+                signs_sums[s_index] += int(row["signs"][s_index])
+            uncertainties.append(float(row["uncertainty"]))
+
+        n = len(ranks)
+        missing = total - n
+        if n < minimum:
+            data_rows.append(
+                {
+                    "group": group,
+                    "n": n,
+                    "missing": missing,
+                    "span": None,
+                    "agreement": None,
+                    "uncertainty": None,
+                }
+            )
+            continue
+
+        span = max(ranks) - min(ranks)
+        signs_total = sum(signs_sums)
+        agreement_value = max(signs_sums) / signs_total
+        try:
+            uncertainty_value = math.hypot(*uncertainties) / n
+        except OverflowError:
+            raise ValueError(
+                f"derived statistics for group {group!r} must be finite"
+            ) from None
+        if (
+            not _is_finite(agreement_value)
+            or not _is_finite(uncertainty_value)
+        ):
+            raise ValueError(
+                f"derived statistics for group {group!r} must be finite"
+            )
+
+        data_rows.append(
+            {
+                "group": group,
+                "n": n,
+                "missing": missing,
+                "span": span,
+                "agreement": _round_output(agreement_value),
+                "uncertainty": _round_output(uncertainty_value),
+            }
+        )
+
+    return {
+        "schema": _MIGRATION_COMPARE_SCHEMA,
+        "names": list(names),
+        "groups": list(first_groups),
         "data": data_rows,
     }
