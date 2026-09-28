@@ -25426,3 +25426,273 @@ def aggregate_comparisons(items, *, minimum: int = 2) -> dict:
         "scenarios": list(first_scenarios),
         "data": data,
     }
+
+
+_EVOLUTION_GROUP_COMPARISONS_SCHEMA = "climate-grid/gec-group-v1"
+_EVOLUTION_GROUP_ITEM_KEYS = ("name", "labels")
+_EVOLUTION_GROUP_COMPARISONS_KEYS = (
+    "schema",
+    "groups",
+    "scenarios",
+    "data",
+)
+_EVOLUTION_GROUP_COMPARISONS_ROW_KEYS = (
+    "group",
+    "scenario",
+    "count",
+    "mean",
+    "slope",
+    "uncertainty",
+    "band",
+)
+
+
+def group_comparisons(items, groups, *, minimum: int = 2) -> dict:
+    """Aggregate pairwise :func:`compare_summaries` results by group.
+
+    ``items`` follows the :func:`aggregate_comparisons` contract: a
+    list of at least two mappings, each with exactly the keys
+    ``name, result`` in that order, where ``name`` is a unique
+    non-empty str and ``result`` is a complete
+    :func:`compare_summaries` result (schema ``climate-grid/gec-v1``);
+    every item's result must share the same ``scenarios`` axis in the
+    same order, taken from the first item.
+
+    ``groups`` must be a non-empty list of mappings, each with exactly
+    the keys ``name, labels`` in that order.  ``name`` is a unique
+    non-empty str and ``labels`` is a non-empty list of distinct
+    non-empty str values.  Across the groups the labels must contain no
+    duplicates and cover every ``items`` name exactly once.
+    ``minimum`` must be a non-bool positive int.
+
+    For every group (in group order) and scenario (in scenario order),
+    the item rows of the group labels whose ``mean``, ``slope``,
+    ``uncertainty`` and ``band`` are all present are collected and
+    ``count`` is the number ``n`` of collected rows.  When
+    ``n < minimum``, ``mean``, ``slope``, ``uncertainty`` and ``band``
+    are all ``None``; otherwise, for each of the two columns, ``mean``
+    is ``fsum(values) / n``, ``slope`` is ``fsum(values) / n`` of the
+    collected slopes, writing the collected uncertainties as ``u``,
+    ``uncertainty`` is ``hypot(*u) / n`` and ``band`` is the
+    ``[min lower bound, max upper bound]`` of the collected bands.
+
+    The returned mapping uses the key order ``schema, groups,
+    scenarios, data``; ``schema`` is ``climate-grid/gec-group-v1``.
+    ``groups`` lists the group names in group order and ``scenarios``
+    echoes the shared scenario axis in its original order.  ``data``
+    follows group then scenario order; each row uses the key order
+    ``group, scenario, count, mean, slope, uncertainty, band``.
+    ``count`` is an int and ``mean``, ``slope`` and ``uncertainty`` are
+    two-item float lists while ``band`` is a two-item list of
+    ``[lower, upper]`` bounds, or all four are ``None``.  Every float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0`` and a
+    non-finite derived value raises ``ValueError``.  The input is not
+    modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite values in an item result.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    labels: list[str] = []
+    validated: list[list[dict]] = []
+    seen_names: set[str] = set()
+    first_scenarios: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _EVOLUTION_SUMMARY_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        scenarios, rows = _validate_compare_summaries_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not validated:
+            first_scenarios = scenarios
+        elif scenarios != first_scenarios:
+            raise ValueError(
+                "all items must share the same result scenarios in the "
+                "same order, taken from the first item"
+            )
+
+        labels.append(name)
+        validated.append(rows)
+
+    if not isinstance(groups, list):
+        raise TypeError("groups must be a list")
+    if len(groups) < 1:
+        raise ValueError("groups must contain at least 1 group")
+
+    group_names: list[str] = []
+    group_labels: list[list[str]] = []
+    seen_group_names: set[str] = set()
+    covered: set[str] = set()
+    for group_index, group in enumerate(groups):
+        where = f"groups[{group_index}]"
+        if not isinstance(group, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(group.keys()) != _EVOLUTION_GROUP_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, labels in order"
+            )
+
+        group_name = group["name"]
+        if not isinstance(group_name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if group_name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if group_name in seen_group_names:
+            raise ValueError(f"duplicate groups name: {group_name!r}")
+        seen_group_names.add(group_name)
+
+        group_label_list = group["labels"]
+        if not isinstance(group_label_list, list):
+            raise TypeError(f"{where}.labels must be a list")
+        if len(group_label_list) < 1:
+            raise ValueError(f"{where}.labels must be non-empty")
+        seen_labels: set[str] = set()
+        for label_index, label in enumerate(group_label_list):
+            label_where = f"{where}.labels[{label_index}]"
+            if not isinstance(label, str):
+                raise TypeError(f"{label_where} must be a str")
+            if label == "":
+                raise ValueError(f"{label_where} must be non-empty")
+            if label in seen_labels:
+                raise ValueError(
+                    f"duplicate {where}.labels entry: {label!r}"
+                )
+            seen_labels.add(label)
+            if label in covered:
+                raise ValueError(
+                    f"{label!r} is assigned to more than one group"
+                )
+            covered.add(label)
+
+        group_names.append(group_name)
+        group_labels.append(group_label_list)
+
+    if covered != seen_names:
+        raise ValueError(
+            "groups labels must cover every items name exactly once"
+        )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    rows_by_name = {
+        name: rows for name, rows in zip(labels, validated)
+    }
+
+    data: list[dict] = []
+    for group_name, group_label_list in zip(group_names, group_labels):
+        group_rows = [rows_by_name[label] for label in group_label_list]
+        for scenario_index, scenario in enumerate(first_scenarios):
+            means: tuple[list, list] = ([], [])
+            slopes: tuple[list, list] = ([], [])
+            uncertainties: tuple[list, list] = ([], [])
+            lower_bounds: tuple[list, list] = ([], [])
+            upper_bounds: tuple[list, list] = ([], [])
+            for rows in group_rows:
+                row = rows[scenario_index]
+                if (
+                    row["mean"] is None
+                    or row["slope"] is None
+                    or row["uncertainty"] is None
+                    or row["band"] is None
+                ):
+                    continue
+                for column in range(2):
+                    means[column].append(float(row["mean"][column]))
+                    slopes[column].append(float(row["slope"][column]))
+                    uncertainties[column].append(
+                        float(row["uncertainty"][column])
+                    )
+                    lower_bounds[column].append(float(row["band"][column][0]))
+                    upper_bounds[column].append(float(row["band"][column][1]))
+
+            count = len(means[0])
+
+            if count < minimum:
+                mean = None
+                slope = None
+                uncertainty = None
+                band = None
+            else:
+                mean = []
+                slope = []
+                uncertainty = []
+                band = []
+                for column in range(2):
+                    try:
+                        mean_value = math.fsum(means[column]) / count
+                        slope_value = math.fsum(slopes[column]) / count
+                        uncertainty_value = (
+                            math.hypot(*uncertainties[column]) / count
+                        )
+                        lower_value = min(lower_bounds[column])
+                        upper_value = max(upper_bounds[column])
+                    except OverflowError:
+                        raise ValueError(
+                            f"data[{group_name!r}][{scenario!r}] results "
+                            "must be finite"
+                        ) from None
+                    if not all(
+                        _is_finite(value)
+                        for value in (
+                            mean_value,
+                            slope_value,
+                            uncertainty_value,
+                            lower_value,
+                            upper_value,
+                        )
+                    ):
+                        raise ValueError(
+                            f"data[{group_name!r}][{scenario!r}] results "
+                            "must be finite"
+                        )
+                    mean.append(_round_output(mean_value))
+                    slope.append(_round_output(slope_value))
+                    uncertainty.append(_round_output(uncertainty_value))
+                    band.append(
+                        [
+                            _round_output(lower_value),
+                            _round_output(upper_value),
+                        ]
+                    )
+
+            data.append(
+                {
+                    "group": group_name,
+                    "scenario": scenario,
+                    "count": count,
+                    "mean": mean,
+                    "slope": slope,
+                    "uncertainty": uncertainty,
+                    "band": band,
+                }
+            )
+
+    return {
+        "schema": _EVOLUTION_GROUP_COMPARISONS_SCHEMA,
+        "groups": group_names,
+        "scenarios": list(first_scenarios),
+        "data": data,
+    }
