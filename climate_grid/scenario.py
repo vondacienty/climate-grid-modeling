@@ -24733,3 +24733,357 @@ def evolution_summary(items, *, minimum: int = 2) -> dict:
         "scenarios": list(first_scenarios),
         "data": data,
     }
+
+
+_EVOLUTION_COMPARE_SUMMARIES_SCHEMA = "climate-grid/gec-v1"
+_EVOLUTION_COMPARE_SUMMARIES_KEYS = (
+    "schema",
+    "scenarios",
+    "data",
+)
+_EVOLUTION_COMPARE_SUMMARIES_ROW_KEYS = (
+    "scenario",
+    "count",
+    "mean",
+    "slope",
+    "uncertainty",
+    "band",
+)
+
+
+def _validate_evolution_summary_result(
+    summary: Any, *, where: str = "summary"
+) -> tuple[
+    list[str], list[str], list[str], list[dict], list[str], list[dict]
+]:
+    """Validate a complete :func:`evolution_summary` result.
+
+    Returns the fresh ``periods``, ``scales`` and ``names`` axes, the
+    fresh ``pairs`` mappings, the ``scenarios`` axis and the data rows
+    (in scenario order), checking the ``climate-grid/ges-v1``
+    contract: key order, the periods/scales/names/pairs/scenarios axes,
+    the scenario-order rows and the internal
+    ``count``/``mean``/``std``/``slope``/``band`` invariants of every
+    row.  ``mean``, ``std``, ``slope`` and ``band`` are ``None``
+    together; when present they are two-item columns with
+    non-negative ``std`` entries and ``band`` bounds in
+    ``[lower, upper]`` order.
+    """
+    if not isinstance(summary, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(summary.keys()) != _EVOLUTION_SUMMARY_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, labels, periods, "
+            "scales, names, pairs, scenarios, data in order"
+        )
+
+    schema = summary["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _EVOLUTION_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_EVOLUTION_SUMMARY_SCHEMA!r}"
+        )
+
+    labels = _validate_string_list(
+        summary["labels"], f"{where}.labels", minimum=2
+    )
+    periods = _validate_string_list(
+        summary["periods"], f"{where}.periods", minimum=2
+    )
+    scales = _validate_string_list(
+        summary["scales"], f"{where}.scales", minimum=2
+    )
+    names = _validate_string_list(
+        summary["names"], f"{where}.names", minimum=2
+    )
+
+    pairs = summary["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError(f"{where}.pairs must be a list")
+    if not pairs:
+        raise ValueError(f"{where}.pairs must be non-empty")
+    out_pairs: list[dict] = []
+    for index, pair in enumerate(pairs):
+        pair_where = f"{where}.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if tuple(pair.keys()) != _GRADE_WINDOW_CHANGE_PAIR_KEYS:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys left, right "
+                "in order"
+            )
+        left = pair["left"]
+        right = pair["right"]
+        if not isinstance(left, str):
+            raise TypeError(f"{pair_where}.left must be a str")
+        if not isinstance(right, str):
+            raise TypeError(f"{pair_where}.right must be a str")
+        if left == "":
+            raise ValueError(f"{pair_where}.left must be non-empty")
+        if right == "":
+            raise ValueError(f"{pair_where}.right must be non-empty")
+        out_pairs.append({"left": left, "right": right})
+
+    scenarios = _validate_string_list(
+        summary["scenarios"], f"{where}.scenarios", minimum=1
+    )
+
+    data = summary["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    n_labels = len(labels)
+    out_rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _EVOLUTION_SUMMARY_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, count, "
+                "mean, std, slope, band in order"
+            )
+
+        scenario_name = row["scenario"]
+        if not isinstance(scenario_name, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        expected_scenario = scenarios[row_index]
+        if scenario_name != expected_scenario:
+            raise ValueError(
+                f"{row_where}.scenario {scenario_name!r} must follow "
+                f"scenario order (expected {expected_scenario!r})"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if not 0 <= count <= n_labels:
+            raise ValueError(
+                f"{row_where}.count must be between 0 and the number of "
+                "labels"
+            )
+
+        mean = row["mean"]
+        std = row["std"]
+        slope = row["slope"]
+        band = row["band"]
+        if mean is None or std is None or slope is None or band is None:
+            if (
+                mean is not None
+                or std is not None
+                or slope is not None
+                or band is not None
+            ):
+                raise ValueError(
+                    f"{row_where}.mean, {row_where}.std, "
+                    f"{row_where}.slope and {row_where}.band must be None "
+                    "together"
+                )
+            out_rows.append(row)
+            continue
+
+        for column_key, column in (
+            ("mean", mean),
+            ("std", std),
+            ("slope", slope),
+        ):
+            if not isinstance(column, list):
+                raise TypeError(f"{row_where}.{column_key} must be a list")
+            if len(column) != 2:
+                raise ValueError(
+                    f"{row_where}.{column_key} must contain exactly 2 items"
+                )
+            for column_index, value in enumerate(column):
+                _validate_number(
+                    value,
+                    f"{row_where}.{column_key}[{column_index}]",
+                    nullable=False,
+                )
+                if column_key == "std" and value < 0:
+                    raise ValueError(
+                        f"{row_where}.std[{column_index}] must be "
+                        "non-negative"
+                    )
+
+        if not isinstance(band, list):
+            raise TypeError(f"{row_where}.band must be a list")
+        if len(band) != 2:
+            raise ValueError(
+                f"{row_where}.band must contain exactly 2 items"
+            )
+        for column_index, bounds in enumerate(band):
+            bounds_where = f"{row_where}.band[{column_index}]"
+            if not isinstance(bounds, list):
+                raise TypeError(f"{bounds_where} must be a list")
+            if len(bounds) != 2:
+                raise ValueError(
+                    f"{bounds_where} must contain exactly 2 items"
+                )
+            _validate_number(
+                bounds[0], f"{bounds_where}[0]", nullable=False
+            )
+            _validate_number(
+                bounds[1], f"{bounds_where}[1]", nullable=False
+            )
+            if bounds[0] > bounds[1]:
+                raise ValueError(
+                    f"{bounds_where} must be in [lower, upper] order"
+                )
+
+        out_rows.append(row)
+
+    return periods, scales, names, out_pairs, scenarios, out_rows
+
+
+def compare_summaries(left, right, *, minimum: int = 2) -> dict:
+    """Pairwise-compare two complete :func:`evolution_summary` results.
+
+    ``left`` and ``right`` must each be a complete
+    :func:`evolution_summary` result (schema ``climate-grid/ges-v1``),
+    validated against that contract.  Both must share the same
+    ``periods``, ``scales``, ``names``, ``pairs`` and ``scenarios``
+    axes in the same order; the axes are taken from ``left``.
+    ``minimum`` must be a non-bool positive int.
+
+    Rows are paired by scenario (in scenario order) and ``count`` is
+    ``min(left count, right count)``.  When either paired count is
+    below ``minimum``, or either side has ``mean``, ``std``, ``slope``
+    or ``band`` equal to ``None``, the output ``mean``, ``slope``,
+    ``uncertainty`` and ``band`` are all ``None``.  Otherwise, for each
+    of the two columns, ``mean`` is the right mean minus the left mean,
+    ``slope`` the right slope minus the left slope, ``uncertainty`` is
+    ``hypot(left std, right std)`` and ``band`` is
+    ``[right lower - left upper, right upper - left lower]``.
+
+    The returned mapping uses the key order ``schema, scenarios, data``;
+    ``schema`` is ``climate-grid/gec-v1`` and ``scenarios`` echoes the
+    shared scenario axis in its original order.  ``data`` follows
+    scenario order; each row uses the key order ``scenario, count, mean,
+    slope, uncertainty, band``.  ``count`` is an int and ``mean``,
+    ``slope`` and ``uncertainty`` are two-item float lists while
+    ``band`` is a list of two two-item lists, or all four are ``None``.
+    Every float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0`` and a non-finite derived value raises ``ValueError``.  The
+    inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    left_periods, left_scales, left_names, left_pairs, scenarios, left_rows = (
+        _validate_evolution_summary_result(left, where="left")
+    )
+    right_periods, right_scales, right_names, right_pairs, right_scenarios, right_rows = (
+        _validate_evolution_summary_result(right, where="right")
+    )
+
+    if right_periods != left_periods:
+        raise ValueError(
+            "left and right must share the same periods in the same order"
+        )
+    if right_scales != left_scales:
+        raise ValueError(
+            "left and right must share the same scales in the same order"
+        )
+    if right_names != left_names:
+        raise ValueError(
+            "left and right must share the same names in the same order"
+        )
+    if right_pairs != left_pairs:
+        raise ValueError(
+            "left and right must share the same pairs in the same order"
+        )
+    if right_scenarios != scenarios:
+        raise ValueError(
+            "left and right must share the same scenarios in the same order"
+        )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    data: list[dict] = []
+    for scenario, left_row, right_row in zip(scenarios, left_rows, right_rows):
+        count = min(left_row["count"], right_row["count"])
+
+        if (
+            count < minimum
+            or left_row["mean"] is None
+            or left_row["std"] is None
+            or left_row["slope"] is None
+            or left_row["band"] is None
+            or right_row["mean"] is None
+            or right_row["std"] is None
+            or right_row["slope"] is None
+            or right_row["band"] is None
+        ):
+            mean = None
+            slope = None
+            uncertainty = None
+            band = None
+        else:
+            mean = []
+            slope = []
+            uncertainty = []
+            band = []
+            for column in range(2):
+                left_mean = float(left_row["mean"][column])
+                right_mean = float(right_row["mean"][column])
+                left_slope = float(left_row["slope"][column])
+                right_slope = float(right_row["slope"][column])
+                left_std = float(left_row["std"][column])
+                right_std = float(right_row["std"][column])
+                left_lower = float(left_row["band"][column][0])
+                left_upper = float(left_row["band"][column][1])
+                right_lower = float(right_row["band"][column][0])
+                right_upper = float(right_row["band"][column][1])
+                mean_value = right_mean - left_mean
+                slope_value = right_slope - left_slope
+                uncertainty_value = math.hypot(left_std, right_std)
+                lower_value = right_lower - left_upper
+                upper_value = right_upper - left_lower
+                if not all(
+                    _is_finite(value)
+                    for value in (
+                        mean_value,
+                        slope_value,
+                        uncertainty_value,
+                        lower_value,
+                        upper_value,
+                    )
+                ):
+                    raise ValueError(
+                        f"data[{scenario!r}] results must be finite"
+                    )
+                mean.append(_round_output(mean_value))
+                slope.append(_round_output(slope_value))
+                uncertainty.append(_round_output(uncertainty_value))
+                band.append(
+                    [
+                        _round_output(lower_value),
+                        _round_output(upper_value),
+                    ]
+                )
+
+        data.append(
+            {
+                "scenario": scenario,
+                "count": count,
+                "mean": mean,
+                "slope": slope,
+                "uncertainty": uncertainty,
+                "band": band,
+            }
+        )
+
+    return {
+        "schema": _EVOLUTION_COMPARE_SUMMARIES_SCHEMA,
+        "scenarios": list(scenarios),
+        "data": data,
+    }
