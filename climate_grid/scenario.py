@@ -28223,3 +28223,329 @@ def migration_summary(items, *, minimum: int = 2) -> dict:
         "groups": list(groups),
         "data": data_rows,
     }
+
+
+_MIGRATION_STABILITY_SCHEMA = "climate-grid/ms-v1"
+_MIGRATION_STABILITY_ITEM_KEYS = ("scale", "result")
+_MIGRATION_STABILITY_KEYS = ("schema", "scales", "groups", "data")
+_MIGRATION_STABILITY_ROW_KEYS = (
+    "group",
+    "n",
+    "coverage",
+    "pairs",
+    "reversals",
+    "rate",
+    "uncertainty",
+)
+
+
+def _validate_migration_summary_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list[str], list[dict]]:
+    """Validate a complete :func:`migration_summary` result.
+
+    Returns the ``labels`` and ``names`` axes, the ``groups`` axis and
+    the ``data`` rows, checking the ``climate-grid/mcs-v1`` contract:
+    key order, the schema, the axes, the one-row-per-group order and
+    each row's key order ``group, n, missing, span, delta,
+    uncertainty``.  ``n`` and ``missing`` are non-bool ints with
+    ``n + missing`` equal to the number of labels.  ``span``, ``delta``
+    and ``uncertainty`` are ``None`` together, otherwise ``span`` is a
+    two-item list ``[minimum, maximum]`` of non-negative non-bool
+    ints, ``delta`` is a finite number rounded to 12 digits and
+    ``uncertainty`` is a non-negative finite number rounded to 12
+    digits.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _MIGRATION_SUMMARY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, labels, names, "
+            "groups, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MIGRATION_SUMMARY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_MIGRATION_SUMMARY_SCHEMA!r}"
+        )
+
+    labels = _validate_string_list(
+        result["labels"], f"{where}.labels", minimum=2
+    )
+    names = _validate_string_list(result["names"], f"{where}.names", minimum=2)
+    groups = _validate_string_list(result["groups"], f"{where}.groups")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(groups):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per group"
+        )
+
+    total = len(labels)
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _MIGRATION_SUMMARY_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys group, n, missing, "
+                "span, delta, uncertainty in order"
+            )
+
+        group = row["group"]
+        if not isinstance(group, str):
+            raise TypeError(f"{row_where}.group must be a str")
+        if group != groups[row_index]:
+            raise ValueError(
+                f"{row_where}.group {group!r} must follow the groups axis "
+                f"order (expected {groups[row_index]!r})"
+            )
+
+        n = row["n"]
+        missing = row["missing"]
+        if not isinstance(n, int) or isinstance(n, bool):
+            raise TypeError(f"{row_where}.n must be a non-bool int")
+        if not isinstance(missing, int) or isinstance(missing, bool):
+            raise TypeError(f"{row_where}.missing must be a non-bool int")
+        if n < 0 or missing < 0 or n + missing != total:
+            raise ValueError(
+                f"{row_where}.n and {row_where}.missing must be "
+                f"non-negative and sum to {total}"
+            )
+
+        span = row["span"]
+        delta = row["delta"]
+        uncertainty = row["uncertainty"]
+        members = (span, delta, uncertainty)
+        present = [value is not None for value in members]
+        if any(present) and not all(present):
+            raise ValueError(
+                f"{row_where}: span, delta and uncertainty must be all "
+                "None or all present"
+            )
+        if not any(present):
+            continue
+
+        if n < 1:
+            raise ValueError(
+                f"{row_where}: span, delta and uncertainty must be None "
+                "when n is zero"
+            )
+
+        if not isinstance(span, list):
+            raise TypeError(f"{row_where}.span must be a list")
+        if len(span) != 2:
+            raise ValueError(
+                f"{row_where}.span must contain exactly 2 items"
+            )
+        for span_index, span_value in enumerate(span):
+            span_where = f"{row_where}.span[{span_index}]"
+            if not isinstance(span_value, int) or isinstance(
+                span_value, bool
+            ):
+                raise TypeError(f"{span_where} must be a non-bool int")
+            if span_value < 0:
+                raise ValueError(f"{span_where} must be non-negative")
+        if span[0] > span[1]:
+            raise ValueError(
+                f"{row_where}.span must be in [minimum, maximum] order"
+            )
+
+        _validate_number(delta, f"{row_where}.delta", nullable=False)
+        if delta != _round_output(delta):
+            raise ValueError(
+                f"{row_where}.delta must be rounded to 12 digits"
+            )
+
+        _validate_number(
+            uncertainty, f"{row_where}.uncertainty", nullable=False
+        )
+        if uncertainty < 0:
+            raise ValueError(
+                f"{row_where}.uncertainty must be non-negative"
+            )
+        if uncertainty != _round_output(uncertainty):
+            raise ValueError(
+                f"{row_where}.uncertainty must be rounded to 12 digits"
+            )
+
+    return labels, names, groups, data
+
+
+def migration_stability(items, *, minimum: int = 2) -> dict:
+    """Measure migration-summary reversal stability across named scales.
+
+    ``items`` must be a list of at least two mappings, each with
+    exactly the keys ``scale, result`` in that order.  ``scale`` is a
+    unique non-empty str and ``result`` is a complete
+    :func:`migration_summary` result (schema ``climate-grid/mcs-v1``)
+    sharing the first item's ``labels``, ``names`` and ``groups`` axes
+    in the same order.  ``minimum`` must be a non-bool positive int.
+
+    For every group (in the groups axis order) the item rows whose
+    ``delta`` and ``uncertainty`` are both not ``None`` are collected
+    in item order: ``n`` is their count and ``coverage`` is ``n``
+    divided by the number of items.  ``pairs`` counts adjacent item
+    pairs that are both collected and ``reversals`` counts those pairs
+    whose two deltas are both non-zero with opposite signs.  When
+    ``n < minimum``, ``rate`` and ``uncertainty`` are both ``None``.
+    Otherwise ``rate`` is ``None`` when ``pairs`` is zero, else
+    ``reversals / pairs``, and ``uncertainty`` is the ``hypot`` of the
+    collected rows' ``uncertainty`` values divided by ``n``.
+
+    The returned mapping uses the key order ``schema, scales, groups,
+    data``; ``schema`` is ``climate-grid/ms-v1``, ``scales`` lists the
+    item scales in item order and ``groups`` echoes the first item's
+    result groups axis.  ``data`` follows the groups axis order.  Each
+    row uses the key order ``group, n, coverage, pairs, reversals,
+    rate, uncertainty``; ``n``, ``pairs`` and ``reversals`` are ints.
+    Every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0`` and a non-finite derived value raises
+    ``ValueError``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    scales: list[str] = []
+    seen_scales: set[str] = set()
+    validated_rows: list[dict[str, dict]] = []
+    labels: list[str] = []
+    names: list[str] = []
+    groups: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _MIGRATION_STABILITY_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys scale, result in order"
+            )
+
+        scale = item["scale"]
+        if not isinstance(scale, str):
+            raise TypeError(f"{where}.scale must be a str")
+        if scale == "":
+            raise ValueError(f"{where}.scale must be non-empty")
+        if scale in seen_scales:
+            raise ValueError(f"duplicate item scale: {scale!r}")
+        seen_scales.add(scale)
+
+        item_labels, item_names, item_groups, data = (
+            _validate_migration_summary_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated_rows:
+            labels = item_labels
+            names = item_names
+            groups = item_groups
+        else:
+            if item_labels != labels:
+                raise ValueError(
+                    "all items must share the same result labels in the "
+                    "same order, taken from the first item"
+                )
+            if item_names != names:
+                raise ValueError(
+                    "all items must share the same result names in the "
+                    "same order, taken from the first item"
+                )
+            if item_groups != groups:
+                raise ValueError(
+                    "all items must share the same result groups in the "
+                    "same order, taken from the first item"
+                )
+
+        scales.append(scale)
+        validated_rows.append({row["group"]: row for row in data})
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    total = len(items)
+    data_rows: list[dict] = []
+    for group in groups:
+        ordered_deltas = [
+            rows[group]["delta"]
+            if rows[group]["delta"] is not None
+            and rows[group]["uncertainty"] is not None
+            else None
+            for rows in validated_rows
+        ]
+        n = sum(delta is not None for delta in ordered_deltas)
+        coverage = n / total
+
+        pairs = 0
+        reversals = 0
+        for left_delta, right_delta in zip(
+            ordered_deltas, ordered_deltas[1:]
+        ):
+            if left_delta is None or right_delta is None:
+                continue
+            pairs += 1
+            if (
+                left_delta != 0
+                and right_delta != 0
+                and (left_delta > 0) != (right_delta > 0)
+            ):
+                reversals += 1
+
+        present_rows = [
+            rows[group]
+            for rows, delta in zip(validated_rows, ordered_deltas)
+            if delta is not None
+        ]
+
+        if n < minimum:
+            rate = None
+            uncertainty = None
+        else:
+            rate = None if pairs == 0 else reversals / pairs
+            uncertainties = [row["uncertainty"] for row in present_rows]
+            try:
+                uncertainty_value = math.hypot(*uncertainties) / n
+            except OverflowError:
+                raise ValueError(
+                    f"derived statistics for group {group!r} must be finite"
+                ) from None
+            if not _is_finite(coverage) or not _is_finite(
+                uncertainty_value
+            ) or (rate is not None and not _is_finite(rate)):
+                raise ValueError(
+                    f"derived statistics for group {group!r} must be finite"
+                )
+            uncertainty = _round_output(uncertainty_value)
+            if rate is not None:
+                rate = _round_output(rate)
+
+        data_rows.append(
+            {
+                "group": group,
+                "n": n,
+                "coverage": _round_output(coverage),
+                "pairs": pairs,
+                "reversals": reversals,
+                "rate": rate,
+                "uncertainty": uncertainty,
+            }
+        )
+
+    return {
+        "schema": _MIGRATION_STABILITY_SCHEMA,
+        "scales": scales,
+        "groups": list(groups),
+        "data": data_rows,
+    }
