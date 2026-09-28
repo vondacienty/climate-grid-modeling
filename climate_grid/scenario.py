@@ -29238,6 +29238,7 @@ def panel_delta(panel, pairs, *, minimum: int = 1) -> dict:
 
 
 _EVOLVE_PANEL_SCHEMA = "climate-grid/mpe-v1"
+_REFERENCE_PANEL_SCHEMA = "climate-grid/mp-reference-v1"
 _MIGRATION_PANEL_DELTA_RESULT_KEYS = (
     "schema",
     "windows",
@@ -29620,6 +29621,215 @@ def evolve_panel(items, *, minimum: int = 1) -> dict:
     return {
         "schema": _EVOLVE_PANEL_SCHEMA,
         "names": list(names),
+        "windows": list(windows),
+        "regions": list(regions),
+        "scales": list(scales),
+        "groups": list(groups),
+        "pairs": [
+            {"name": pair["name"], "left": pair["left"], "right": pair["right"]}
+            for pair in pairs
+        ],
+        "data": result_rows,
+    }
+
+
+def reference_panel(items, *, minimum: int = 1) -> dict:
+    """Compare :func:`panel_delta` results against a reference item.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a unique
+    non-empty str and ``result`` is a complete :func:`panel_delta`
+    result (schema ``climate-grid/mp-delta-v1``); every result is
+    validated against that contract.  All results must share the same
+    ``windows``, ``regions``, ``scales``, ``groups`` and ``pairs`` axes
+    in the same order, taken from the first result.  ``minimum`` must
+    be a non-bool positive int.  A wrong container/item/argument type
+    raises ``TypeError`` and any other violation, including a
+    non-finite derived value, raises ``ValueError``.
+
+    The first item is the reference.  For each later item (in item
+    order), each pair (in pair order) and each group (in group order)
+    one flat row is emitted with the key order ``name, pair, group,
+    count, coverage, change, uncertainty``.  Writing ``B``/``C`` for
+    the reference/current item rows, ``D``/``E``/``U`` stand for the
+    row's ``coverage_delta``, ``change_delta`` and ``uncertainty`` and
+    ``count`` is ``min(B.count, C.count)``.  When ``count`` is below
+    ``minimum``, or either side has any of ``D``, ``E`` or ``U`` equal
+    to ``None``, ``coverage``, ``change`` and ``uncertainty`` are all
+    ``None``.  Otherwise ``coverage`` is ``C.D - B.D``, ``change`` is
+    ``C.E - B.E`` and ``uncertainty`` is the ``hypot`` of the two
+    sides' ``U`` values.  ``count`` is an int and every computed float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0``.
+
+    The returned mapping uses the key order ``schema, reference, names,
+    windows, regions, scales, groups, pairs, data``; ``schema`` is
+    ``climate-grid/mp-reference-v1``, ``reference`` is the first item
+    name, ``names`` lists the later item names in their input order and
+    the remaining axes are copied from the first result.  ``data``
+    iterates the later items, then the pairs, then the groups.  The
+    inputs are not modified.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    validated: list[dict[tuple[str, str], dict]] = []
+    windows: list[str] = []
+    regions: list[str] = []
+    scales: list[str] = []
+    groups: list[str] = []
+    pairs: list[dict] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _EVOLVE_PANEL_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        (
+            item_windows,
+            item_regions,
+            item_scales,
+            item_groups,
+            item_pairs,
+            data,
+        ) = _validate_panel_delta_result(item["result"], where=f"{where}.result")
+        if not validated:
+            windows = item_windows
+            regions = item_regions
+            scales = item_scales
+            groups = item_groups
+            pairs = item_pairs
+        else:
+            if item_windows != windows:
+                raise ValueError(
+                    "all results must share the same windows in the same "
+                    "order, taken from the first result"
+                )
+            if item_regions != regions:
+                raise ValueError(
+                    "all results must share the same regions in the same "
+                    "order, taken from the first result"
+                )
+            if item_scales != scales:
+                raise ValueError(
+                    "all results must share the same scales in the same "
+                    "order, taken from the first result"
+                )
+            if item_groups != groups:
+                raise ValueError(
+                    "all results must share the same groups in the same "
+                    "order, taken from the first result"
+                )
+            if item_pairs != pairs:
+                raise ValueError(
+                    "all results must share the same pairs in the same "
+                    "order, taken from the first result"
+                )
+
+        names.append(name)
+        validated.append({(row["pair"], row["group"]): row for row in data})
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    reference_name = names[0]
+    reference_lookup = validated[0]
+    result_rows: list[dict] = []
+    for current_index in range(1, len(items)):
+        current_lookup = validated[current_index]
+        current_name = names[current_index]
+        for pair in pairs:
+            pair_name = pair["name"]
+            for group in groups:
+                reference_row = reference_lookup[(pair_name, group)]
+                current_row = current_lookup[(pair_name, group)]
+                count = min(reference_row["count"], current_row["count"])
+                delta_where = (
+                    f"data row for reference {reference_name!r}->"
+                    f"{current_name!r}, pair {pair_name!r}, group {group!r}"
+                )
+
+                reference_stats = (
+                    reference_row["coverage_delta"],
+                    reference_row["change_delta"],
+                    reference_row["uncertainty"],
+                )
+                current_stats = (
+                    current_row["coverage_delta"],
+                    current_row["change_delta"],
+                    current_row["uncertainty"],
+                )
+                if (
+                    count < minimum
+                    or any(value is None for value in reference_stats)
+                    or any(value is None for value in current_stats)
+                ):
+                    coverage = None
+                    change = None
+                    uncertainty = None
+                else:
+                    try:
+                        coverage_value = (
+                            current_row["coverage_delta"]
+                            - reference_row["coverage_delta"]
+                        )
+                        change_value = (
+                            current_row["change_delta"]
+                            - reference_row["change_delta"]
+                        )
+                        uncertainty_value = math.hypot(
+                            reference_row["uncertainty"],
+                            current_row["uncertainty"],
+                        )
+                    except OverflowError:
+                        raise ValueError(
+                            f"{delta_where} derived statistics must be finite"
+                        ) from None
+                    if (
+                        not _is_finite(coverage_value)
+                        or not _is_finite(change_value)
+                        or not _is_finite(uncertainty_value)
+                    ):
+                        raise ValueError(
+                            f"{delta_where} derived statistics must be finite"
+                        )
+                    coverage = _round_output(coverage_value)
+                    change = _round_output(change_value)
+                    uncertainty = _round_output(uncertainty_value)
+
+                result_rows.append(
+                    {
+                        "name": current_name,
+                        "pair": pair_name,
+                        "group": group,
+                        "count": count,
+                        "coverage": coverage,
+                        "change": change,
+                        "uncertainty": uncertainty,
+                    }
+                )
+
+    return {
+        "schema": _REFERENCE_PANEL_SCHEMA,
+        "reference": reference_name,
+        "names": names[1:],
         "windows": list(windows),
         "regions": list(regions),
         "scales": list(scales),
