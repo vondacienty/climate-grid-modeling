@@ -28252,9 +28252,9 @@ def _validate_migration_summary_result(
     ``n + missing`` equal to the number of labels.  ``span``, ``delta``
     and ``uncertainty`` are ``None`` together, otherwise ``span`` is a
     two-item list ``[minimum, maximum]`` of non-negative non-bool
-    ints, ``delta`` is a finite number rounded to 12 digits and
-    ``uncertainty`` is a non-negative finite number rounded to 12
-    digits.
+    ints, ``delta`` is a finite number between -1 and 1 rounded to 12
+    digits and ``uncertainty`` is a non-negative finite number rounded
+    to 12 digits.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -28357,6 +28357,10 @@ def _validate_migration_summary_result(
             )
 
         _validate_number(delta, f"{row_where}.delta", nullable=False)
+        if not -1 <= delta <= 1:
+            raise ValueError(
+                f"{row_where}.delta must be between -1 and 1"
+            )
         if delta != _round_output(delta):
             raise ValueError(
                 f"{row_where}.delta must be rounded to 12 digits"
@@ -28546,6 +28550,354 @@ def migration_stability(items, *, minimum: int = 2) -> dict:
     return {
         "schema": _MIGRATION_STABILITY_SCHEMA,
         "scales": scales,
+        "groups": list(groups),
+        "data": data_rows,
+    }
+
+
+_MIGRATION_PANEL_SCHEMA = "climate-grid/mp-v1"
+_MIGRATION_PANEL_ITEM_KEYS = ("window", "region", "result")
+_MIGRATION_PANEL_KEYS = (
+    "schema",
+    "windows",
+    "regions",
+    "scales",
+    "groups",
+    "data",
+)
+_MIGRATION_PANEL_ROW_KEYS = (
+    "region",
+    "group",
+    "n",
+    "coverage",
+    "change",
+    "uncertainty",
+)
+
+
+def _validate_migration_stability_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list[str], list[str], list[dict]]:
+    """Validate a complete :func:`migration_stability` result.
+
+    Returns the ``scales`` and ``groups`` axes and the ``data`` rows,
+    checking the ``climate-grid/ms-v1`` contract: key order, the
+    schema, the axes, the one-row-per-group order and each row's key
+    order ``group, n, coverage, pairs, reversals, rate,
+    uncertainty``.  ``n``, ``pairs`` and ``reversals`` are non-bool
+    ints with ``0 <= n`` to the number of scales, ``0 <= pairs <=
+    n - 1`` and ``0 <= reversals <= pairs``; ``coverage`` equals
+    ``n`` divided by the number of scales (rounded to 12 digits).
+    ``rate`` is ``None`` when ``pairs`` is zero, otherwise it equals
+    ``reversals / pairs`` rounded to 12 digits; ``uncertainty`` is
+    ``None`` together with a below-minimum row or otherwise a
+    non-negative finite number rounded to 12 digits.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _MIGRATION_STABILITY_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scales, groups, "
+            "data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _MIGRATION_STABILITY_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_MIGRATION_STABILITY_SCHEMA!r}"
+        )
+
+    scales = _validate_string_list(
+        result["scales"], f"{where}.scales", minimum=2
+    )
+    groups = _validate_string_list(result["groups"], f"{where}.groups")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(groups):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per group"
+        )
+
+    total = len(scales)
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _MIGRATION_STABILITY_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys group, n, "
+                "coverage, pairs, reversals, rate, uncertainty in order"
+            )
+
+        group = row["group"]
+        if not isinstance(group, str):
+            raise TypeError(f"{row_where}.group must be a str")
+        if group != groups[row_index]:
+            raise ValueError(
+                f"{row_where}.group {group!r} must follow the groups axis "
+                f"order (expected {groups[row_index]!r})"
+            )
+
+        n = row["n"]
+        pairs = row["pairs"]
+        reversals = row["reversals"]
+        for name, value in (
+            ("n", n),
+            ("pairs", pairs),
+            ("reversals", reversals),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{row_where}.{name} must be a non-bool int")
+        if n < 0 or n > total:
+            raise ValueError(
+                f"{row_where}.n must be between 0 and the number of scales"
+            )
+        if pairs < 0 or pairs > max(0, n - 1):
+            raise ValueError(
+                f"{row_where}.pairs must be between 0 and n - 1"
+            )
+        if reversals < 0 or reversals > pairs:
+            raise ValueError(
+                f"{row_where}.reversals must be between 0 and pairs"
+            )
+
+        coverage = row["coverage"]
+        _validate_number(coverage, f"{row_where}.coverage", nullable=False)
+        if not 0 <= coverage <= 1:
+            raise ValueError(
+                f"{row_where}.coverage must be between 0 and 1"
+            )
+        if coverage != _round_output(n / total):
+            raise ValueError(
+                f"{row_where}.coverage must equal n divided by the number "
+                "of scales, rounded to 12 digits"
+            )
+
+        rate = row["rate"]
+        uncertainty = row["uncertainty"]
+        _validate_number(rate, f"{row_where}.rate", nullable=True)
+        _validate_number(
+            uncertainty, f"{row_where}.uncertainty", nullable=True
+        )
+        if rate is not None:
+            if pairs == 0:
+                raise ValueError(
+                    f"{row_where}.rate must be None when pairs is 0"
+                )
+            if not 0 <= rate <= 1:
+                raise ValueError(
+                    f"{row_where}.rate must be between 0 and 1"
+                )
+            if rate != _round_output(reversals / pairs):
+                raise ValueError(
+                    f"{row_where}.rate must equal reversals divided by "
+                    "pairs, rounded to 12 digits"
+                )
+            if uncertainty is None:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be present when rate "
+                    "is present"
+                )
+        elif pairs > 0 and uncertainty is not None:
+            raise ValueError(
+                f"{row_where}.uncertainty must be None when rate is None "
+                "and pairs is non-zero"
+            )
+        if uncertainty is not None:
+            if n < 1:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be None when n is zero"
+                )
+            if uncertainty < 0:
+                raise ValueError(
+                    f"{row_where}.uncertainty must be non-negative"
+                )
+            if uncertainty != _round_output(uncertainty):
+                raise ValueError(
+                    f"{row_where}.uncertainty must be rounded to 12 digits"
+                )
+
+    return scales, groups, data
+
+
+def migration_panel(items, *, minimum: int = 2) -> dict:
+    """Aggregate per-window migration stability results by region.
+
+    ``items`` must be a non-empty list of mappings, each with exactly
+    the keys ``window, region, result`` in that order.  ``window`` and
+    ``region`` are non-empty str, at least two distinct windows must
+    occur and the items must cover every ``(window, region)``
+    combination exactly once, in window-then-region order.  ``result``
+    is a complete :func:`migration_stability` result (schema
+    ``climate-grid/ms-v1``); every result must share the same
+    ``scales`` and ``groups`` axes in the same order, taken from the
+    first item.  ``minimum`` must be a non-bool positive int.
+
+    For each region (in first-appearance order) and group (in the
+    groups axis order) the result rows whose ``rate`` and
+    ``uncertainty`` are both not ``None`` are collected across the
+    region's items in item (window) order: ``n`` is their count.
+    When ``n < minimum``, ``coverage``, ``change`` and
+    ``uncertainty`` are all ``None``.  Otherwise ``coverage`` is the
+    mean of the collected rates, ``change`` is the last collected
+    rate minus the first and ``uncertainty`` is the ``hypot`` of the
+    collected uncertainties divided by ``n``.
+
+    The returned mapping uses the key order ``schema, windows,
+    regions, scales, groups, data``; ``schema`` is
+    ``climate-grid/mp-v1``, ``windows`` and ``regions`` list the item
+    values in first-appearance order and ``scales`` and ``groups``
+    echo the first item's result axes.  ``data`` follows the
+    region-then-group order.  Each row uses the key order ``region,
+    group, n, coverage, change, uncertainty``; ``n`` is an int.
+    Every output float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0`` and a non-finite derived value raises
+    ``ValueError``.  The inputs are not modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite results.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) == 0:
+        raise ValueError("items must be non-empty")
+
+    windows: list[str] = []
+    regions: list[str] = []
+    pairs: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    validated: list[tuple[str, str, dict[str, dict]]] = []
+    scales: list[str] = []
+    groups: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _MIGRATION_PANEL_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys window, region, "
+                "result in order"
+            )
+
+        window = item["window"]
+        region = item["region"]
+        if not isinstance(window, str):
+            raise TypeError(f"{where}.window must be a str")
+        if window == "":
+            raise ValueError(f"{where}.window must be non-empty")
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{where}.region must be non-empty")
+        if (window, region) in seen_pairs:
+            raise ValueError(
+                f"duplicate window/region pair: {(window, region)!r}"
+            )
+        seen_pairs.add((window, region))
+
+        item_scales, item_groups, result_rows = (
+            _validate_migration_stability_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated:
+            scales = item_scales
+            groups = item_groups
+        elif item_scales != scales or item_groups != groups:
+            raise ValueError(
+                "all items must share the same result scales and groups "
+                "in the same order, taken from the first item"
+            )
+
+        if window not in windows:
+            windows.append(window)
+        if region not in regions:
+            regions.append(region)
+        pairs.append((window, region))
+        validated.append(
+            (window, region, {row["group"]: row for row in result_rows})
+        )
+
+    if len(windows) < 2:
+        raise ValueError("items must use at least 2 distinct windows")
+
+    expected_pairs = [
+        (window, region) for window in windows for region in regions
+    ]
+    if pairs != expected_pairs:
+        raise ValueError(
+            "items must cover every window/region combination exactly "
+            "once, in window-then-region order"
+        )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    data_rows: list[dict] = []
+    for region in regions:
+        for group in groups:
+            collected = [
+                rows[group]
+                for _item_window, item_region, rows in validated
+                if item_region == region
+                and rows[group]["rate"] is not None
+                and rows[group]["uncertainty"] is not None
+            ]
+            n = len(collected)
+            if n < minimum:
+                coverage = None
+                change = None
+                uncertainty = None
+            else:
+                rates = [row["rate"] for row in collected]
+                uncertainties = [
+                    row["uncertainty"] for row in collected
+                ]
+                coverage_value = sum(rates) / n
+                change_value = rates[-1] - rates[0]
+                try:
+                    uncertainty_value = math.hypot(*uncertainties) / n
+                except OverflowError:
+                    raise ValueError(
+                        f"derived statistics for region {region!r}, group "
+                        f"{group!r} must be finite"
+                    ) from None
+                if (
+                    not _is_finite(coverage_value)
+                    or not _is_finite(change_value)
+                    or not _is_finite(uncertainty_value)
+                ):
+                    raise ValueError(
+                        f"derived statistics for region {region!r}, group "
+                        f"{group!r} must be finite"
+                    )
+                coverage = _round_output(coverage_value)
+                change = _round_output(change_value)
+                uncertainty = _round_output(uncertainty_value)
+
+            data_rows.append(
+                {
+                    "region": region,
+                    "group": group,
+                    "n": n,
+                    "coverage": coverage,
+                    "change": change,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _MIGRATION_PANEL_SCHEMA,
+        "windows": windows,
+        "regions": regions,
+        "scales": list(scales),
         "groups": list(groups),
         "data": data_rows,
     }
