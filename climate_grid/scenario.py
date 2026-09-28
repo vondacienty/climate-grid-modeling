@@ -24767,7 +24767,8 @@ def _validate_evolution_summary_result(
     row.  ``mean``, ``std``, ``slope`` and ``band`` are ``None``
     together; when present they are two-item columns with
     non-negative ``std`` entries and ``band`` bounds in
-    ``[lower, upper]`` order.
+    ``[lower, upper]`` order, and a row whose ``count`` is below 2
+    must have all four set to ``None``.
     """
     if not isinstance(summary, dict):
         raise TypeError(f"{where} must be a dict")
@@ -24887,6 +24888,12 @@ def _validate_evolution_summary_result(
             out_rows.append(row)
             continue
 
+        if count < 2:
+            raise ValueError(
+                f"{row_where}.mean, {row_where}.std, {row_where}.slope "
+                f"and {row_where}.band must all be None when count is below 2"
+            )
+
         for column_key, column in (
             ("mean", mean),
             ("std", std),
@@ -24972,8 +24979,9 @@ def compare_summaries(left, right, *, minimum: int = 2) -> dict:
     inputs are not modified.
 
     Raises ``TypeError`` for wrong container/argument types and
-    ``ValueError`` for any other contract violation, including
-    non-finite results.
+    ``ValueError`` for any other contract violation, including a row
+    whose ``count`` is below 2 while ``mean``, ``std``, ``slope`` and
+    ``band`` are not all ``None``, and including non-finite results.
     """
     left_periods, left_scales, left_names, left_pairs, scenarios, left_rows = (
         _validate_evolution_summary_result(left, where="left")
@@ -25085,5 +25093,347 @@ def compare_summaries(left, right, *, minimum: int = 2) -> dict:
     return {
         "schema": _EVOLUTION_COMPARE_SUMMARIES_SCHEMA,
         "scenarios": list(scenarios),
+        "data": data,
+    }
+
+
+_COMPARISON_AGGREGATE_SCHEMA = "climate-grid/gec-summary-v1"
+_COMPARISON_AGGREGATE_ITEM_KEYS = ("name", "result")
+_COMPARISON_AGGREGATE_OUTPUT_KEYS = (
+    "schema",
+    "labels",
+    "scenarios",
+    "data",
+)
+
+
+def _validate_compare_summaries_result(
+    comparison: Any, *, where: str = "comparison"
+) -> tuple[list[str], list[dict]]:
+    """Validate a complete :func:`compare_summaries` result.
+
+    Returns a fresh copy of the ``scenarios`` axis and the data rows
+    (in scenario order), checking the ``climate-grid/gec-v1``
+    contract: key order, the ``scenarios`` axis, the scenario-order
+    rows and the internal ``count``/``mean``/``slope``/
+    ``uncertainty``/``band`` invariants of every row.  ``mean``,
+    ``slope``, ``uncertainty`` and ``band`` are ``None`` together;
+    when present they are two-item columns with non-negative
+    ``uncertainty`` entries, and a row whose ``count`` is below 2 must
+    have all four set to ``None``.  Note that a comparison band is a
+    difference of bands, so its entries are not required to be in
+    ``[lower, upper]`` order.
+    """
+    if not isinstance(comparison, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(comparison.keys()) != _EVOLUTION_COMPARE_SUMMARIES_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, scenarios, data "
+            "in order"
+        )
+
+    schema = comparison["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _EVOLUTION_COMPARE_SUMMARIES_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be "
+            f"{_EVOLUTION_COMPARE_SUMMARIES_SCHEMA!r}"
+        )
+
+    scenarios = _validate_string_list(
+        comparison["scenarios"], f"{where}.scenarios", minimum=1
+    )
+
+    data = comparison["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scenarios):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per scenario"
+        )
+
+    out_rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _EVOLUTION_COMPARE_SUMMARIES_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scenario, count, "
+                "mean, slope, uncertainty, band in order"
+            )
+
+        scenario_name = row["scenario"]
+        if not isinstance(scenario_name, str):
+            raise TypeError(f"{row_where}.scenario must be a str")
+        expected_scenario = scenarios[row_index]
+        if scenario_name != expected_scenario:
+            raise ValueError(
+                f"{row_where}.scenario {scenario_name!r} must follow "
+                f"scenario order (expected {expected_scenario!r})"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{row_where}.count must be non-negative")
+
+        mean = row["mean"]
+        slope = row["slope"]
+        uncertainty = row["uncertainty"]
+        band = row["band"]
+        if (
+            mean is None
+            or slope is None
+            or uncertainty is None
+            or band is None
+        ):
+            if (
+                mean is not None
+                or slope is not None
+                or uncertainty is not None
+                or band is not None
+            ):
+                raise ValueError(
+                    f"{row_where}.mean, {row_where}.slope, "
+                    f"{row_where}.uncertainty and {row_where}.band must "
+                    "be None together"
+                )
+            out_rows.append(row)
+            continue
+
+        if count < 2:
+            raise ValueError(
+                f"{row_where}.mean, {row_where}.slope, "
+                f"{row_where}.uncertainty and {row_where}.band must all "
+                "be None when count is below 2"
+            )
+
+        for column_key, column in (
+            ("mean", mean),
+            ("slope", slope),
+            ("uncertainty", uncertainty),
+        ):
+            if not isinstance(column, list):
+                raise TypeError(f"{row_where}.{column_key} must be a list")
+            if len(column) != 2:
+                raise ValueError(
+                    f"{row_where}.{column_key} must contain exactly 2 items"
+                )
+            for column_index, value in enumerate(column):
+                _validate_number(
+                    value,
+                    f"{row_where}.{column_key}[{column_index}]",
+                    nullable=False,
+                )
+                if column_key == "uncertainty" and value < 0:
+                    raise ValueError(
+                        f"{row_where}.uncertainty[{column_index}] must be "
+                        "non-negative"
+                    )
+
+        if not isinstance(band, list):
+            raise TypeError(f"{row_where}.band must be a list")
+        if len(band) != 2:
+            raise ValueError(
+                f"{row_where}.band must contain exactly 2 items"
+            )
+        for column_index, bounds in enumerate(band):
+            bounds_where = f"{row_where}.band[{column_index}]"
+            if not isinstance(bounds, list):
+                raise TypeError(f"{bounds_where} must be a list")
+            if len(bounds) != 2:
+                raise ValueError(
+                    f"{bounds_where} must contain exactly 2 items"
+                )
+            _validate_number(
+                bounds[0], f"{bounds_where}[0]", nullable=False
+            )
+            _validate_number(
+                bounds[1], f"{bounds_where}[1]", nullable=False
+            )
+
+        out_rows.append(row)
+
+    return list(scenarios), out_rows
+
+
+def aggregate_comparisons(items, *, minimum: int = 2) -> dict:
+    """Aggregate named :func:`compare_summaries` results.
+
+    ``items`` must be a list of at least two mappings, each with
+    exactly the keys ``name, result`` in that order.  ``name`` is a
+    unique non-empty str and ``result`` is a complete
+    :func:`compare_summaries` result (schema ``climate-grid/gec-v1``),
+    validated against that contract.  Every item's result must share
+    the same ``scenarios`` axis in the same order; it is taken from
+    the first item's result.  ``minimum`` must be a non-bool positive
+    int.
+
+    For every scenario (in scenario order), the item rows whose
+    ``mean``, ``slope``, ``uncertainty`` and ``band`` are all present
+    are collected and ``count`` is the number ``n`` of collected
+    rows.  When ``n < minimum``, ``mean``, ``slope``, ``uncertainty``
+    and ``band`` are all ``None``; otherwise, for each of the two
+    columns, writing the collected means, slopes and uncertainties as
+    ``m``, ``b`` and ``u``, ``mean`` is ``fsum(m) / n``, ``slope`` is
+    ``fsum(b) / n``, ``uncertainty`` is ``hypot(*u) / n`` and ``band``
+    is the ``[min lower bound, max upper bound]`` of the collected
+    bands.
+
+    The returned mapping uses the key order ``schema, labels,
+    scenarios, data``; ``schema`` is ``climate-grid/gec-summary-v1``.
+    ``labels`` lists the item names in item order and ``scenarios``
+    echoes the first item's result scenario axis in its original
+    order.  ``data`` follows scenario order; each row uses the key
+    order ``scenario, count, mean, slope, uncertainty, band``.
+    ``count`` is an int and ``mean``, ``slope`` and ``uncertainty``
+    are two-item float lists while ``band`` is a list of two two-item
+    float lists, or all four are ``None``.  Every float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0`` and a
+    non-finite derived value raises ``ValueError``.  The input is not
+    modified.
+
+    Raises ``TypeError`` for wrong container/argument types and
+    ``ValueError`` for any other contract violation, including
+    non-finite derived values.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    labels: list[str] = []
+    validated: list[list[dict]] = []
+    seen_names: set[str] = set()
+    first_scenarios: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _COMPARISON_AGGREGATE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        scenarios, rows = _validate_compare_summaries_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not validated:
+            first_scenarios = scenarios
+        elif scenarios != first_scenarios:
+            raise ValueError(
+                "all items must share the same result scenarios in the "
+                "same order, taken from the first item"
+            )
+
+        labels.append(name)
+        validated.append(rows)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    data: list[dict] = []
+    for scenario_index, scenario in enumerate(first_scenarios):
+        means: tuple[list, list] = ([], [])
+        slopes: tuple[list, list] = ([], [])
+        uncertainties: tuple[list, list] = ([], [])
+        lower_bounds: tuple[list, list] = ([], [])
+        upper_bounds: tuple[list, list] = ([], [])
+        for rows in validated:
+            row = rows[scenario_index]
+            if (
+                row["mean"] is None
+                or row["slope"] is None
+                or row["uncertainty"] is None
+                or row["band"] is None
+            ):
+                continue
+            for column in range(2):
+                means[column].append(row["mean"][column])
+                slopes[column].append(row["slope"][column])
+                uncertainties[column].append(
+                    row["uncertainty"][column]
+                )
+                lower_bounds[column].append(row["band"][column][0])
+                upper_bounds[column].append(row["band"][column][1])
+
+        n = len(means[0])
+
+        if n < minimum:
+            mean = None
+            slope = None
+            uncertainty = None
+            band = None
+        else:
+            mean = []
+            slope = []
+            uncertainty = []
+            band = []
+            for column in range(2):
+                try:
+                    mean_value = math.fsum(means[column]) / n
+                    slope_value = math.fsum(slopes[column]) / n
+                    uncertainty_value = (
+                        math.hypot(*uncertainties[column]) / n
+                    )
+                    lower_value = float(min(lower_bounds[column]))
+                    upper_value = float(max(upper_bounds[column]))
+                except OverflowError:
+                    raise ValueError(
+                        "comparison aggregate statistics must yield "
+                        "finite statistics"
+                    ) from None
+                if not all(
+                    _is_finite(value)
+                    for value in (
+                        mean_value,
+                        slope_value,
+                        uncertainty_value,
+                        lower_value,
+                        upper_value,
+                    )
+                ):
+                    raise ValueError(
+                        f"data[{scenario!r}] results must be finite"
+                    )
+                mean.append(_round_output(mean_value))
+                slope.append(_round_output(slope_value))
+                uncertainty.append(_round_output(uncertainty_value))
+                band.append(
+                    [
+                        _round_output(lower_value),
+                        _round_output(upper_value),
+                    ]
+                )
+
+        data.append(
+            {
+                "scenario": scenario,
+                "count": n,
+                "mean": mean,
+                "slope": slope,
+                "uncertainty": uncertainty,
+                "band": band,
+            }
+        )
+
+    return {
+        "schema": _COMPARISON_AGGREGATE_SCHEMA,
+        "labels": labels,
+        "scenarios": list(first_scenarios),
         "data": data,
     }
