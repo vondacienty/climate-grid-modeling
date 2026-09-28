@@ -26825,3 +26825,262 @@ def group_scale(items, *, minimum: int = 1) -> dict:
         "scenarios": list(scenarios),
         "data": data_rows,
     }
+
+
+_GROUP_MIGRATION_SCHEMA = "climate-grid/gm-v1"
+_GROUP_MIGRATION_ITEM_KEYS = ("scale", "region", "result")
+_GROUP_MIGRATION_RESULT_KEYS = (
+    "schema",
+    "scales",
+    "regions",
+    "reference",
+    "groups",
+    "data",
+)
+
+
+def group_migration(items, *, minimum: int = 1) -> dict:
+    """Aggregate group rank migration between adjacent scales per region.
+
+    ``items`` and ``minimum`` are validated exactly as in
+    :func:`group_scale`, and the scale and region axes are generated the
+    same way (first-appearance order, unique ``(scale, region)`` pairs);
+    every ``result`` is a complete :func:`group_rank_stability` result
+    (schema ``climate-grid/ggs-v1``) sharing the first item's
+    ``reference`` and ``groups`` and ``scenarios`` axes.  At least two
+    distinct scales must be present or ``ValueError`` is raised.
+
+    The adjacent scale pairs follow the scale axis order.  For each
+    region (in region order) and group (in group order), every adjacent
+    pair is examined: when both results exist for the region and the
+    group rows have a non-``None`` ``rank`` and ``uncertainty`` on both
+    sides, ``d`` is the right rank minus the left rank and ``u`` is the
+    ``hypot`` of the two uncertainties; otherwise both are ``None``.
+    ``changes`` lists one ``[d, u]`` pair per adjacent scale pair and
+    ``valid`` counts the valid pairs.
+
+    When ``valid < minimum``, ``mean_abs``, ``uncertainty`` and
+    ``rank`` are all ``None``; otherwise ``mean_abs`` is the sum of the
+    absolute ``d`` values divided by ``valid`` and ``uncertainty`` is
+    the ``hypot`` of every valid pair's ``u`` divided by ``valid``.
+    Within each region the valid groups are ranked, from 1, by their
+    unrounded ``mean_abs`` in ascending order; ties keep the group
+    order.  Invalid groups follow in their original group order with
+    ``rank`` of ``None``.
+
+    The returned mapping uses the key order ``schema, scales, regions,
+    reference, groups, data``; ``schema`` is ``climate-grid/gm-v1`` and
+    ``reference`` and ``groups`` echo the first item's result
+    unchanged.  ``data`` follows region order and, within each region,
+    the ranking above; each row uses the key order ``region, group,
+    valid, changes, mean_abs, uncertainty, rank``.  ``valid`` and a
+    non-empty ``rank`` are ints; every output float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0`` and a
+    non-finite derived value raises ``ValueError``.  The input is not
+    modified.
+
+    Raises ``TypeError`` for wrong container/item/argument types and
+    ``ValueError`` for any other contract violation.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 1:
+        raise ValueError("items must be non-empty")
+
+    scales: list[str] = []
+    regions: list[str] = []
+    seen_scales: set[str] = set()
+    seen_regions: set[str] = set()
+    seen_pairs: set[tuple[str, str]] = set()
+    validated: dict[tuple[str, str], dict[str, dict]] = {}
+    reference = ""
+    groups: list[str] = []
+    scenarios: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _GROUP_MIGRATION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys scale, region, result "
+                "in order"
+            )
+
+        scale = item["scale"]
+        if not isinstance(scale, str):
+            raise TypeError(f"{where}.scale must be a str")
+        if scale == "":
+            raise ValueError(f"{where}.scale must be non-empty")
+
+        region = item["region"]
+        if not isinstance(region, str):
+            raise TypeError(f"{where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{where}.region must be non-empty")
+
+        pair = (scale, region)
+        if pair in seen_pairs:
+            raise ValueError(
+                f"duplicate items scale/region pair: "
+                f"({scale!r}, {region!r})"
+            )
+        seen_pairs.add(pair)
+        if scale not in seen_scales:
+            seen_scales.add(scale)
+            scales.append(scale)
+        if region not in seen_regions:
+            seen_regions.add(region)
+            regions.append(region)
+
+        item_reference, item_groups, item_scenarios, data = (
+            _validate_group_rank_stability_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated:
+            reference = item_reference
+            groups = item_groups
+            scenarios = item_scenarios
+        else:
+            if item_reference != reference:
+                raise ValueError(
+                    "all items must share the same result reference, taken "
+                    "from the first item"
+                )
+            if item_groups != groups:
+                raise ValueError(
+                    "all items must share the same result groups in the "
+                    "same order, taken from the first item"
+                )
+            if item_scenarios != scenarios:
+                raise ValueError(
+                    "all items must share the same result scenarios in the "
+                    "same order, taken from the first item"
+                )
+
+        validated[pair] = {row["group"]: row for row in data}
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    if len(scales) < 2:
+        raise ValueError("at least two distinct scales are required")
+
+    scale_pairs = [
+        (scales[index], scales[index + 1])
+        for index in range(len(scales) - 1)
+    ]
+
+    data_rows: list[dict] = []
+    for region in regions:
+        valid_rows: list[dict] = []
+        invalid_rows: list[dict] = []
+        for group in groups:
+            changes: list[list] = []
+            deltas: list[int] = []
+            uncertainties: list[float] = []
+            for left_scale, right_scale in scale_pairs:
+                left = validated.get((left_scale, region))
+                right = validated.get((right_scale, region))
+                d = None
+                u = None
+                if left is not None and right is not None:
+                    left_row = left[group]
+                    right_row = right[group]
+                    if (
+                        left_row["rank"] is not None
+                        and right_row["rank"] is not None
+                        and left_row["uncertainty"] is not None
+                        and right_row["uncertainty"] is not None
+                    ):
+                        try:
+                            d = int(right_row["rank"]) - int(
+                                left_row["rank"]
+                            )
+                            u = math.hypot(
+                                float(left_row["uncertainty"]),
+                                float(right_row["uncertainty"]),
+                            )
+                        except OverflowError:
+                            raise ValueError(
+                                f"derived statistics for group {group!r} "
+                                "must be finite"
+                            ) from None
+                        if not _is_finite(u):
+                            raise ValueError(
+                                f"derived statistics for group {group!r} "
+                                "must be finite"
+                            )
+                        deltas.append(d)
+                        uncertainties.append(u)
+                changes.append([d, _round_output(u) if u is not None else None])
+
+            valid = len(deltas)
+            base_row = {
+                "region": region,
+                "group": group,
+                "valid": valid,
+                "changes": changes,
+            }
+            if valid < minimum:
+                invalid_rows.append(
+                    {
+                        **base_row,
+                        "mean_abs": None,
+                        "uncertainty": None,
+                        "rank": None,
+                    }
+                )
+                continue
+
+            mean_abs_value = sum(abs(delta) for delta in deltas) / valid
+            try:
+                uncertainty_value = math.hypot(*uncertainties) / valid
+            except OverflowError:
+                raise ValueError(
+                    f"derived statistics for group {group!r} must be finite"
+                ) from None
+
+            if (
+                not _is_finite(mean_abs_value)
+                or not _is_finite(uncertainty_value)
+            ):
+                raise ValueError(
+                    f"derived statistics for group {group!r} must be finite"
+                )
+
+            valid_rows.append(
+                {
+                    **base_row,
+                    "mean_abs_value": mean_abs_value,
+                    "mean_abs": _round_output(mean_abs_value),
+                    "uncertainty": _round_output(uncertainty_value),
+                }
+            )
+
+        valid_rows.sort(key=lambda row: row["mean_abs_value"])
+        for rank, row in enumerate(valid_rows, start=1):
+            data_rows.append(
+                {
+                    "region": row["region"],
+                    "group": row["group"],
+                    "valid": row["valid"],
+                    "changes": row["changes"],
+                    "mean_abs": row["mean_abs"],
+                    "uncertainty": row["uncertainty"],
+                    "rank": rank,
+                }
+            )
+        for row in invalid_rows:
+            data_rows.append(row)
+
+    return {
+        "schema": _GROUP_MIGRATION_SCHEMA,
+        "scales": scales,
+        "regions": regions,
+        "reference": reference,
+        "groups": list(groups),
+        "data": data_rows,
+    }
