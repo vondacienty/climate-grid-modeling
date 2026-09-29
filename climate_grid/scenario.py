@@ -32166,3 +32166,387 @@ def profile_diagnostic(result, *, tolerance: float = 0.0) -> dict:
         "panels": list(panels),
         "data": data_rows,
     }
+
+
+_PROFILE_SUMMARY_SCHEMA = "climate-grid/ps-summary-v1"
+_PROFILE_SUMMARY_OUTPUT_KEYS = (
+    "schema",
+    "names",
+    "scales",
+    "minimums",
+    "thresholds",
+    "panels",
+    "data",
+)
+_PROFILE_SUMMARY_ROW_KEYS = (
+    "minimum",
+    "count",
+    "mean_abs",
+    "std",
+    "ranges",
+    "peak",
+    "peak_std",
+    "peak_range",
+)
+
+
+def _validate_profile_diagnostic_result(
+    result: Any, *, where: str = "result"
+) -> tuple:
+    """Validate a complete :func:`profile_diagnostic` result.
+
+    Returns the ``tolerance``, ``scales``, ``minimums``,
+    ``thresholds`` and ``panels`` axes and the ``data`` rows, checking
+    the ``climate-grid/ps-scale-diagnostic-v1`` contract: key order,
+    the schema, the axes and each minimum row, including every
+    ``mean_abs`` and ``peak`` statistic and each interval.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _PROFILE_DIAGNOSTIC_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, tolerance, scales, "
+            "minimums, thresholds, panels, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _PROFILE_DIAGNOSTIC_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_PROFILE_DIAGNOSTIC_SCHEMA!r}")
+
+    tolerance = result["tolerance"]
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
+        raise TypeError(f"{where}.tolerance must be a finite non-bool int or float")
+    if not _is_finite(tolerance) or tolerance < 0:
+        raise ValueError(f"{where}.tolerance must be finite and non-negative")
+
+    scales = _validate_string_list(result["scales"], f"{where}.scales", minimum=2)
+    minimums = _validate_profile_minimums(result["minimums"])
+    thresholds = _validate_profile_thresholds(result["thresholds"])
+
+    panels = result["panels"]
+    if not isinstance(panels, list):
+        raise TypeError(f"{where}.panels must be a list")
+    if len(panels) == 0:
+        raise ValueError(f"{where}.panels must be non-empty")
+    seen_panels: set[str] = set()
+    for panel_index, panel in enumerate(panels):
+        panel_where = f"{where}.panels[{panel_index}]"
+        if not isinstance(panel, str):
+            raise TypeError(f"{panel_where} must be a str")
+        if panel == "":
+            raise ValueError(f"{panel_where} must be non-empty")
+        if panel in seen_panels:
+            raise ValueError(f"duplicate {panel_where} entry: {panel!r}")
+        seen_panels.add(panel)
+
+    n_minimums = len(minimums)
+    n_thresholds = len(thresholds)
+    pair_count = len(scales) - 1
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != n_minimums:
+        raise ValueError(
+            f"{where}.data must contain exactly one row per minimum"
+        )
+
+    rows: list[dict] = []
+    for row_index, (row, minimum) in enumerate(zip(data, minimums)):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _PROFILE_DIAGNOSTIC_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys minimum, count, "
+                "mean_abs, peak, intervals in order"
+            )
+
+        row_minimum = row["minimum"]
+        if not isinstance(row_minimum, int) or isinstance(row_minimum, bool):
+            raise TypeError(f"{row_where}.minimum must be a non-bool int")
+        if row_minimum != minimum:
+            raise ValueError(
+                f"{row_where}.minimum must equal the corresponding minimums "
+                "entry"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count != pair_count:
+            raise ValueError(
+                f"{row_where}.count must equal the number of adjacent scale pairs"
+            )
+
+        mean_abs = row["mean_abs"]
+        if not isinstance(mean_abs, list):
+            raise TypeError(f"{row_where}.mean_abs must be a list")
+        if len(mean_abs) != n_thresholds:
+            raise ValueError(
+                f"{row_where}.mean_abs must contain one entry per threshold"
+            )
+        for value_index, value in enumerate(mean_abs):
+            value_where = f"{row_where}.mean_abs[{value_index}]"
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(
+                    f"{value_where} must be a finite non-bool int or float"
+                )
+            if not _is_finite(value) or value < 0:
+                raise ValueError(
+                    f"{value_where} must be finite and non-negative"
+                )
+
+        peak = row["peak"]
+        if not isinstance(peak, (int, float)) or isinstance(peak, bool):
+            raise TypeError(f"{row_where}.peak must be a finite non-bool int or float")
+        if not _is_finite(peak) or peak < 0:
+            raise ValueError(f"{row_where}.peak must be finite and non-negative")
+
+        intervals = row["intervals"]
+        if not isinstance(intervals, list):
+            raise TypeError(f"{row_where}.intervals must be a list")
+        previous_pair_position = -1
+        for interval_index, interval in enumerate(intervals):
+            interval_where = f"{row_where}.intervals[{interval_index}]"
+            if not isinstance(interval, dict):
+                raise TypeError(f"{interval_where} must be a dict")
+            if tuple(interval.keys()) != _PROFILE_DIAGNOSTIC_INTERVAL_KEYS:
+                raise ValueError(
+                    f"{interval_where} must have exactly the keys left, right, "
+                    "magnitude in order"
+                )
+            left = interval["left"]
+            if not isinstance(left, str):
+                raise TypeError(f"{interval_where}.left must be a str")
+            if left not in scales:
+                raise ValueError(
+                    f"{interval_where}.left must be a scales entry"
+                )
+            right = interval["right"]
+            if not isinstance(right, str):
+                raise TypeError(f"{interval_where}.right must be a str")
+            left_position = scales.index(left)
+            if left_position + 1 >= len(scales):
+                raise ValueError(
+                    f"{interval_where}.left must not be the final scale"
+                )
+            if right != scales[left_position + 1]:
+                raise ValueError(
+                    f"{interval_where}.right must be the scale immediately "
+                    "following left"
+                )
+            if left_position <= previous_pair_position:
+                raise ValueError(
+                    f"{interval_where} intervals must be in scale-pair order "
+                    "without repeats"
+                )
+            previous_pair_position = left_position
+            magnitude = interval["magnitude"]
+            if not isinstance(magnitude, (int, float)) or isinstance(
+                magnitude, bool
+            ):
+                raise TypeError(
+                    f"{interval_where}.magnitude must be a finite non-bool "
+                    "int or float"
+                )
+            if not _is_finite(magnitude) or magnitude < 0:
+                raise ValueError(
+                    f"{interval_where}.magnitude must be finite and non-negative"
+                )
+            if magnitude <= tolerance:
+                raise ValueError(
+                    f"{interval_where}.magnitude must be strictly greater than "
+                    "tolerance"
+                )
+
+        rows.append(row)
+
+    return tolerance, scales, minimums, thresholds, panels, rows
+
+
+def profile_summary(items) -> dict:
+    """Aggregate complete :func:`profile_diagnostic` results across items.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a unique
+    non-empty str and ``result`` is a complete :func:`profile_diagnostic`
+    result (schema ``climate-grid/ps-scale-diagnostic-v1``), validated
+    against that contract.  Every result must share the same
+    ``tolerance`` and the same ``scales``, ``minimums``, ``thresholds``
+    and ``panels`` axes in the same order, taken from the first result.
+    A wrong container or entry type raises ``TypeError``; any other
+    contract violation, or a non-finite derived value, raises
+    ``ValueError``.
+
+    The returned mapping uses the key order ``schema, names, scales,
+    minimums, thresholds, panels, data``; ``schema`` is
+    ``climate-grid/ps-summary-v1``, ``names`` lists the item names in
+    item order and the axes are copied from the first result.  ``data``
+    is ordered by minimum; each row uses the key order
+    ``minimum, count, mean_abs, std, ranges, peak, peak_std,
+    peak_range``.  ``count`` is the number of items ``n``.  For each
+    threshold, ``mean_abs`` is ``fsum(x) / n``, ``std`` is
+    ``sqrt(fsum((x - mean_abs) ** 2) / n)`` and ``ranges`` is
+    ``{"min": min(x), "max": max(x)}`` over the items' per-threshold
+    values; ``peak``, ``peak_std`` and ``peak_range`` use the same
+    formulas over the items' peaks.  Every derived float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified and every output list is newly allocated.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    tolerance: Any = None
+    scales: list = []
+    minimums: list = []
+    thresholds: list = []
+    panels: list = []
+    rows_by_item: list[list[dict]] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _EVOLVE_PANEL_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        (
+            item_tolerance,
+            item_scales,
+            item_minimums,
+            item_thresholds,
+            item_panels,
+            item_rows,
+        ) = _validate_profile_diagnostic_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not rows_by_item:
+            tolerance = item_tolerance
+            scales = item_scales
+            minimums = item_minimums
+            thresholds = item_thresholds
+            panels = item_panels
+        else:
+            if item_tolerance != tolerance:
+                raise ValueError(
+                    "all results must share the same tolerance, taken from the "
+                    "first result"
+                )
+            if item_scales != scales:
+                raise ValueError(
+                    "all results must share the same scales in the same order, "
+                    "taken from the first result"
+                )
+            if item_minimums != minimums:
+                raise ValueError(
+                    "all results must share the same minimums in the same "
+                    "order, taken from the first result"
+                )
+            if item_thresholds != thresholds:
+                raise ValueError(
+                    "all results must share the same thresholds in the same "
+                    "order, taken from the first result"
+                )
+            if item_panels != panels:
+                raise ValueError(
+                    "all results must share the same panels in the same order, "
+                    "taken from the first result"
+                )
+
+        names.append(name)
+        rows_by_item.append(item_rows)
+
+    n_items = len(items)
+    n_thresholds = len(thresholds)
+
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value)
+        except OverflowError:
+            # A finite int too large to represent cannot yield a finite
+            # derived statistic.
+            raise ValueError("derived statistics must be finite") from None
+
+    data_rows: list[dict] = []
+    for minimum_index, minimum in enumerate(minimums):
+        mean_abs: list[float] = []
+        std: list[float] = []
+        ranges: list[dict] = []
+        for threshold_index in range(n_thresholds):
+            values = [
+                _as_float(rows[minimum_index]["mean_abs"][threshold_index])
+                for rows in rows_by_item
+            ]
+            mean = math.fsum(values) / n_items
+            if not _is_finite(mean):
+                raise ValueError("derived statistics must be finite")
+            deviation = math.sqrt(
+                math.fsum((value - mean) ** 2 for value in values) / n_items
+            )
+            if not _is_finite(deviation):
+                raise ValueError("derived statistics must be finite")
+            minimum_value = min(values)
+            maximum_value = max(values)
+            mean_abs.append(_round_output(mean))
+            std.append(_round_output(deviation))
+            ranges.append(
+                {
+                    "min": _round_output(minimum_value),
+                    "max": _round_output(maximum_value),
+                }
+            )
+
+        peaks = [
+            _as_float(rows[minimum_index]["peak"]) for rows in rows_by_item
+        ]
+        peak_mean = math.fsum(peaks) / n_items
+        if not _is_finite(peak_mean):
+            raise ValueError("derived statistics must be finite")
+        peak_deviation = math.sqrt(
+            math.fsum((value - peak_mean) ** 2 for value in peaks) / n_items
+        )
+        if not _is_finite(peak_deviation):
+            raise ValueError("derived statistics must be finite")
+
+        data_rows.append(
+            {
+                "minimum": minimum,
+                "count": n_items,
+                "mean_abs": mean_abs,
+                "std": std,
+                "ranges": ranges,
+                "peak": _round_output(peak_mean),
+                "peak_std": _round_output(peak_deviation),
+                "peak_range": {
+                    "min": _round_output(min(peaks)),
+                    "max": _round_output(max(peaks)),
+                },
+            }
+        )
+
+    return {
+        "schema": _PROFILE_SUMMARY_SCHEMA,
+        "names": list(names),
+        "scales": list(scales),
+        "minimums": list(minimums),
+        "thresholds": list(thresholds),
+        "panels": list(panels),
+        "data": data_rows,
+    }
