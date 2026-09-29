@@ -30858,3 +30858,221 @@ def sensitivity(result, configs, *, minimum: int = 1) -> dict:
         "data": data,
         "summary": summary,
     }
+
+
+_PANEL_STABILITY_SCHEMA = "climate-grid/ps-v1"
+_PANEL_STABILITY_ITEM_KEYS = ("name", "result")
+_PANEL_STABILITY_RESULT_KEYS = ("schema", "panels", "data")
+_PANEL_STABILITY_ROW_KEYS = (
+    "pair",
+    "group",
+    "name",
+    "count",
+    "span",
+    "flips",
+    "change",
+    "stable",
+)
+
+
+def panel_stability(items, configs, *, minimum: int = 1, threshold: float = 0.0) -> dict:
+    """Aggregate per-item :func:`sensitivity` results into a panel.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a unique
+    non-empty str and ``result`` is a complete :func:`reference_panel`
+    result (schema ``climate-grid/mp-reference-v1``); every result is
+    validated against that contract and all results must share the same
+    value for every key except ``data``, taken from the first result.
+    ``configs`` and ``minimum`` are validated exactly as in
+    :func:`sensitivity`.  ``threshold`` must be a finite non-bool number
+    greater than or equal to 0.  A wrong container/item/argument type
+    raises ``TypeError`` and any other violation raises ``ValueError``.
+
+    A sensitivity summary is computed for every item as
+    ``sensitivity(item["result"], configs, minimum=minimum)``.  For
+    each pair (in pair order), group (in group order) and name (in the
+    results' ``names`` order) the items' summary rows whose ``valid``
+    is greater than 0 are collected in item order and ``n`` is their
+    number.  When ``n`` is zero, ``span``, ``flips`` and ``change`` are
+    all ``None`` and ``stable`` is ``False``.  Otherwise ``span`` is
+    the largest collected ``rank_range[1]`` minus the smallest
+    ``rank_range[0]``, ``flips`` is the sum of the collected
+    ``sign_flips`` values, ``change`` is the largest collected
+    ``max_change`` and ``stable`` is ``True`` exactly when ``n`` equals
+    the number of items, ``span`` and ``flips`` are both zero and
+    ``change`` is at most ``threshold``.
+
+    The returned mapping uses the key order ``schema, panels, data``;
+    ``schema`` is ``climate-grid/ps-v1`` and ``panels`` lists the item
+    names in input order.  ``data`` iterates the pairs, then the
+    groups, then the names; each row uses the key order ``pair, group,
+    name, count, span, flips, change, stable`` where ``count`` is
+    ``n``.  ``count``, ``span`` and ``flips`` are ints.  The inputs are
+    not modified.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    results: list[dict] = []
+    reference: str = ""
+    member_names: list[str] = []
+    windows: list[str] = []
+    regions: list[str] = []
+    scales: list[str] = []
+    groups: list[str] = []
+    pairs: list[dict] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _PANEL_STABILITY_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+
+        (
+            item_reference,
+            item_names,
+            item_windows,
+            item_regions,
+            item_scales,
+            item_groups,
+            item_pairs,
+            _data,
+        ) = _validate_reference_panel_result(
+            item["result"], where=f"{where}.result"
+        )
+        if not results:
+            reference = item_reference
+            member_names = item_names
+            windows = item_windows
+            regions = item_regions
+            scales = item_scales
+            groups = item_groups
+            pairs = item_pairs
+        else:
+            if item_reference != reference:
+                raise ValueError(
+                    "all results must share the same reference, taken from "
+                    "the first result"
+                )
+            if item_names != member_names:
+                raise ValueError(
+                    "all results must share the same names in the same "
+                    "order, taken from the first result"
+                )
+            if item_windows != windows:
+                raise ValueError(
+                    "all results must share the same windows in the same "
+                    "order, taken from the first result"
+                )
+            if item_regions != regions:
+                raise ValueError(
+                    "all results must share the same regions in the same "
+                    "order, taken from the first result"
+                )
+            if item_scales != scales:
+                raise ValueError(
+                    "all results must share the same scales in the same "
+                    "order, taken from the first result"
+                )
+            if item_groups != groups:
+                raise ValueError(
+                    "all results must share the same groups in the same "
+                    "order, taken from the first result"
+                )
+            if item_pairs != pairs:
+                raise ValueError(
+                    "all results must share the same pairs in the same "
+                    "order, taken from the first result"
+                )
+
+        names.append(name)
+        results.append(item["result"])
+
+    _validate_sensitivity_configs(configs)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        raise TypeError("threshold must be a non-bool number")
+    if not _is_finite(threshold):
+        raise ValueError("threshold must be finite")
+    if threshold < 0:
+        raise ValueError("threshold must be non-negative")
+
+    summaries: list[dict[tuple[str, str, str], dict]] = []
+    for result in results:
+        outcome = sensitivity(result, configs, minimum=minimum)
+        summaries.append(
+            {
+                (row["pair"], row["group"], row["name"]): row
+                for row in outcome["summary"]
+            }
+        )
+
+    total = len(items)
+    data: list[dict] = []
+    for pair in pairs:
+        pair_name = pair["name"]
+        for group in groups:
+            for member in member_names:
+                key = (pair_name, group, member)
+                collected = [
+                    summary[key]
+                    for summary in summaries
+                    if summary[key]["valid"] > 0
+                ]
+                n = len(collected)
+                if n == 0:
+                    span = None
+                    flips = None
+                    change = None
+                    stable = False
+                else:
+                    span = max(
+                        row["rank_range"][1] for row in collected
+                    ) - min(row["rank_range"][0] for row in collected)
+                    flips = sum(row["sign_flips"] for row in collected)
+                    change = max(row["max_change"] for row in collected)
+                    stable = (
+                        n == total
+                        and span == 0
+                        and flips == 0
+                        and change <= threshold
+                    )
+                data.append(
+                    {
+                        "pair": pair_name,
+                        "group": group,
+                        "name": member,
+                        "count": n,
+                        "span": span,
+                        "flips": flips,
+                        "change": change,
+                        "stable": stable,
+                    }
+                )
+
+    return {
+        "schema": _PANEL_STABILITY_SCHEMA,
+        "panels": names,
+        "data": data,
+    }
