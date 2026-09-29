@@ -31068,3 +31068,103 @@ def panel_stability(items, configs, *, minimum: int = 1, threshold: float = 0.0)
         "panels": names,
         "data": data_rows,
     }
+
+
+_PANEL_STABILITY_PROFILE_SCHEMA = "climate-grid/ps-profile-v1"
+
+
+def panel_stability_profile(items, configs, thresholds, *, minimum: int = 1) -> dict:
+    """Profile :func:`panel_stability` across several thresholds.
+
+    ``thresholds`` must be a non-empty list of finite non-bool
+    non-negative int or float values in strictly increasing order; a
+    wrong container or item type raises ``TypeError`` while an empty
+    list, a non-finite or negative item, or a non-increasing sequence
+    raises ``ValueError``.  ``items``, ``configs`` and ``minimum`` are
+    validated exactly as in :func:`panel_stability`, which is run once
+    per threshold as ``panel_stability(items, configs, minimum=minimum,
+    threshold=threshold)``.
+
+    The returned mapping uses the key order ``schema, thresholds,
+    panels, data, coverage``; ``schema`` is
+    ``climate-grid/ps-profile-v1``, ``thresholds`` lists the thresholds
+    as given and ``panels`` lists the item names in item order.
+    ``data`` follows the pair, then group, then name order and each row
+    uses the key order ``pair, group, name, first, stable``; ``stable``
+    is the list of the runs' ``stable`` flags in threshold order and
+    ``first`` is the threshold of the first ``True`` flag, or ``None``
+    when no flag is ``True``.  ``coverage`` follows the threshold order
+    and each row uses the key order ``threshold, stable, total, rate``;
+    ``stable`` is the number of ``data`` rows whose flag is ``True``
+    for that threshold, ``total`` is the number of ``data`` rows and
+    ``rate`` is ``stable / total``.  Every derived float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0`` and a
+    non-finite derived value raises ``ValueError``.  The inputs are not
+    modified.
+    """
+    if not isinstance(thresholds, list):
+        raise TypeError("thresholds must be a list")
+    if len(thresholds) == 0:
+        raise ValueError("thresholds must be non-empty")
+    previous: Any = None
+    for index, threshold in enumerate(thresholds):
+        where = f"thresholds[{index}]"
+        if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+            raise TypeError(f"{where} must be a finite non-bool int or float")
+        if not _is_finite(threshold) or threshold < 0:
+            raise ValueError(f"{where} must be finite and non-negative")
+        if previous is not None and threshold <= previous:
+            raise ValueError("thresholds must be strictly increasing")
+        previous = threshold
+
+    runs = [
+        panel_stability(items, configs, minimum=minimum, threshold=threshold)
+        for threshold in thresholds
+    ]
+    panels = runs[0]["panels"]
+
+    data: list[dict] = []
+    base_rows = runs[0]["data"]
+    for row_index, base in enumerate(base_rows):
+        stable = [run["data"][row_index]["stable"] for run in runs]
+        first = None
+        for threshold, flag in zip(thresholds, stable):
+            if flag:
+                first = threshold
+                break
+        data.append(
+            {
+                "pair": base["pair"],
+                "group": base["group"],
+                "name": base["name"],
+                "first": first,
+                "stable": stable,
+            }
+        )
+
+    total = len(data)
+    coverage: list[dict] = []
+    for threshold_index, threshold in enumerate(thresholds):
+        stable_count = sum(1 for row in data if row["stable"][threshold_index])
+        rate = stable_count / total
+        if not _is_finite(rate):
+            raise ValueError(
+                f"coverage row for threshold {threshold!r} derived "
+                "statistics must be finite"
+            )
+        coverage.append(
+            {
+                "threshold": threshold,
+                "stable": stable_count,
+                "total": total,
+                "rate": _round_output(float(rate)),
+            }
+        )
+
+    return {
+        "schema": _PANEL_STABILITY_PROFILE_SCHEMA,
+        "thresholds": list(thresholds),
+        "panels": panels,
+        "data": data,
+        "coverage": coverage,
+    }
