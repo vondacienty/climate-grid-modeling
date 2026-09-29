@@ -31187,3 +31187,121 @@ def panel_stability_profile(
         "data": data_rows,
         "coverage": coverage_rows,
     }
+
+
+_PANEL_STABILITY_MINIMUM_PROFILE_SCHEMA = (
+    "climate-grid/ps-minimum-profile-v1"
+)
+
+
+def _validate_profile_minimums(minimums: Any) -> list:
+    if not isinstance(minimums, list):
+        raise TypeError("minimums must be a list")
+    if len(minimums) == 0:
+        raise ValueError("minimums must be non-empty")
+
+    for index, minimum in enumerate(minimums):
+        if not isinstance(minimum, int) or isinstance(minimum, bool):
+            raise TypeError(f"minimums[{index}] must be a non-bool int")
+        if minimum <= 0:
+            raise ValueError(f"minimums[{index}] must be positive")
+
+    for index in range(1, len(minimums)):
+        if minimums[index] <= minimums[index - 1]:
+            raise ValueError("minimums must be strictly increasing")
+
+    return minimums
+
+
+def minimum_profile(items, configs, thresholds, minimums) -> dict:
+    """Aggregate :func:`panel_stability_profile` across minimums.
+
+    ``items``, ``configs`` and ``thresholds`` are validated exactly as
+    in :func:`panel_stability_profile`, which is run once per minimum
+    as ``panel_stability_profile(items, configs, thresholds,
+    minimum=minimum)``.  ``minimums`` must be a non-empty list of
+    non-bool positive ints in strictly increasing order.  A wrong
+    container or entry type raises ``TypeError``; an empty container,
+    a non-positive entry or a non-increasing sequence raises
+    ``ValueError``.
+
+    The returned mapping uses the key order ``schema, minimums,
+    thresholds, panels, data``; ``schema`` is
+    ``climate-grid/ps-minimum-profile-v1``, ``minimums`` and
+    ``thresholds`` are echoed unchanged and ``panels`` is taken from
+    the first result.  ``data`` follows ``minimums`` order; each row
+    uses the key order ``minimum, first_counts, never, stable_counts,
+    rates, deltas``.  ``first_counts`` counts, per threshold, the
+    ``data`` rows of the corresponding profile whose ``first`` equals
+    that threshold; ``never`` counts the rows whose ``first`` is
+    ``None``.  ``stable_counts`` and ``rates`` are taken from the
+    profile's ``coverage`` rows in threshold order.  The first row's
+    ``deltas`` is a list of ``None`` with the same length as
+    ``rates``; every later row's ``deltas`` is its ``rates`` minus the
+    previous row's ``rates`` at the same positions.
+
+    Counts are ints and every derived float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``; a non-finite derived value
+    raises ``ValueError``.  The inputs are not modified.
+    """
+    _validate_profile_thresholds(thresholds)
+    _validate_profile_minimums(minimums)
+
+    results = [
+        panel_stability_profile(
+            items, configs, thresholds, minimum=minimum
+        )
+        for minimum in minimums
+    ]
+
+    panels = results[0]["panels"]
+    data_rows: list[dict] = []
+    for result_index, result in enumerate(results):
+        first_counts = [0 for _threshold in thresholds]
+        never = 0
+        for row in result["data"]:
+            first = row["first"]
+            if first is None:
+                never += 1
+            else:
+                for threshold_index, threshold in enumerate(thresholds):
+                    if first == threshold:
+                        first_counts[threshold_index] += 1
+                        break
+
+        stable_counts = [
+            coverage["stable"] for coverage in result["coverage"]
+        ]
+        rates = [coverage["rate"] for coverage in result["coverage"]]
+
+        if result_index == 0:
+            deltas: list = [None for _rate in rates]
+        else:
+            deltas = []
+            previous_rates = data_rows[result_index - 1]["rates"]
+            for rate, previous_rate in zip(rates, previous_rates):
+                delta = _round_output(rate - previous_rate)
+                if not _is_finite(delta):
+                    raise ValueError(
+                        "minimums derived statistics must be finite"
+                    )
+                deltas.append(delta)
+
+        data_rows.append(
+            {
+                "minimum": minimums[result_index],
+                "first_counts": first_counts,
+                "never": never,
+                "stable_counts": stable_counts,
+                "rates": rates,
+                "deltas": deltas,
+            }
+        )
+
+    return {
+        "schema": _PANEL_STABILITY_MINIMUM_PROFILE_SCHEMA,
+        "minimums": minimums,
+        "thresholds": thresholds,
+        "panels": panels,
+        "data": data_rows,
+    }
