@@ -29840,3 +29840,364 @@ def reference_panel(items, *, minimum: int = 1) -> dict:
         ],
         "data": result_rows,
     }
+
+
+_REFERENCE_SUM_SCHEMA = "climate-grid/mp-reference-summary-v1"
+_REFERENCE_PANEL_RESULT_KEYS = (
+    "schema",
+    "reference",
+    "names",
+    "windows",
+    "regions",
+    "scales",
+    "groups",
+    "pairs",
+    "data",
+)
+_REFERENCE_PANEL_ROW_KEYS = (
+    "name",
+    "pair",
+    "group",
+    "count",
+    "coverage",
+    "change",
+    "uncertainty",
+)
+_REFERENCE_SUM_ROW_KEYS = (
+    "pair",
+    "group",
+    "total",
+    "valid",
+    "coverage",
+    "coverage_range",
+    "change",
+    "change_range",
+    "uncertainty",
+)
+
+
+def _validate_reference_panel_result(
+    result: Any, *, where: str = "result"
+) -> tuple[
+    str,
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    list[dict],
+    list[list[dict]],
+]:
+    """Validate a complete :func:`reference_panel` result.
+
+    Returns the ``reference`` name, the compared ``names``, the
+    ``windows``, ``regions``, ``scales``, ``groups`` and ``pairs`` axes
+    and the flat ``data`` rows grouped by compared name, checking the
+    ``climate-grid/mp-reference-v1`` contract: key order, the schema,
+    the axes (non-empty unique strings, with at least two windows and
+    scales) and the one-row-per-(name, pair, group) order.  Each pair
+    uses the key order ``name, left, right`` with a unique name and two
+    distinct regions; each row uses the key order ``name, pair, group,
+    count, coverage, change, uncertainty``; ``count`` is a non-bool
+    non-negative int no greater than the number of windows and
+    ``coverage``, ``change`` and ``uncertainty`` are each ``None`` or a
+    finite number rounded to 12 digits.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _REFERENCE_PANEL_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, "
+            "names, windows, regions, scales, groups, pairs, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _REFERENCE_PANEL_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be {_REFERENCE_PANEL_SCHEMA!r}"
+        )
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    names = _validate_string_list(result["names"], f"{where}.names")
+    if reference in names:
+        raise ValueError(
+            f"{where}.reference must not appear in {where}.names"
+        )
+
+    windows = _validate_string_list(
+        result["windows"], f"{where}.windows", minimum=2
+    )
+    regions = _validate_string_list(result["regions"], f"{where}.regions")
+    scales = _validate_string_list(
+        result["scales"], f"{where}.scales", minimum=2
+    )
+    groups = _validate_string_list(result["groups"], f"{where}.groups")
+
+    pairs = result["pairs"]
+    if not isinstance(pairs, list):
+        raise TypeError(f"{where}.pairs must be a list")
+    if len(pairs) == 0:
+        raise ValueError(f"{where}.pairs must be non-empty")
+    seen_pairs: set[str] = set()
+    for index, pair in enumerate(pairs):
+        pair_where = f"{where}.pairs[{index}]"
+        if not isinstance(pair, dict):
+            raise TypeError(f"{pair_where} must be a dict")
+        if tuple(pair.keys()) != _MIGRATION_PANEL_DELTA_PAIR_KEYS:
+            raise ValueError(
+                f"{pair_where} must have exactly the keys name, left, "
+                "right in order"
+            )
+        name = pair["name"]
+        left = pair["left"]
+        right = pair["right"]
+        for key, value in (("name", name), ("left", left), ("right", right)):
+            if not isinstance(value, str):
+                raise TypeError(f"{pair_where}.{key} must be a str")
+            if value == "":
+                raise ValueError(f"{pair_where}.{key} must be non-empty")
+        if name in seen_pairs:
+            raise ValueError(f"duplicate {where}.pairs name: {name!r}")
+        seen_pairs.add(name)
+        for key, value in (("left", left), ("right", right)):
+            if value not in regions:
+                raise ValueError(
+                    f"{pair_where}.{key} must be a name in {where}.regions"
+                )
+        if left == right:
+            raise ValueError(
+                f"{pair_where}.left and {pair_where}.right must be "
+                "different regions"
+            )
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(names) * len(pairs) * len(groups):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(name, pair, group) combination"
+        )
+
+    chunks: list[list[dict]] = []
+    cursor = 0
+    for name in names:
+        chunk: list[dict] = []
+        for pair in pairs:
+            pair_name = pair["name"]
+            for group in groups:
+                row_where = f"{where}.data[{cursor}]"
+                row = data[cursor]
+                cursor += 1
+                chunk.append(row)
+                if not isinstance(row, dict):
+                    raise TypeError(f"{row_where} must be a dict")
+                if tuple(row.keys()) != _REFERENCE_PANEL_ROW_KEYS:
+                    raise ValueError(
+                        f"{row_where} must have exactly the keys name, "
+                        "pair, group, count, coverage, change, "
+                        "uncertainty in order"
+                    )
+
+                if not isinstance(row["name"], str):
+                    raise TypeError(f"{row_where}.name must be a str")
+                if row["name"] != name:
+                    raise ValueError(
+                        f"{row_where}.name must be {name!r} for its position"
+                    )
+                if not isinstance(row["pair"], str):
+                    raise TypeError(f"{row_where}.pair must be a str")
+                if row["pair"] != pair_name:
+                    raise ValueError(
+                        f"{row_where}.pair must be {pair_name!r} for its "
+                        "position"
+                    )
+                if not isinstance(row["group"], str):
+                    raise TypeError(f"{row_where}.group must be a str")
+                if row["group"] != group:
+                    raise ValueError(
+                        f"{row_where}.group must be {group!r} for its position"
+                    )
+
+                count = row["count"]
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(
+                        f"{row_where}.count must be a non-bool int"
+                    )
+                if count < 0 or count > len(windows):
+                    raise ValueError(
+                        f"{row_where}.count must be between 0 and the number "
+                        "of windows"
+                    )
+
+                for key in ("coverage", "change", "uncertainty"):
+                    value = row[key]
+                    if value is None:
+                        continue
+                    _validate_number(
+                        value, f"{row_where}.{key}", nullable=False
+                    )
+                    if value != _round_output(value):
+                        raise ValueError(
+                            f"{row_where}.{key} must be rounded to 12 digits"
+                        )
+        chunks.append(chunk)
+
+    return reference, names, windows, regions, scales, groups, pairs, chunks
+
+
+def reference_sum(result, *, minimum: int = 1) -> dict:
+    """Aggregate a :func:`reference_panel` comparison across names.
+
+    ``result`` must be a complete :func:`reference_panel` result (schema
+    ``climate-grid/mp-reference-v1``); it is validated against that
+    contract.  ``minimum`` must be a non-bool positive int.  A wrong
+    result/argument type raises ``TypeError`` and any other violation,
+    including a non-finite derived value, raises ``ValueError``.
+
+    For each pair (in pair order) and group (in group order) the rows
+    across the compared names are aggregated.  A name counts toward
+    ``valid`` only when its row has ``coverage``, ``change`` and
+    ``uncertainty`` all present (not ``None``); ``total`` is
+    ``len(names)``.  When ``valid < minimum``, ``coverage``,
+    ``coverage_range``, ``change``, ``change_range`` and
+    ``uncertainty`` are all ``None``.  Otherwise ``coverage`` and
+    ``change`` are ``fsum / valid`` over the valid rows,
+    ``coverage_range`` and ``change_range`` are each ``[min, max]`` and
+    ``uncertainty`` is ``hypot(*u) / valid`` over the valid rows'
+    uncertainties.
+
+    The returned mapping uses the key order ``schema, reference, names,
+    windows, regions, scales, groups, pairs, data``; ``schema`` is
+    ``climate-grid/mp-reference-summary-v1`` and the metadata echoes the
+    result in its original order.  ``data`` iterates the pairs then the
+    groups; each row uses the key order ``pair, group, total, valid,
+    coverage, coverage_range, change, change_range, uncertainty``.
+    ``total`` and ``valid`` are ints and every computed float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    input is not modified.
+    """
+    (
+        reference,
+        names,
+        windows,
+        regions,
+        scales,
+        groups,
+        pairs,
+        chunks,
+    ) = _validate_reference_panel_result(result)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    total = len(names)
+    lookups = [
+        {(row["pair"], row["group"]): row for row in chunk}
+        for chunk in chunks
+    ]
+    data_rows: list[dict] = []
+    for pair in pairs:
+        pair_name = pair["name"]
+        for group in groups:
+            coverage_values: list = []
+            change_values: list = []
+            uncertainty_values: list = []
+            for lookup in lookups:
+                row = lookup[(pair_name, group)]
+                coverage = row["coverage"]
+                change = row["change"]
+                uncertainty = row["uncertainty"]
+                if coverage is None or change is None or uncertainty is None:
+                    continue
+                coverage_values.append(coverage)
+                change_values.append(change)
+                uncertainty_values.append(uncertainty)
+            valid = len(coverage_values)
+
+            if valid < minimum:
+                coverage = None
+                coverage_range = None
+                change = None
+                change_range = None
+                uncertainty = None
+            else:
+                row_where = (
+                    f"data row for pair {pair_name!r}, group {group!r}"
+                )
+                try:
+                    coverage_value = math.fsum(coverage_values) / valid
+                    coverage_lo = min(coverage_values)
+                    coverage_hi = max(coverage_values)
+                    change_value = math.fsum(change_values) / valid
+                    change_lo = min(change_values)
+                    change_hi = max(change_values)
+                    uncertainty_value = math.hypot(*uncertainty_values) / valid
+                except OverflowError:
+                    raise ValueError(
+                        f"{row_where} derived statistics must be finite"
+                    ) from None
+                if not all(
+                    _is_finite(value)
+                    for value in (
+                        coverage_value,
+                        coverage_lo,
+                        coverage_hi,
+                        change_value,
+                        change_lo,
+                        change_hi,
+                        uncertainty_value,
+                    )
+                ):
+                    raise ValueError(
+                        f"{row_where} derived statistics must be finite"
+                    )
+                coverage = _round_output(coverage_value)
+                coverage_range = [
+                    _round_output(coverage_lo),
+                    _round_output(coverage_hi),
+                ]
+                change = _round_output(change_value)
+                change_range = [
+                    _round_output(change_lo),
+                    _round_output(change_hi),
+                ]
+                uncertainty = _round_output(uncertainty_value)
+
+            data_rows.append(
+                {
+                    "pair": pair_name,
+                    "group": group,
+                    "total": total,
+                    "valid": valid,
+                    "coverage": coverage,
+                    "coverage_range": coverage_range,
+                    "change": change,
+                    "change_range": change_range,
+                    "uncertainty": uncertainty,
+                }
+            )
+
+    return {
+        "schema": _REFERENCE_SUM_SCHEMA,
+        "reference": reference,
+        "names": list(names),
+        "windows": list(windows),
+        "regions": list(regions),
+        "scales": list(scales),
+        "groups": list(groups),
+        "pairs": [
+            {"name": pair["name"], "left": pair["left"], "right": pair["right"]}
+            for pair in pairs
+        ],
+        "data": data_rows,
+    }
