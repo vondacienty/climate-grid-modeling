@@ -30441,3 +30441,250 @@ def weighted_sum(result, weights, *, minimum: int = 1) -> dict:
         "weights": list(weights),
         "data": result_rows,
     }
+
+
+_DECOMPOSE_SCHEMA = "climate-grid/mpw-decompose-v1"
+_DECOMPOSE_RESULT_KEYS = (
+    "schema",
+    "reference",
+    "names",
+    "windows",
+    "regions",
+    "scales",
+    "groups",
+    "pairs",
+    "weights",
+    "data",
+)
+_DECOMPOSE_ROW_KEYS = (
+    "pair",
+    "group",
+    "name",
+    "valid",
+    "weight",
+    "share",
+    "contribution",
+    "uncertainty",
+    "rank",
+)
+
+
+def decompose(result, weights, *, minimum: int = 1) -> dict:
+    """Decompose a complete :func:`reference_panel` result by weight share.
+
+    ``result`` must be a complete :func:`reference_panel` result (schema
+    ``climate-grid/mp-reference-v1``) and is validated with the same
+    contract as :func:`weighted_sum`; ``weights`` and ``minimum`` use
+    the same validation as :func:`weighted_sum` as well.
+
+    For each pair (in pair order) and group (in group order) a name row
+    counts toward the valid count ``v`` only when its ``coverage``,
+    ``change`` and ``uncertainty`` are all present and its weight is
+    positive.  When ``v`` is below ``minimum`` every name reports
+    ``share``, ``contribution``, ``uncertainty`` and ``rank`` as
+    ``None``.  Otherwise, writing the valid weights as ``w``, ``m`` is
+    ``max(w)``, ``a`` is ``w / m`` and ``A`` is ``fsum(a)``; each valid
+    name gets ``share`` ``a / A``, ``contribution``
+    ``[share * coverage, share * change]`` and ``uncertainty``
+    ``share * uncertainty``.  Valid names are ranked by the unrounded
+    ``abs(contribution[1])`` in descending order, ties broken by the
+    names order, with ranks starting at 1.  Invalid names report
+    ``None`` for every derived value and are listed after the valid
+    names, in their original names order.
+
+    The returned mapping uses the key order ``schema, reference, names,
+    windows, regions, scales, groups, pairs, weights, data``; ``schema``
+    is ``climate-grid/mpw-decompose-v1``, the metadata axes are copied
+    from the input in their original order and ``weights`` is a copy of
+    the argument.  ``data`` iterates the pairs then the groups; each row
+    uses the key order ``pair, group, name, valid, weight, share,
+    contribution, uncertainty, rank``, where ``valid`` is ``v`` and
+    ``weight`` is the name's original weight.  ``valid`` and ``rank``
+    are ints and every computed float is ``round(x, 12)`` with negative
+    zero normalized to ``0.0``.  A non-finite derived value raises
+    ``ValueError``.  The inputs are not modified.
+    """
+    reference, names, windows, regions, scales, groups, pairs, data = (
+        _validate_reference_panel_result(result)
+    )
+
+    if not isinstance(weights, list):
+        raise TypeError("weights must be a list")
+    if len(weights) != len(names):
+        raise ValueError("weights must be the same length as result.names")
+    for index, weight in enumerate(weights):
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise TypeError(
+                f"weights[{index}] must be a finite non-bool int or float"
+            )
+        if not _is_finite(weight) or weight < 0:
+            raise ValueError(
+                f"weights[{index}] must be finite and non-negative"
+            )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    rows_lookup: dict[tuple[str, str, str], dict] = {
+        (row["name"], row["pair"], row["group"]): row for row in data
+    }
+
+    result_rows: list[dict] = []
+    for pair in pairs:
+        pair_name = pair["name"]
+        for group in groups:
+            sum_where = f"data row for pair {pair_name!r}, group {group!r}"
+            selected: list[tuple] = []
+            invalid: list[tuple] = []
+            for index, (name, weight) in enumerate(zip(names, weights)):
+                row = rows_lookup[(name, pair_name, group)]
+                coverage = row["coverage"]
+                change = row["change"]
+                uncertainty = row["uncertainty"]
+                if (
+                    weight > 0
+                    and coverage is not None
+                    and change is not None
+                    and uncertainty is not None
+                ):
+                    selected.append(
+                        (index, name, weight, coverage, change, uncertainty)
+                    )
+                else:
+                    invalid.append((index, name, weight))
+
+            valid = len(selected)
+
+            if valid < minimum:
+                ordered = [
+                    (index, name, weight)
+                    for index, (name, weight) in enumerate(zip(names, weights))
+                ]
+                for _index, name, weight in ordered:
+                    result_rows.append(
+                        {
+                            "pair": pair_name,
+                            "group": group,
+                            "name": name,
+                            "valid": valid,
+                            "weight": weight,
+                            "share": None,
+                            "contribution": None,
+                            "uncertainty": None,
+                            "rank": None,
+                        }
+                    )
+                continue
+
+            try:
+                max_weight = max(item[2] for item in selected)
+                scaled = [item[2] / max_weight for item in selected]
+                scaled_total = math.fsum(scaled)
+            except OverflowError:
+                raise ValueError(
+                    f"{sum_where} derived statistics must be finite"
+                ) from None
+            if not _is_finite(max_weight) or not _is_finite(scaled_total):
+                raise ValueError(
+                    f"{sum_where} derived statistics must be finite"
+                )
+
+            enriched: list[tuple] = []
+            for item, scaled_weight in zip(selected, scaled):
+                index, name, weight, coverage, change, uncertainty = item
+                try:
+                    share = scaled_weight / scaled_total
+                    contribution_coverage = share * coverage
+                    contribution_change = share * change
+                    combined = share * uncertainty
+                except OverflowError:
+                    raise ValueError(
+                        f"{sum_where} derived statistics must be finite"
+                    ) from None
+                if (
+                    not _is_finite(share)
+                    or not _is_finite(contribution_coverage)
+                    or not _is_finite(contribution_change)
+                    or not _is_finite(combined)
+                ):
+                    raise ValueError(
+                        f"{sum_where} derived statistics must be finite"
+                    )
+                enriched.append(
+                    (
+                        index,
+                        name,
+                        weight,
+                        share,
+                        contribution_coverage,
+                        contribution_change,
+                        combined,
+                    )
+                )
+
+            ranked = sorted(
+                enriched,
+                key=lambda item: (-abs(item[5]), item[0]),
+            )
+            rank_by_index = {
+                item[0]: rank for rank, item in enumerate(ranked, start=1)
+            }
+
+            for (
+                index,
+                name,
+                weight,
+                share,
+                contribution_coverage,
+                contribution_change,
+                combined,
+            ) in enriched:
+                result_rows.append(
+                    {
+                        "pair": pair_name,
+                        "group": group,
+                        "name": name,
+                        "valid": valid,
+                        "weight": weight,
+                        "share": _round_output(share),
+                        "contribution": [
+                            _round_output(contribution_coverage),
+                            _round_output(contribution_change),
+                        ],
+                        "uncertainty": _round_output(combined),
+                        "rank": rank_by_index[index],
+                    }
+                )
+
+            for _index, name, weight in invalid:
+                result_rows.append(
+                    {
+                        "pair": pair_name,
+                        "group": group,
+                        "name": name,
+                        "valid": valid,
+                        "weight": weight,
+                        "share": None,
+                        "contribution": None,
+                        "uncertainty": None,
+                        "rank": None,
+                    }
+                )
+
+    return {
+        "schema": _DECOMPOSE_SCHEMA,
+        "reference": reference,
+        "names": list(names),
+        "windows": list(windows),
+        "regions": list(regions),
+        "scales": list(scales),
+        "groups": list(groups),
+        "pairs": [
+            {"name": pair["name"], "left": pair["left"], "right": pair["right"]}
+            for pair in pairs
+        ],
+        "weights": list(weights),
+        "data": result_rows,
+    }
