@@ -33883,3 +33883,535 @@ def panel_compare(result, *, min_panels: int = 2) -> dict:
         "thresholds": list(thresholds),
         "data": data,
     }
+
+
+_PANEL_SUM_SCHEMA = "climate-grid/pcs-v1"
+_PANEL_SUM_ITEM_KEYS = ("name", "result")
+_PANEL_SUM_OUTPUT_KEYS = (
+    "schema",
+    "factor",
+    "scenarios",
+    "reference",
+    "scales",
+    "panels",
+    "minimums",
+    "thresholds",
+    "data",
+)
+_PANEL_SUM_ROW_KEYS = (
+    "scale",
+    "minimum",
+    "count",
+    "d",
+    "u",
+    "band",
+    "pd",
+    "pu",
+    "pband",
+)
+
+
+def _validate_panel_compare_result(result: Any, *, where: str) -> tuple:
+    """Validate a complete :func:`panel_compare` result.
+
+    Returns the ``factor``, the ``reference``, the ``scales``,
+    ``panels``, ``minimums`` and ``thresholds`` axes and the ``data``
+    rows, checking the ``climate-grid/pc-v1`` contract: key order, the
+    schema, a finite positive factor rounded to 12 digits, the axes,
+    one data row per ``(scale, minimum)`` pair in scale then minimum
+    order and each row's key order ``scale, minimum, count, d, u, band,
+    pd, pu, pband``.  ``count`` is a positive int; a row is either
+    fully populated or fully ``None``: either every threshold's ``d``,
+    ``u`` and ``band`` entry and the peaks ``pd``, ``pu`` and ``pband``
+    are finite rounded numbers (with ``u`` and ``pu`` non-negative), or
+    every threshold's ``d`` and ``u`` is ``None``, every ``band`` entry
+    is ``[None, None]`` and ``pd``, ``pu`` are ``None`` with ``pband``
+    equal to ``[None, None]``.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != (
+        "schema",
+        "factor",
+        "reference",
+        "scales",
+        "panels",
+        "minimums",
+        "thresholds",
+        "data",
+    ):
+        raise ValueError(
+            f"{where} must have exactly the keys schema, factor, "
+            "reference, scales, panels, minimums, thresholds, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _PANEL_COMPARE_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_PANEL_COMPARE_SCHEMA!r}")
+
+    factor = result["factor"]
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+        raise TypeError(
+            f"{where}.factor must be a finite non-bool int or float"
+        )
+    if not _is_finite(factor) or factor <= 0:
+        raise ValueError(f"{where}.factor must be finite and positive")
+    if isinstance(factor, float) and factor != _round_output(factor):
+        raise ValueError(f"{where}.factor must be rounded to 12 digits")
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scales = _validate_string_list(result["scales"], f"{where}.scales")
+    panels = _validate_string_list(result["panels"], f"{where}.panels")
+    minimums = _validate_profile_minimums(result["minimums"])
+    thresholds = _validate_profile_thresholds(result["thresholds"])
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scales) * len(minimums):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(scale, minimum) pair"
+        )
+
+    n_minimums = len(minimums)
+    n_thresholds = len(thresholds)
+    rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _PANEL_SUM_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scale, minimum, "
+                "count, d, u, band, pd, pu, pband in order"
+            )
+
+        row_scale = row["scale"]
+        if not isinstance(row_scale, str):
+            raise TypeError(f"{row_where}.scale must be a str")
+        if row_scale != scales[row_index // n_minimums]:
+            raise ValueError(
+                f"{row_where}.scale must equal the corresponding "
+                "scales entry"
+            )
+
+        row_minimum = row["minimum"]
+        if not isinstance(row_minimum, int) or isinstance(row_minimum, bool):
+            raise TypeError(f"{row_where}.minimum must be a non-bool int")
+        if row_minimum != minimums[row_index % n_minimums]:
+            raise ValueError(
+                f"{row_where}.minimum must equal the corresponding "
+                "minimums entry"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 1:
+            raise ValueError(f"{row_where}.count must be positive")
+
+        d_values = row["d"]
+        u_values = row["u"]
+        band_values = row["band"]
+        for key, values in (("d", d_values), ("u", u_values)):
+            if not isinstance(values, list):
+                raise TypeError(f"{row_where}.{key} must be a list")
+            if len(values) != n_thresholds:
+                raise ValueError(
+                    f"{row_where}.{key} must contain one value per threshold"
+                )
+        if not isinstance(band_values, list):
+            raise TypeError(f"{row_where}.band must be a list")
+        if len(band_values) != n_thresholds:
+            raise ValueError(
+                f"{row_where}.band must contain one band per threshold"
+            )
+
+        # A row is fully valid (every d/u/band/pd/pu/pband non-None)
+        # or fully None; the two shapes may not be mixed.
+        row_valid = d_values[0] is not None
+        for threshold_index in range(n_thresholds):
+            d_value = d_values[threshold_index]
+            u_value = u_values[threshold_index]
+            band_entry = band_values[threshold_index]
+            band_is_none = (
+                isinstance(band_entry, list)
+                and not isinstance(band_entry, bool)
+                and len(band_entry) == 2
+                and band_entry[0] is None
+                and band_entry[1] is None
+            )
+            if (d_value is None) != (not row_valid) or (
+                u_value is None
+            ) != (not row_valid):
+                raise ValueError(
+                    f"{row_where}.d and {row_where}.u must be numbers for "
+                    "every threshold or None for every threshold"
+                )
+            if band_is_none != (not row_valid):
+                raise ValueError(
+                    f"{row_where}.band entries must be numeric for every "
+                    "threshold or [None, None] for every threshold"
+                )
+            if not row_valid:
+                continue
+
+            for key, value in (("d", d_value), ("u", u_value)):
+                cell_where = f"{row_where}.{key}[{threshold_index}]"
+                if not isinstance(value, (int, float)) or isinstance(
+                    value, bool
+                ):
+                    raise TypeError(
+                        f"{cell_where} must be a finite non-bool int or float"
+                    )
+                if not _is_finite(value):
+                    raise ValueError(f"{cell_where} must be finite")
+                if key == "u" and value < 0:
+                    raise ValueError(f"{cell_where} must be non-negative")
+                if isinstance(value, float) and value != _round_output(value):
+                    raise ValueError(
+                        f"{cell_where} must be rounded to 12 digits"
+                    )
+
+            if not isinstance(band_entry, list) or isinstance(
+                band_entry, bool
+            ):
+                raise TypeError(
+                    f"{row_where}.band[{threshold_index}] must be a "
+                    "two-item list"
+                )
+            if len(band_entry) != 2:
+                raise ValueError(
+                    f"{row_where}.band[{threshold_index}] must contain "
+                    "exactly two items"
+                )
+            for bound_index, bound in enumerate(band_entry):
+                bound_where = (
+                    f"{row_where}.band[{threshold_index}][{bound_index}]"
+                )
+                if not isinstance(bound, (int, float)) or isinstance(
+                    bound, bool
+                ):
+                    raise TypeError(
+                        f"{bound_where} must be a finite non-bool int or float"
+                    )
+                if not _is_finite(bound):
+                    raise ValueError(f"{bound_where} must be finite")
+                if isinstance(bound, float) and bound != _round_output(bound):
+                    raise ValueError(
+                        f"{bound_where} must be rounded to 12 digits"
+                    )
+
+        pd = row["pd"]
+        pu = row["pu"]
+        pband = row["pband"]
+        peaks_none = pd is None
+        if (pu is None) != peaks_none:
+            raise ValueError(
+                f"{row_where}.pd and {row_where}.pu must be None together "
+                "or numbers together"
+            )
+        pband_is_none = (
+            isinstance(pband, list)
+            and not isinstance(pband, bool)
+            and len(pband) == 2
+            and pband[0] is None
+            and pband[1] is None
+        )
+        if pband_is_none != peaks_none:
+            raise ValueError(
+                f"{row_where}.pband must be [None, None] exactly when pd "
+                "and pu are None"
+            )
+        if peaks_none == row_valid:
+            raise ValueError(
+                f"{row_where} must be fully valid (non-None d, u, band, "
+                "pd, pu, pband) or fully None"
+            )
+        if row_valid:
+            for key, value in (("pd", pd), ("pu", pu)):
+                cell_where = f"{row_where}.{key}"
+                if not isinstance(value, (int, float)) or isinstance(
+                    value, bool
+                ):
+                    raise TypeError(
+                        f"{cell_where} must be a finite non-bool int or float"
+                    )
+                if not _is_finite(value):
+                    raise ValueError(f"{cell_where} must be finite")
+                if key == "pu" and value < 0:
+                    raise ValueError(f"{cell_where} must be non-negative")
+                if isinstance(value, float) and value != _round_output(value):
+                    raise ValueError(
+                        f"{cell_where} must be rounded to 12 digits"
+                    )
+            if not isinstance(pband, list) or isinstance(pband, bool):
+                raise TypeError(f"{row_where}.pband must be a two-item list")
+            if len(pband) != 2:
+                raise ValueError(
+                    f"{row_where}.pband must contain exactly two items"
+                )
+            for bound_index, bound in enumerate(pband):
+                bound_where = f"{row_where}.pband[{bound_index}]"
+                if not isinstance(bound, (int, float)) or isinstance(
+                    bound, bool
+                ):
+                    raise TypeError(
+                        f"{bound_where} must be a finite non-bool int or float"
+                    )
+                if not _is_finite(bound):
+                    raise ValueError(f"{bound_where} must be finite")
+                if isinstance(bound, float) and bound != _round_output(bound):
+                    raise ValueError(
+                        f"{bound_where} must be rounded to 12 digits"
+                    )
+
+        rows.append(row)
+
+    return factor, reference, scales, panels, minimums, thresholds, rows
+
+
+def panel_sum(items, *, minimum: int = 1) -> dict:
+    """Aggregate :func:`panel_compare` differences across scenarios.
+
+    ``items`` must be a list of at least two mappings, each with exactly
+    the keys ``name, result`` in that order.  ``name`` is a unique
+    non-empty str and ``result`` is a complete :func:`panel_compare`
+    result (schema ``climate-grid/pc-v1``), validated against that
+    contract.  Every result must share the same values, in the same
+    order, for every key other than ``data`` (``factor``, ``reference``,
+    ``scales``, ``panels``, ``minimums`` and ``thresholds``); those axes
+    are taken from the first item.  ``minimum`` must be a non-bool
+    positive ``int``.  A wrong container or entry type raises
+    ``TypeError``; any other contract violation, or a non-finite or
+    overflowing derived value, raises ``ValueError``.
+
+    For each scale (in scale order) and minimum (in minimum order) the
+    corresponding rows of every item are aligned.  An item's original
+    row is valid only when its ``d``, ``u``, ``band``, ``pd``, ``pu``
+    and ``pband`` are all non-``None`` (the row is either fully
+    populated or fully ``None`` by the :func:`panel_compare` contract).
+    ``n`` is the number of valid items, i.e. the output row's ``count``.
+    When ``n`` is below ``minimum`` the row's ``d`` and ``u`` are
+    ``None`` lists as long as ``thresholds``, ``band`` is an
+    equal-length list of ``[None, None]`` lists and ``pd``, ``pu`` and
+    ``pband`` are ``None``, ``None`` and ``[None, None]``.  Otherwise,
+    for each threshold, ``d`` is the mean ``fsum(d) / n`` of the valid
+    values, ``u`` is ``hypot(*u) / n`` and ``band`` is the two-item list
+    ``[d - factor * u, d + factor * u]``; the valid peaks use the same
+    formulas, giving ``pd``, ``pu`` and ``pband``.
+
+    The returned mapping uses the key order ``schema, factor,
+    scenarios, reference, scales, panels, minimums, thresholds, data``;
+    ``schema`` is ``climate-grid/pcs-v1``, ``scenarios`` lists the item
+    names in item order and the other axes are fresh copies from the
+    first item.  ``data`` follows scale order then minimum order; each
+    row uses the key order ``scale, minimum, count, d, u, band, pd, pu,
+    pband`` where ``d``, ``u`` and ``band`` follow threshold order and
+    each ``band`` entry and ``pband`` are two-item lists.  Every derived
+    float is ``round(x, 12)`` with negative zero normalized to ``0.0``;
+    every output list is newly constructed and the inputs are not
+    modified.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two items")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    validated: list[tuple] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _PANEL_SUM_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, result in order"
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate items name: {name!r}")
+        seen_names.add(name)
+        names.append(name)
+
+        parts = _validate_panel_compare_result(
+            item["result"], where=f"{where}.result"
+        )
+        (
+            item_factor,
+            item_reference,
+            item_scales,
+            item_panels,
+            item_minimums,
+            item_thresholds,
+            item_rows,
+        ) = parts
+        if not validated:
+            factor = item_factor
+            reference = item_reference
+            scales = item_scales
+            panels = item_panels
+            minimums = item_minimums
+            thresholds = item_thresholds
+        else:
+            if item_factor != factor:
+                raise ValueError(
+                    "all results must have equal factor, taken from the "
+                    "first item"
+                )
+            if item_reference != reference:
+                raise ValueError(
+                    "all results must have equal reference, taken from the "
+                    "first item"
+                )
+            if item_scales != scales:
+                raise ValueError(
+                    "all results must have equal scales in the same order, "
+                    "taken from the first item"
+                )
+            if item_panels != panels:
+                raise ValueError(
+                    "all results must have equal panels in the same order, "
+                    "taken from the first item"
+                )
+            if item_minimums != minimums:
+                raise ValueError(
+                    "all results must have equal minimums in the same order, "
+                    "taken from the first item"
+                )
+            if item_thresholds != thresholds:
+                raise ValueError(
+                    "all results must have equal thresholds in the same "
+                    "order, taken from the first item"
+                )
+        validated.append(item_rows)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_thresholds = len(thresholds)
+    data: list[dict] = []
+    for scale_index, scale in enumerate(scales):
+        for minimum_index, row_minimum in enumerate(minimums):
+            row_offset = scale_index * len(minimums) + minimum_index
+            item_rows = [rows[row_offset] for rows in validated]
+            valid_rows = [row for row in item_rows if row["pd"] is not None]
+            count_n = len(valid_rows)
+
+            d_values: list = [None for _threshold in thresholds]
+            u_values: list = [None for _threshold in thresholds]
+            band_values: list = [
+                [None, None] for _threshold in thresholds
+            ]
+            pd_value: Any = None
+            pu_value: Any = None
+            pband_value: Any = [None, None]
+
+            if count_n >= minimum:
+                for threshold_index in range(n_thresholds):
+                    try:
+                        d = math.fsum(
+                            _as_finite_float(row["d"][threshold_index])
+                            for row in valid_rows
+                        ) / count_n
+                    except OverflowError:
+                        # An overflowing fsum sum is a non-finite value.
+                        raise ValueError(
+                            "derived statistics must be finite"
+                        ) from None
+                    u = math.hypot(
+                        *(
+                            _as_finite_float(row["u"][threshold_index])
+                            for row in valid_rows
+                        )
+                    ) / count_n
+                    try:
+                        lower = d - factor * u
+                        upper = d + factor * u
+                    except OverflowError:
+                        # Huge int factors overflow float arithmetic.
+                        raise ValueError(
+                            "derived statistics must be finite"
+                        ) from None
+                    if not all(
+                        _is_finite(value) for value in (d, u, lower, upper)
+                    ):
+                        raise ValueError("derived statistics must be finite")
+                    d_values[threshold_index] = _round_output(d)
+                    u_values[threshold_index] = _round_output(u)
+                    band_values[threshold_index] = [
+                        _round_output(lower),
+                        _round_output(upper),
+                    ]
+
+                try:
+                    pd_value = math.fsum(
+                        _as_finite_float(row["pd"]) for row in valid_rows
+                    ) / count_n
+                except OverflowError:
+                    raise ValueError(
+                        "derived statistics must be finite"
+                    ) from None
+                pu_value = math.hypot(
+                    *(_as_finite_float(row["pu"]) for row in valid_rows)
+                ) / count_n
+                try:
+                    peak_lower = pd_value - factor * pu_value
+                    peak_upper = pd_value + factor * pu_value
+                except OverflowError:
+                    raise ValueError(
+                        "derived statistics must be finite"
+                    ) from None
+                if not all(
+                    _is_finite(value)
+                    for value in (pd_value, pu_value, peak_lower, peak_upper)
+                ):
+                    raise ValueError("derived statistics must be finite")
+                pband_value = [
+                    _round_output(peak_lower),
+                    _round_output(peak_upper),
+                ]
+                pd_value = _round_output(pd_value)
+                pu_value = _round_output(pu_value)
+
+            data.append(
+                {
+                    "scale": scale,
+                    "minimum": row_minimum,
+                    "count": count_n,
+                    "d": d_values,
+                    "u": u_values,
+                    "band": band_values,
+                    "pd": pd_value,
+                    "pu": pu_value,
+                    "pband": pband_value,
+                }
+            )
+
+    return {
+        "schema": _PANEL_SUM_SCHEMA,
+        "factor": _round_output(factor),
+        "scenarios": list(names),
+        "reference": reference,
+        "scales": list(scales),
+        "panels": list(panels),
+        "minimums": list(minimums),
+        "thresholds": list(thresholds),
+        "data": data,
+    }
