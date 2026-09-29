@@ -30228,3 +30228,228 @@ def reference_sum(result, *, minimum: int = 1) -> dict:
         ],
         "data": result_rows,
     }
+
+
+_WEIGHTED_SUM_SCHEMA = "climate-grid/mpw-v1"
+_WEIGHTED_SUM_RESULT_KEYS = (
+    "schema",
+    "reference",
+    "names",
+    "weights",
+    "windows",
+    "regions",
+    "scales",
+    "groups",
+    "pairs",
+    "data",
+)
+_WEIGHTED_SUM_ROW_KEYS = (
+    "pair",
+    "group",
+    "total",
+    "valid",
+    "weight",
+    "center",
+    "ranges",
+    "uncertainty",
+    "interval",
+)
+
+
+def weighted_sum(result, weights, *, minimum: int = 1) -> dict:
+    """Aggregate a complete :func:`reference_panel` result with weights.
+
+    ``result`` must be a complete :func:`reference_panel` result (schema
+    ``climate-grid/mp-reference-v1``) and is validated against that
+    contract exactly as in :func:`reference_sum`.  ``weights`` must be a
+    list with the same length as ``result``'s ``names`` axis; each item
+    must be a finite, non-bool, non-negative ``int``/``float`` (zero
+    weights simply do not participate).  ``minimum`` must be a non-bool
+    positive int.  A wrong container/item/argument type raises
+    ``TypeError`` and any other violation, including a non-finite derived
+    value, raises ``ValueError``.
+
+    For each pair (in pair order) and group (in group order) the rows
+    across names are aggregated.  A row counts toward ``valid`` only when
+    ``coverage``, ``change`` and ``uncertainty`` are all present and the
+    name's weight is positive; ``total`` is the number of names.  Writing
+    ``w`` for each included row's weight and ``W`` for ``fsum(w)``, when
+    ``valid`` is below ``minimum`` the six statistics are all ``None``
+    except ``weight`` which is ``W``.  Otherwise ``center`` is the two
+    weighted means ``[fsum(w·coverage)/W, fsum(w·change)/W]``, ``ranges``
+    is the two ``[min, max]`` pairs for coverage and change and
+    ``uncertainty`` is ``hypot(w·u)/W`` over the included rows.  Writing
+    ``U`` for the weighted uncertainty, ``interval`` is
+    ``[center[1] - U, center[1] + U]``.
+
+    The returned mapping follows the top level of :func:`reference_sum`
+    with ``weights`` inserted directly before ``data``; ``schema`` is
+    ``climate-grid/mpw-v1`` and the metadata axes are copied from the
+    input in their original order.  ``data`` iterates the pairs then the
+    groups; each row uses the key order ``pair, group, total, valid,
+    weight, center, ranges, uncertainty, interval``.  ``total`` and
+    ``valid`` are ints and every computed float is ``round(x, 12)`` with
+    negative zero normalized to ``0.0``.  The inputs are not modified.
+    """
+    reference, names, windows, regions, scales, groups, pairs, data = (
+        _validate_reference_panel_result(result)
+    )
+
+    if not isinstance(weights, list):
+        raise TypeError("weights must be a list")
+    if len(weights) != len(names):
+        raise ValueError(
+            "weights must have the same length as result.names "
+            f"({len(names)} expected)"
+        )
+    for index, weight in enumerate(weights):
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise TypeError(
+                f"weights[{index}] must be a finite non-bool int or float"
+            )
+        if not _is_finite(weight):
+            raise ValueError(f"weights[{index}] must be finite")
+        if weight < 0:
+            raise ValueError(f"weights[{index}] must be non-negative")
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    total = len(names)
+    rows_lookup: dict[tuple[str, str, str], dict] = {
+        (row["name"], row["pair"], row["group"]): row for row in data
+    }
+
+    result_rows: list[dict] = []
+    for pair in pairs:
+        pair_name = pair["name"]
+        for group in groups:
+            sum_where = f"data row for pair {pair_name!r}, group {group!r}"
+            included_weights: list = []
+            coverages: list = []
+            changes: list = []
+            uncertainties: list = []
+            for name, weight in zip(names, weights):
+                row = rows_lookup[(name, pair_name, group)]
+                coverage = row["coverage"]
+                change = row["change"]
+                uncertainty = row["uncertainty"]
+                if (
+                    weight > 0
+                    and coverage is not None
+                    and change is not None
+                    and uncertainty is not None
+                ):
+                    included_weights.append(weight)
+                    coverages.append(coverage)
+                    changes.append(change)
+                    uncertainties.append(uncertainty)
+
+            valid = len(coverages)
+            try:
+                weight_sum = math.fsum(included_weights)
+            except OverflowError:
+                raise ValueError(
+                    f"{sum_where} derived statistics must be finite"
+                ) from None
+            if not _is_finite(weight_sum):
+                raise ValueError(
+                    f"{sum_where} derived statistics must be finite"
+                )
+            weight_out = _round_output(weight_sum)
+
+            if valid < minimum:
+                center = None
+                ranges = None
+                combined = None
+                interval = None
+            else:
+                weighted_coverages = [
+                    w * value for w, value in zip(included_weights, coverages)
+                ]
+                weighted_changes = [
+                    w * value for w, value in zip(included_weights, changes)
+                ]
+                weighted_uncertainties = [
+                    w * value
+                    for w, value in zip(included_weights, uncertainties)
+                ]
+                try:
+                    coverage_value = math.fsum(weighted_coverages) / weight_sum
+                    change_value = math.fsum(weighted_changes) / weight_sum
+                    uncertainty_value = (
+                        math.hypot(*weighted_uncertainties) / weight_sum
+                    )
+                except OverflowError:
+                    raise ValueError(
+                        f"{sum_where} derived statistics must be finite"
+                    ) from None
+                if (
+                    not _is_finite(coverage_value)
+                    or not _is_finite(change_value)
+                    or not _is_finite(uncertainty_value)
+                ):
+                    raise ValueError(
+                        f"{sum_where} derived statistics must be finite"
+                    )
+                coverage_mean = _round_output(coverage_value)
+                change_mean = _round_output(change_value)
+                combined = _round_output(uncertainty_value)
+                center = [coverage_mean, change_mean]
+                ranges = [
+                    [
+                        _round_output(float(min(coverages))),
+                        _round_output(float(max(coverages))),
+                    ],
+                    [
+                        _round_output(float(min(changes))),
+                        _round_output(float(max(changes))),
+                    ],
+                ]
+                try:
+                    lower_value = change_mean - combined
+                    upper_value = change_mean + combined
+                except OverflowError:
+                    raise ValueError(
+                        f"{sum_where} derived statistics must be finite"
+                    ) from None
+                if not _is_finite(lower_value) or not _is_finite(upper_value):
+                    raise ValueError(
+                        f"{sum_where} derived statistics must be finite"
+                    )
+                interval = [
+                    _round_output(lower_value),
+                    _round_output(upper_value),
+                ]
+
+            result_rows.append(
+                {
+                    "pair": pair_name,
+                    "group": group,
+                    "total": total,
+                    "valid": valid,
+                    "weight": weight_out,
+                    "center": center,
+                    "ranges": ranges,
+                    "uncertainty": combined,
+                    "interval": interval,
+                }
+            )
+
+    return {
+        "schema": _WEIGHTED_SUM_SCHEMA,
+        "reference": reference,
+        "names": list(names),
+        "weights": list(weights),
+        "windows": list(windows),
+        "regions": list(regions),
+        "scales": list(scales),
+        "groups": list(groups),
+        "pairs": [
+            {"name": pair["name"], "left": pair["left"], "right": pair["right"]}
+            for pair in pairs
+        ],
+        "data": result_rows,
+    }
