@@ -34257,10 +34257,16 @@ def panel_sum(items, *, minimum: int = 1) -> dict:
             u_values: list[float] = []
             band_values: list[list[float]] = []
             for threshold_index in range(n_thresholds):
-                d = math.fsum(
-                    _as_finite_float(row["d"][threshold_index])
-                    for row in valid_rows
-                ) / n
+                try:
+                    d = math.fsum(
+                        _as_finite_float(row["d"][threshold_index])
+                        for row in valid_rows
+                    ) / n
+                except OverflowError:
+                    # Finite terms can still overflow the fsum total.
+                    raise ValueError(
+                        "derived statistics must be finite"
+                    ) from None
                 u = math.hypot(
                     *(
                         _as_finite_float(row["u"][threshold_index])
@@ -34285,9 +34291,15 @@ def panel_sum(items, *, minimum: int = 1) -> dict:
                     [_round_output(lower), _round_output(upper)]
                 )
 
-            pd = math.fsum(
-                _as_finite_float(row["pd"]) for row in valid_rows
-            ) / n
+            try:
+                pd = math.fsum(
+                    _as_finite_float(row["pd"]) for row in valid_rows
+                ) / n
+            except OverflowError:
+                # Finite terms can still overflow the fsum total.
+                raise ValueError(
+                    "derived statistics must be finite"
+                ) from None
             pu = math.hypot(
                 *(_as_finite_float(row["pu"]) for row in valid_rows)
             ) / n
@@ -34327,6 +34339,457 @@ def panel_sum(items, *, minimum: int = 1) -> dict:
         "scales": list(scales),
         "panels": list(panels),
         "minimums": list(minimums),
+        "thresholds": list(thresholds),
+        "data": data,
+    }
+
+
+_PANEL_REGION_DELTA_SCHEMA = "climate-grid/prd-v1"
+_PANEL_REGION_DELTA_ITEM_KEYS = ("region", "result")
+_PANEL_SUM_OUTPUT_KEYS = (
+    "schema",
+    "factor",
+    "scenarios",
+    "reference",
+    "scales",
+    "panels",
+    "minimums",
+    "thresholds",
+    "data",
+)
+_PANEL_SUM_OUTPUT_ROW_KEYS = (
+    "scale",
+    "minimum",
+    "count",
+    "d",
+    "u",
+    "band",
+    "pd",
+    "pu",
+    "pband",
+)
+_PANEL_REGION_DELTA_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "thresholds",
+    "data",
+)
+_PANEL_REGION_DELTA_ROW_KEYS = (
+    "region",
+    "scale",
+    "minimum",
+    "count",
+    "delta",
+    "u",
+    "interval",
+)
+
+
+def _validate_panel_sum_result(result: Any, *, where: str) -> tuple:
+    """Validate a complete :func:`panel_sum` result.
+
+    Returns the ``factor``, the ``reference``, the ``scales``,
+    ``panels``, ``minimums`` and ``thresholds`` axes and the ``data``
+    rows, checking the ``climate-grid/pcs-v1`` contract: key order, the
+    schema, a finite positive factor rounded to 12 digits, the axes,
+    one data row per ``(scale, minimum)`` pair in scale then minimum
+    order and each row's key order ``scale, minimum, count, d, u,
+    band, pd, pu, pband``.  ``count`` is a non-negative int; ``d``,
+    ``u`` and ``band`` hold one entry per threshold and each ``band``
+    entry and ``pband`` are two-item lists.  Every statistic entry is
+    either ``None`` or a finite value rounded to 12 digits; non-``None``
+    ``u`` and ``pu`` values are non-negative.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _PANEL_SUM_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, factor, "
+            "scenarios, reference, scales, panels, minimums, "
+            "thresholds, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _PANEL_SUM_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_PANEL_SUM_SCHEMA!r}")
+
+    factor = result["factor"]
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+        raise TypeError(
+            f"{where}.factor must be a finite non-bool int or float"
+        )
+    if not _is_finite(factor) or factor <= 0:
+        raise ValueError(f"{where}.factor must be finite and positive")
+    if isinstance(factor, float) and factor != _round_output(factor):
+        raise ValueError(f"{where}.factor must be rounded to 12 digits")
+
+    scenarios = _validate_string_list(
+        result["scenarios"], f"{where}.scenarios"
+    )
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    scales = _validate_string_list(
+        result["scales"], f"{where}.scales", minimum=0
+    )
+    panels = _validate_string_list(result["panels"], f"{where}.panels")
+    minimums = _validate_profile_minimums(result["minimums"])
+    thresholds = _validate_profile_thresholds(result["thresholds"])
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(scales) * len(minimums):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per "
+            "(scale, minimum) pair"
+        )
+
+    n_minimums = len(minimums)
+    n_thresholds = len(thresholds)
+    rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _PANEL_SUM_OUTPUT_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys scale, minimum, "
+                "count, d, u, band, pd, pu, pband in order"
+            )
+
+        row_scale = row["scale"]
+        if not isinstance(row_scale, str):
+            raise TypeError(f"{row_where}.scale must be a str")
+        if row_scale != scales[row_index // n_minimums]:
+            raise ValueError(
+                f"{row_where}.scale must equal the corresponding "
+                "scales entry"
+            )
+
+        row_minimum = row["minimum"]
+        if not isinstance(row_minimum, int) or isinstance(row_minimum, bool):
+            raise TypeError(f"{row_where}.minimum must be a non-bool int")
+        if row_minimum != minimums[row_index % n_minimums]:
+            raise ValueError(
+                f"{row_where}.minimum must equal the corresponding "
+                "minimums entry"
+            )
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{row_where}.count must be non-negative")
+
+        for key in ("d", "u"):
+            values = row[key]
+            if not isinstance(values, list):
+                raise TypeError(f"{row_where}.{key} must be a list")
+            if len(values) != n_thresholds:
+                raise ValueError(
+                    f"{row_where}.{key} must contain one value per threshold"
+                )
+            for value_index, value in enumerate(values):
+                if value is None:
+                    continue
+                value_where = f"{row_where}.{key}[{value_index}]"
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                ):
+                    raise TypeError(
+                        f"{value_where} must be None or a finite non-bool "
+                        "int or float"
+                    )
+                if not _is_finite(value):
+                    raise ValueError(f"{value_where} must be finite")
+                if key == "u" and value < 0:
+                    raise ValueError(f"{value_where} must be non-negative")
+                if isinstance(value, float) and value != _round_output(value):
+                    raise ValueError(
+                        f"{value_where} must be rounded to 12 digits"
+                    )
+
+        bands = row["band"]
+        if not isinstance(bands, list):
+            raise TypeError(f"{row_where}.band must be a list")
+        if len(bands) != n_thresholds:
+            raise ValueError(
+                f"{row_where}.band must contain one band per threshold"
+            )
+        for band_index, bounds in enumerate(bands):
+            band_where = f"{row_where}.band[{band_index}]"
+            if not isinstance(bounds, list) or isinstance(bounds, bool):
+                raise TypeError(f"{band_where} must be a two-item list")
+            if len(bounds) != 2:
+                raise ValueError(f"{band_where} must contain exactly two items")
+            for bound_index, bound in enumerate(bounds):
+                if bound is None:
+                    continue
+                bound_where = f"{band_where}[{bound_index}]"
+                if (
+                    not isinstance(bound, (int, float))
+                    or isinstance(bound, bool)
+                ):
+                    raise TypeError(
+                        f"{bound_where} must be None or a finite non-bool "
+                        "int or float"
+                    )
+                if not _is_finite(bound):
+                    raise ValueError(f"{bound_where} must be finite")
+                if isinstance(bound, float) and bound != _round_output(bound):
+                    raise ValueError(
+                        f"{bound_where} must be rounded to 12 digits"
+                    )
+
+        pd = row["pd"]
+        if pd is not None:
+            if not isinstance(pd, (int, float)) or isinstance(pd, bool):
+                raise TypeError(
+                    f"{row_where}.pd must be None or a finite non-bool "
+                    "int or float"
+                )
+            if not _is_finite(pd):
+                raise ValueError(f"{row_where}.pd must be finite")
+            if isinstance(pd, float) and pd != _round_output(pd):
+                raise ValueError(f"{row_where}.pd must be rounded to 12 digits")
+
+        pu = row["pu"]
+        if pu is not None:
+            if not isinstance(pu, (int, float)) or isinstance(pu, bool):
+                raise TypeError(
+                    f"{row_where}.pu must be None or a finite non-bool "
+                    "int or float"
+                )
+            if not _is_finite(pu):
+                raise ValueError(f"{row_where}.pu must be finite")
+            if pu < 0:
+                raise ValueError(f"{row_where}.pu must be non-negative")
+            if isinstance(pu, float) and pu != _round_output(pu):
+                raise ValueError(f"{row_where}.pu must be rounded to 12 digits")
+
+        pband = row["pband"]
+        if not isinstance(pband, list) or isinstance(pband, bool):
+            raise TypeError(f"{row_where}.pband must be a two-item list")
+        if len(pband) != 2:
+            raise ValueError(
+                f"{row_where}.pband must contain exactly two items"
+            )
+        for bound_index, bound in enumerate(pband):
+            if bound is None:
+                continue
+            bound_where = f"{row_where}.pband[{bound_index}]"
+            if (
+                not isinstance(bound, (int, float))
+                or isinstance(bound, bool)
+            ):
+                raise TypeError(
+                    f"{bound_where} must be None or a finite non-bool "
+                    "int or float"
+                )
+            if not _is_finite(bound):
+                raise ValueError(f"{bound_where} must be finite")
+            if isinstance(bound, float) and bound != _round_output(bound):
+                raise ValueError(
+                    f"{bound_where} must be rounded to 12 digits"
+                )
+
+        rows.append(row)
+
+    return factor, reference, scales, panels, minimums, thresholds, rows
+
+
+def panel_region_delta(items, *, minimum: int = 1) -> dict:
+    """Pairwise region differences of aggregated :func:`panel_sum` results.
+
+    ``items`` must be a list of at least two dicts whose keys are
+    exactly ``region, result`` in that order; ``region`` is a unique
+    non-empty ``str`` and ``result`` a complete :func:`panel_sum`
+    result (schema ``climate-grid/pcs-v1``), validated against that
+    contract.  Every result must hold the same ``factor``,
+    ``reference``, ``scales``, ``panels``, ``minimums`` and
+    ``thresholds``; only the ``data`` rows may differ.  ``minimum``
+    must be a non-bool positive ``int``.  A wrong container or entry
+    type raises ``TypeError``; any other contract violation, or a
+    non-finite or overflowing derived value, raises ``ValueError``.
+
+    The first item is the reference region.  Each later item is paired
+    with it: for every ``(scale, minimum)`` pair the two rows are found
+    by ``scale`` then ``minimum`` and ``count`` is the smaller of the
+    two rows' ``count``.  When ``count`` is smaller than ``minimum`` or
+    either row's ``d`` or ``u`` holds any ``None``, the row's ``delta``
+    and ``u`` are ``None`` lists as long as ``thresholds`` and
+    ``interval`` is an equal-length list of ``[None, None]`` lists.
+    Otherwise, for each threshold, ``delta`` is the current region's
+    ``d`` minus the reference region's ``d``, ``u`` is ``hypot`` of the
+    current and reference ``u`` and ``interval`` is the two-item list
+    ``[delta - factor * u, delta + factor * u]``.
+
+    The returned mapping uses the key order ``schema, reference,
+    thresholds, data``; ``schema`` is ``climate-grid/prd-v1``,
+    ``reference`` is the first item's region and ``thresholds`` is a
+    fresh copy of the first result's thresholds in their original
+    order.  ``data`` follows item order (later regions first), then
+    scale order, then minimum order; each row uses the key order
+    ``region, scale, minimum, count, delta, u, interval`` where
+    ``delta``, ``u`` and ``interval`` follow threshold order and each
+    ``interval`` entry is a two-item list.  Every derived float is
+    ``round(x, 12)`` with negative zero normalized to ``0.0``; every
+    output list is newly constructed and the input is not modified.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two items")
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    regions: list[str] = []
+    results: list[tuple] = []
+    seen: set[str] = set()
+    for item_index, item in enumerate(items):
+        item_where = f"items[{item_index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where} must be a dict")
+        if tuple(item.keys()) != _PANEL_REGION_DELTA_ITEM_KEYS:
+            raise ValueError(
+                f"{item_where} must have exactly the keys region, result "
+                "in order"
+            )
+
+        region = item["region"]
+        if not isinstance(region, str):
+            raise TypeError(f"{item_where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{item_where}.region must be non-empty")
+        if region in seen:
+            raise ValueError(f"duplicate items region: {region!r}")
+        seen.add(region)
+        regions.append(region)
+        results.append(
+            _validate_panel_sum_result(
+                item["result"], where=f"{item_where}.result"
+            )
+        )
+
+    factor, reference, scales, panels, minimums, thresholds, _rows = results[
+        0
+    ]
+    for item_index, other in enumerate(results[1:], start=1):
+        if other[:6] != (
+            factor,
+            reference,
+            scales,
+            panels,
+            minimums,
+            thresholds,
+        ):
+            raise ValueError(
+                f"items[{item_index}].result must have the same factor, "
+                "reference, scales, panels, minimums and thresholds as "
+                "every other result"
+            )
+
+    reference_region = regions[0]
+    reference_rows = results[0][6]
+    n_minimums = len(minimums)
+    n_thresholds = len(thresholds)
+
+    data: list[dict] = []
+    for item_index in range(1, len(items)):
+        current_region = regions[item_index]
+        current_rows = results[item_index][6]
+        for scale_index, scale in enumerate(scales):
+            for minimum_index, row_minimum in enumerate(minimums):
+                row_index = scale_index * n_minimums + minimum_index
+                base_row = reference_rows[row_index]
+                current_row = current_rows[row_index]
+                count = min(current_row["count"], base_row["count"])
+
+                missing = (
+                    count < minimum
+                    or any(value is None for value in current_row["d"])
+                    or any(value is None for value in current_row["u"])
+                    or any(value is None for value in base_row["d"])
+                    or any(value is None for value in base_row["u"])
+                )
+                if missing:
+                    data.append(
+                        {
+                            "region": current_region,
+                            "scale": scale,
+                            "minimum": row_minimum,
+                            "count": count,
+                            "delta": [None for _threshold in thresholds],
+                            "u": [None for _threshold in thresholds],
+                            "interval": [
+                                [None, None] for _threshold in thresholds
+                            ],
+                        }
+                    )
+                    continue
+
+                delta_values: list[float] = []
+                u_values: list[float] = []
+                interval_values: list[list[float]] = []
+                for threshold_index in range(n_thresholds):
+                    delta = _as_finite_float(
+                        current_row["d"][threshold_index]
+                    ) - _as_finite_float(
+                        base_row["d"][threshold_index]
+                    )
+                    u = math.hypot(
+                        _as_finite_float(
+                            current_row["u"][threshold_index]
+                        ),
+                        _as_finite_float(base_row["u"][threshold_index]),
+                    )
+                    try:
+                        lower = delta - factor * u
+                        upper = delta + factor * u
+                    except OverflowError:
+                        # Huge int factors overflow float arithmetic.
+                        raise ValueError(
+                            "derived statistics must be finite"
+                        ) from None
+                    if not all(
+                        _is_finite(value)
+                        for value in (delta, u, lower, upper)
+                    ):
+                        raise ValueError(
+                            "derived statistics must be finite"
+                        )
+                    delta_values.append(_round_output(delta))
+                    u_values.append(_round_output(u))
+                    interval_values.append(
+                        [_round_output(lower), _round_output(upper)]
+                    )
+
+                data.append(
+                    {
+                        "region": current_region,
+                        "scale": scale,
+                        "minimum": row_minimum,
+                        "count": count,
+                        "delta": delta_values,
+                        "u": u_values,
+                        "interval": interval_values,
+                    }
+                )
+
+    return {
+        "schema": _PANEL_REGION_DELTA_SCHEMA,
+        "reference": reference_region,
         "thresholds": list(thresholds),
         "data": data,
     }
