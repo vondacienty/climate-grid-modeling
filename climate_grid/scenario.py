@@ -30688,3 +30688,149 @@ def decompose(result, weights, *, minimum: int = 1) -> dict:
         "weights": list(weights),
         "data": result_rows,
     }
+
+
+_SENSITIVITY_SCHEMA = "climate-grid/mpws-v1"
+_SENSITIVITY_SUMMARY_ROW_KEYS = (
+    "pair",
+    "group",
+    "name",
+    "valid",
+    "rank_range",
+    "sign_flips",
+    "max_change",
+)
+
+
+def sensitivity(result, configs, *, minimum: int = 1) -> dict:
+    """Measure how sensitive the :func:`decompose` output is to weights.
+
+    ``result`` is validated exactly as in :func:`decompose` (a complete
+    :func:`reference_panel` result, schema
+    ``climate-grid/mp-reference-v1``) and ``minimum`` uses the same
+    validation as :func:`decompose`.  ``configs`` is a list of at least
+    two dicts; each dict must have exactly the keys ``name, weights`` in
+    that order.  ``name`` is a unique non-empty str and ``weights``
+    follows the :func:`decompose` weights contract: one finite non-bool
+    non-negative number per ``result.names`` entry, in names order.  A
+    wrong container/item/argument type raises ``TypeError`` and any other
+    violation, including a non-finite derived value, raises
+    ``ValueError``.
+
+    A decomposition is computed for every configuration as
+    ``decompose(result, weights, minimum=minimum)``.  The returned
+    mapping uses the key order ``schema, configs, data, summary``;
+    ``schema`` is ``climate-grid/mpws-v1`` and ``configs`` lists the
+    configuration names in input order.  ``data`` concatenates the
+    configurations' decomposition ``data`` rows in configuration order;
+    each row is the decomposition row with a ``config`` key (the
+    configuration name) placed first.
+
+    ``summary`` iterates the result pairs (in pair order), then the
+    groups (in group order) and the names (in names order).  For each
+    combination the configurations whose decomposition row has a
+    ``rank`` other than ``None`` are collected in configuration order;
+    ``valid`` is their number.  Each summary row uses the key order
+    ``pair, group, name, valid, rank_range, sign_flips, max_change``.
+    When ``valid`` is zero the last three values are ``None``.
+    Otherwise ``rank_range`` is ``[min rank, max rank]``, ``sign_flips``
+    is the number of adjacent configurations whose
+    ``contribution[1]`` values have a negative product and
+    ``max_change`` is the largest absolute difference between adjacent
+    ``contribution[1]`` values; with a single valid configuration
+    ``sign_flips`` is ``0`` and ``max_change`` is ``0.0``.
+    ``rank_range`` endpoints and ``sign_flips`` are ints and every
+    computed float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``.  The inputs are not modified.
+    """
+    reference, names, windows, regions, scales, groups, pairs, data = (
+        _validate_reference_panel_result(result)
+    )
+    config_names = _validate_rank_configs(configs, len(names), minimum=2)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    rows_by_config: list[list[dict]] = []
+    result_rows: list[dict] = []
+    for config_name, config in zip(config_names, configs):
+        decomposed = decompose(result, config["weights"], minimum=minimum)
+        config_rows = decomposed["data"]
+        rows_by_config.append(config_rows)
+        for row in config_rows:
+            result_rows.append({"config": config_name, **row})
+
+    lookups = [
+        {(row["name"], row["pair"], row["group"]): row for row in rows}
+        for rows in rows_by_config
+    ]
+
+    summary_rows: list[dict] = []
+    for pair in pairs:
+        pair_name = pair["name"]
+        for group in groups:
+            for name in names:
+                selected = [
+                    lookup[(name, pair_name, group)]
+                    for lookup in lookups
+                    if lookup[(name, pair_name, group)]["rank"] is not None
+                ]
+                valid = len(selected)
+
+                if valid == 0:
+                    rank_range = None
+                    sign_flips = None
+                    max_change = None
+                else:
+                    ranks = [row["rank"] for row in selected]
+                    rank_range = [min(ranks), max(ranks)]
+                    sign_flips = 0
+                    max_change = 0.0
+                    if valid > 1:
+                        changes = [row["contribution"][1] for row in selected]
+                        sign_flips = sum(
+                            1
+                            for previous, current in zip(changes, changes[1:])
+                            if previous * current < 0
+                        )
+                        try:
+                            max_change = max(
+                                abs(current - previous)
+                                for previous, current in zip(
+                                    changes, changes[1:]
+                                )
+                            )
+                        except OverflowError:
+                            raise ValueError(
+                                f"summary row for pair {pair_name!r}, group "
+                                f"{group!r}, name {name!r} derived statistics "
+                                "must be finite"
+                            ) from None
+                        if not _is_finite(max_change):
+                            raise ValueError(
+                                f"summary row for pair {pair_name!r}, group "
+                                f"{group!r}, name {name!r} derived statistics "
+                                "must be finite"
+                            )
+                        max_change = _round_output(max_change)
+
+                summary_rows.append(
+                    {
+                        "pair": pair_name,
+                        "group": group,
+                        "name": name,
+                        "valid": valid,
+                        "rank_range": rank_range,
+                        "sign_flips": sign_flips,
+                        "max_change": max_change,
+                    }
+                )
+
+    return {
+        "schema": _SENSITIVITY_SCHEMA,
+        "configs": config_names,
+        "data": result_rows,
+        "summary": summary_rows,
+    }
