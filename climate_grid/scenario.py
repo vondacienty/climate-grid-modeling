@@ -31068,3 +31068,122 @@ def panel_stability(items, configs, *, minimum: int = 1, threshold: float = 0.0)
         "panels": names,
         "data": data_rows,
     }
+
+
+_PANEL_STABILITY_PROFILE_SCHEMA = "climate-grid/ps-profile-v1"
+
+
+def _validate_profile_thresholds(thresholds: Any) -> list:
+    if not isinstance(thresholds, list):
+        raise TypeError("thresholds must be a list")
+    if len(thresholds) == 0:
+        raise ValueError("thresholds must be non-empty")
+
+    previous = None
+    for index, threshold in enumerate(thresholds):
+        if (
+            not isinstance(threshold, (int, float))
+            or isinstance(threshold, bool)
+        ):
+            raise TypeError(
+                f"thresholds[{index}] must be a finite non-bool int or float"
+            )
+        if not _is_finite(threshold) or threshold < 0:
+            raise ValueError(
+                f"thresholds[{index}] must be finite and non-negative"
+            )
+        if previous is not None and not threshold > previous:
+            raise ValueError("thresholds must be strictly increasing")
+        previous = threshold
+
+    return thresholds
+
+
+def panel_stability_profile(
+    items, configs, thresholds, *, minimum: int = 1
+) -> dict:
+    """Aggregate :func:`panel_stability` across a range of thresholds.
+
+    ``items``, ``configs`` and ``minimum`` are validated exactly as in
+    :func:`panel_stability`, which is run once per threshold as
+    ``panel_stability(items, configs, minimum=minimum, threshold=t)``.
+    ``thresholds`` must be a non-empty list whose entries are finite
+    non-bool non-negative ints or floats in strictly increasing order.
+    A wrong container or entry type raises ``TypeError``; an empty
+    container, a non-finite or negative entry, or a non-increasing
+    sequence raises ``ValueError``.
+
+    The returned mapping uses the key order ``schema, thresholds,
+    panels, data, coverage``; ``schema`` is
+    ``climate-grid/ps-profile-v1``, ``thresholds`` is echoed
+    unchanged and ``panels`` lists the item names in item order.
+    ``data`` follows the pair, then group, then name order from the
+    per-threshold results; each row uses the key order
+    ``pair, group, name, first, stable`` where ``stable`` is a list
+    of booleans in threshold order and ``first`` is the first
+    threshold for which the row is stable, or ``None`` when it is
+    stable for none of them.
+
+    ``coverage`` follows threshold order; each row uses the key
+    order ``threshold, stable, total, rate`` where ``stable`` is the
+    number of stable ``data`` rows, ``total`` is the number of
+    ``data`` rows and ``rate`` is ``stable / total``.  Every derived
+    float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``; a non-finite derived value raises ``ValueError``.  The
+    inputs are not modified.
+    """
+    _validate_profile_thresholds(thresholds)
+
+    results = [
+        panel_stability(
+            items, configs, minimum=minimum, threshold=threshold
+        )
+        for threshold in thresholds
+    ]
+
+    panels = results[0]["panels"]
+    data_rows: list[dict] = []
+    stable_counts = [0 for _threshold in thresholds]
+    for row_index, first_row in enumerate(results[0]["data"]):
+        stable_flags: list[bool] = []
+        first = None
+        for result_index, result in enumerate(results):
+            is_stable = result["data"][row_index]["stable"]
+            stable_flags.append(is_stable)
+            if is_stable:
+                stable_counts[result_index] += 1
+                if first is None:
+                    first = thresholds[result_index]
+
+        data_rows.append(
+            {
+                "pair": first_row["pair"],
+                "group": first_row["group"],
+                "name": first_row["name"],
+                "first": first,
+                "stable": stable_flags,
+            }
+        )
+
+    total = len(data_rows)
+    coverage_rows: list[dict] = []
+    for threshold, stable_count in zip(thresholds, stable_counts):
+        rate = _round_output(stable_count / total)
+        if not _is_finite(rate):
+            raise ValueError("coverage derived statistics must be finite")
+        coverage_rows.append(
+            {
+                "threshold": threshold,
+                "stable": stable_count,
+                "total": total,
+                "rate": rate,
+            }
+        )
+
+    return {
+        "schema": _PANEL_STABILITY_PROFILE_SCHEMA,
+        "thresholds": thresholds,
+        "panels": panels,
+        "data": data_rows,
+        "coverage": coverage_rows,
+    }
