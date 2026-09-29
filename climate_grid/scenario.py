@@ -32623,9 +32623,10 @@ def _validate_profile_summary_result(
     axes, one data row per minimum and each row's key order
     ``minimum, count, mean_abs, std, ranges, peak, peak_std,
     peak_range``.  ``count`` equals the number of names, the per-
-    threshold statistics each hold one finite value rounded to 12
-    digits per threshold, every range holds two ordered such values and
-    the peak statistics mirror the threshold ones.
+    threshold statistics each hold one finite non-negative value
+    rounded to 12 digits per threshold, every range holds two ordered
+    non-negative such values and the peak statistics mirror the
+    threshold ones.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -32712,6 +32713,8 @@ def _validate_profile_summary_result(
                     )
                 if not _is_finite(value):
                     raise ValueError(f"{value_where} must be finite")
+                if value < 0:
+                    raise ValueError(f"{value_where} must be non-negative")
                 if isinstance(value, float) and value != _round_output(value):
                     raise ValueError(
                         f"{value_where} must be rounded to 12 digits"
@@ -32739,6 +32742,8 @@ def _validate_profile_summary_result(
                     )
                 if not _is_finite(bound):
                     raise ValueError(f"{bound_where} must be finite")
+                if bound < 0:
+                    raise ValueError(f"{bound_where} must be non-negative")
                 if isinstance(bound, float) and bound != _round_output(bound):
                     raise ValueError(
                         f"{bound_where} must be rounded to 12 digits"
@@ -32755,6 +32760,8 @@ def _validate_profile_summary_result(
             )
         if not _is_finite(peak):
             raise ValueError(f"{row_where}.peak must be finite")
+        if peak < 0:
+            raise ValueError(f"{row_where}.peak must be non-negative")
         if isinstance(peak, float) and peak != _round_output(peak):
             raise ValueError(f"{row_where}.peak must be rounded to 12 digits")
 
@@ -32768,6 +32775,8 @@ def _validate_profile_summary_result(
             )
         if not _is_finite(peak_std):
             raise ValueError(f"{row_where}.peak_std must be finite")
+        if peak_std < 0:
+            raise ValueError(f"{row_where}.peak_std must be non-negative")
         if isinstance(peak_std, float) and peak_std != _round_output(peak_std):
             raise ValueError(
                 f"{row_where}.peak_std must be rounded to 12 digits"
@@ -32789,6 +32798,8 @@ def _validate_profile_summary_result(
                 )
             if not _is_finite(bound):
                 raise ValueError(f"{bound_where} must be finite")
+            if bound < 0:
+                raise ValueError(f"{bound_where} must be non-negative")
             if isinstance(bound, float) and bound != _round_output(bound):
                 raise ValueError(
                     f"{bound_where} must be rounded to 12 digits"
@@ -32935,6 +32946,136 @@ def compare_profiles(left, right, *, factor: float = 1) -> dict:
 
     return {
         "schema": _PROFILE_COMPARE_SCHEMA,
+        "factor": _round_output(factor),
+        "minimums": list(minimums),
+        "thresholds": list(thresholds),
+        "data": data,
+    }
+
+
+_PROFILE_SET_SCHEMA = "climate-grid/psd-set-v1"
+
+
+def profile_set(summaries, *, factor: float = 1) -> dict:
+    """Aggregate pairwise :func:`compare_profiles` results across summaries.
+
+    ``summaries`` must be a list of at least two complete
+    :func:`profile_summary` results (schema
+    ``climate-grid/ps-summary-v1``); every entry is validated through
+    :func:`compare_profiles` and all must share equal ``scales``,
+    ``minimums``, ``thresholds`` and ``panels`` axes in the same order.
+    ``factor`` must be a finite non-bool positive ``int`` or
+    ``float``.  A wrong container or entry type raises ``TypeError``;
+    any other contract violation, or a non-finite or overflowing
+    derived value, raises ``ValueError``.
+
+    The first summary is compared pairwise with each remaining summary
+    via :func:`compare_profiles` (with the first summary as ``left``),
+    giving ``k`` = ``len(summaries) - 1`` comparisons ``C``.  For each
+    minimum and threshold, ``d`` is ``fsum(C.d) / k``, ``u`` is
+    ``hypot(*C.u) / k`` and ``band`` is the two-item list
+    ``[d - factor * u, d + factor * u]``; the comparisons' peaks use
+    the same formulas, giving ``pd``, ``pu`` and ``pband``.
+
+    The returned mapping uses the key order ``schema, factor,
+    minimums, thresholds, data``; ``schema`` is
+    ``climate-grid/psd-set-v1``, ``factor`` echoes the argument rounded
+    to 12 digits and the axes are fresh copies taken from the first
+    summary.  ``data`` follows minimum order; each row uses the key
+    order ``minimum, count, d, u, band, pd, pu, pband`` where ``count``
+    is ``k``, ``d``, ``u`` and ``band`` follow threshold order and each
+    ``band`` entry and ``pband`` are two-item lists.  Every derived
+    float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``; every output list is newly constructed and the inputs are
+    not modified.
+    """
+    if not isinstance(summaries, list):
+        raise TypeError("summaries must be a list")
+    if len(summaries) < 2:
+        raise ValueError("summaries must contain at least two items")
+
+    first = summaries[0]
+    comparisons: list[dict] = [
+        compare_profiles(first, summaries[index], factor=factor)
+        for index in range(1, len(summaries))
+    ]
+    k = len(comparisons)
+    minimums = comparisons[0]["minimums"]
+    thresholds = comparisons[0]["thresholds"]
+
+    data: list[dict] = []
+    for minimum_index, minimum in enumerate(minimums):
+        d_values: list[float] = []
+        u_values: list[float] = []
+        band_values: list[list[float]] = []
+        for threshold_index in range(len(thresholds)):
+            d = math.fsum(
+                _as_finite_float(
+                    comparison["data"][minimum_index]["d"][threshold_index]
+                )
+                for comparison in comparisons
+            ) / k
+            u = math.hypot(
+                *(
+                    _as_finite_float(
+                        comparison["data"][minimum_index]["u"][
+                            threshold_index
+                        ]
+                    )
+                    for comparison in comparisons
+                )
+            ) / k
+            try:
+                lower = d - factor * u
+                upper = d + factor * u
+            except OverflowError:
+                # Huge int factors overflow float arithmetic.
+                raise ValueError("derived statistics must be finite") from None
+            if not all(_is_finite(value) for value in (d, u, lower, upper)):
+                raise ValueError("derived statistics must be finite")
+            d_values.append(_round_output(d))
+            u_values.append(_round_output(u))
+            band_values.append([_round_output(lower), _round_output(upper)])
+
+        pd = math.fsum(
+            _as_finite_float(comparison["data"][minimum_index]["pd"])
+            for comparison in comparisons
+        ) / k
+        pu = math.hypot(
+            *(
+                _as_finite_float(comparison["data"][minimum_index]["pu"])
+                for comparison in comparisons
+            )
+        ) / k
+        try:
+            peak_lower = pd - factor * pu
+            peak_upper = pd + factor * pu
+        except OverflowError:
+            # Huge int factors overflow float arithmetic.
+            raise ValueError("derived statistics must be finite") from None
+        if not all(
+            _is_finite(value) for value in (pd, pu, peak_lower, peak_upper)
+        ):
+            raise ValueError("derived statistics must be finite")
+
+        data.append(
+            {
+                "minimum": minimum,
+                "count": k,
+                "d": d_values,
+                "u": u_values,
+                "band": band_values,
+                "pd": _round_output(pd),
+                "pu": _round_output(pu),
+                "pband": [
+                    _round_output(peak_lower),
+                    _round_output(peak_upper),
+                ],
+            }
+        )
+
+    return {
+        "schema": _PROFILE_SET_SCHEMA,
         "factor": _round_output(factor),
         "minimums": list(minimums),
         "thresholds": list(thresholds),
