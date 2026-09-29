@@ -34367,6 +34367,24 @@ _PANEL_REGION_DELTA_ROW_KEYS = (
     "u",
     "interval",
 )
+_PANEL_REGION_SUMMARY_SCHEMA = "climate-grid/prd-summary-v1"
+_PANEL_REGION_SUMMARY_OUTPUT_KEYS = (
+    "schema",
+    "reference",
+    "regions",
+    "scales",
+    "minimums",
+    "thresholds",
+    "data",
+)
+_PANEL_REGION_SUMMARY_ROW_KEYS = (
+    "scale",
+    "minimum",
+    "count",
+    "mean",
+    "ranges",
+    "u",
+)
 
 
 def _validate_panel_sum_result(result: Any, *, where: str) -> tuple:
@@ -34772,4 +34790,357 @@ def panel_region_delta(items, *, minimum: int = 1) -> dict:
         "reference": regions[0],
         "thresholds": list(thresholds),
         "data": data,
+    }
+
+
+def _validate_panel_region_delta_result(result: Any, *, where: str) -> tuple:
+    """Validate a complete :func:`panel_region_delta` result.
+
+    Returns the ``reference``, the ``regions``, ``scales`` and
+    ``minimums`` axes, the ``thresholds`` axis and the ``data`` rows,
+    checking the ``climate-grid/prd-v1`` contract: key order, the
+    schema, the axes, one data row per ``(region, scale, minimum)``
+    triple in scale then minimum order over the regions following the
+    reference (a duplicate-free cartesian product), each region axis
+    listing its rows in scale then minimum order and each row's key
+    order ``region, scale, minimum, count, delta, u, interval``.
+    ``count`` is a non-negative int; ``delta`` and ``u`` hold one entry
+    per threshold and ``interval`` holds one two-item list per
+    threshold.  Every statistic entry is either ``None`` or a finite
+    non-bool value rounded to 12 digits; within a row ``delta``, ``u``
+    and ``interval`` are all ``None``-form or all present together.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _PANEL_REGION_DELTA_OUTPUT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, reference, "
+            "thresholds, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _PANEL_REGION_DELTA_SCHEMA:
+        raise ValueError(f"{where}.schema must be {_PANEL_REGION_DELTA_SCHEMA!r}")
+
+    reference = result["reference"]
+    if not isinstance(reference, str):
+        raise TypeError(f"{where}.reference must be a str")
+    if reference == "":
+        raise ValueError(f"{where}.reference must be non-empty")
+
+    thresholds = _validate_profile_thresholds(result["thresholds"])
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+
+    regions: list[str] = []
+    scales: list[str] = []
+    minimums: list[int] = []
+    seen_regions: set[str] = set()
+    seen_scales: set[str] = set()
+    seen_minimums: set[int] = set()
+    seen_triples: set[tuple] = set()
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _PANEL_REGION_DELTA_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys region, scale, "
+                "minimum, count, delta, u, interval in order"
+            )
+
+        region = row["region"]
+        if not isinstance(region, str):
+            raise TypeError(f"{row_where}.region must be a str")
+        if region == "":
+            raise ValueError(f"{row_where}.region must be non-empty")
+        if region == reference:
+            raise ValueError(
+                f"{row_where}.region must not equal reference {reference!r}"
+            )
+        if region not in seen_regions:
+            seen_regions.add(region)
+            regions.append(region)
+
+        scale = row["scale"]
+        if not isinstance(scale, str):
+            raise TypeError(f"{row_where}.scale must be a str")
+        if scale == "":
+            raise ValueError(f"{row_where}.scale must be non-empty")
+        if scale not in seen_scales:
+            seen_scales.add(scale)
+            scales.append(scale)
+
+        minimum = row["minimum"]
+        if not isinstance(minimum, int) or isinstance(minimum, bool):
+            raise TypeError(f"{row_where}.minimum must be a non-bool int")
+        if minimum < 1:
+            raise ValueError(f"{row_where}.minimum must be positive")
+        if minimum not in seen_minimums:
+            seen_minimums.add(minimum)
+            minimums.append(minimum)
+
+        triple = (region, scale, minimum)
+        if triple in seen_triples:
+            raise ValueError(
+                f"duplicate {where}.data row for {triple!r}"
+            )
+        seen_triples.add(triple)
+
+        count = row["count"]
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"{row_where}.count must be a non-bool int")
+        if count < 0:
+            raise ValueError(f"{row_where}.count must be non-negative")
+
+        delta = row["delta"]
+        if not isinstance(delta, list):
+            raise TypeError(f"{row_where}.delta must be a list")
+        u = row["u"]
+        if not isinstance(u, list):
+            raise TypeError(f"{row_where}.u must be a list")
+        interval = row["interval"]
+        if not isinstance(interval, list):
+            raise TypeError(f"{row_where}.interval must be a list")
+        if len(delta) != len(thresholds) or len(u) != len(thresholds) or (
+            len(interval) != len(thresholds)
+        ):
+            raise ValueError(
+                f"{row_where} must hold one entry per threshold in delta, u "
+                "and interval"
+            )
+
+        none_deltas: list[bool] = []
+        for value_index, value in enumerate(delta):
+            value_where = f"{row_where}.delta[{value_index}]"
+            if value is None:
+                none_deltas.append(True)
+                continue
+            none_deltas.append(False)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(
+                    f"{value_where} must be None or a finite non-bool int "
+                    "or float"
+                )
+            if not _is_finite(value):
+                raise ValueError(f"{value_where} must be finite")
+            if isinstance(value, float) and value != _round_output(value):
+                raise ValueError(f"{value_where} must be rounded to 12 digits")
+
+        none_us: list[bool] = []
+        for value_index, value in enumerate(u):
+            value_where = f"{row_where}.u[{value_index}]"
+            if value is None:
+                none_us.append(True)
+                continue
+            none_us.append(False)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(
+                    f"{value_where} must be None or a finite non-bool int "
+                    "or float"
+                )
+            if not _is_finite(value):
+                raise ValueError(f"{value_where} must be finite")
+            if value < 0:
+                raise ValueError(f"{value_where} must be non-negative")
+            if isinstance(value, float) and value != _round_output(value):
+                raise ValueError(f"{value_where} must be rounded to 12 digits")
+
+        none_intervals: list[bool] = []
+        for band_index, bounds in enumerate(interval):
+            band_where = f"{row_where}.interval[{band_index}]"
+            if not isinstance(bounds, list) or isinstance(bounds, bool):
+                raise TypeError(f"{band_where} must be a two-item list")
+            if len(bounds) != 2:
+                raise ValueError(f"{band_where} must contain exactly two items")
+            if bounds[0] is None or bounds[1] is None:
+                if not (bounds[0] is None and bounds[1] is None):
+                    raise ValueError(
+                        f"{band_where} must be either both present or both None"
+                    )
+                none_intervals.append(True)
+            else:
+                none_intervals.append(False)
+            for bound_index, bound in enumerate(bounds):
+                if bound is None:
+                    continue
+                bound_where = f"{band_where}[{bound_index}]"
+                if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+                    raise TypeError(
+                        f"{bound_where} must be None or a finite non-bool int "
+                        "or float"
+                    )
+                if not _is_finite(bound):
+                    raise ValueError(f"{bound_where} must be finite")
+                if isinstance(bound, float) and bound != _round_output(bound):
+                    raise ValueError(
+                        f"{bound_where} must be rounded to 12 digits"
+                    )
+
+        if not (none_deltas == none_us == none_intervals):
+            raise ValueError(
+                f"{row_where}: delta, u and interval must be None-form or "
+                "present together at each threshold"
+            )
+
+    if len(seen_triples) != len(regions) * len(scales) * len(minimums):
+        raise ValueError(
+            f"{where}.data must be the duplicate-free cartesian product of "
+            "regions, scales and minimums"
+        )
+
+    expected_order = [
+        (region, scale, minimum)
+        for region in regions
+        for scale in scales
+        for minimum in minimums
+    ]
+    actual_order = [
+        (row["region"], row["scale"], row["minimum"]) for row in data
+    ]
+    if actual_order != expected_order:
+        raise ValueError(
+            f"{where}.data rows must follow region, then scale, then minimum "
+            "order over the full cartesian product"
+        )
+
+    return reference, regions, scales, minimums, thresholds, data
+
+
+def panel_region_summary(result, *, minimum: int = 1) -> dict:
+    """Summarize a panel-region delta result across regions.
+
+    ``result`` must be a complete :func:`panel_region_delta` result
+    (schema ``climate-grid/prd-v1``) with exactly the keys ``schema,
+    reference, thresholds, data`` in that order; every member is
+    validated against that contract, including each ``data`` row's key
+    order ``region, scale, minimum, count, delta, u, interval``.  The
+    rows must form the duplicate-free cartesian product of region,
+    scale and minimum, with all three axes taken in first-appearance
+    order, and must follow that product's region-then-scale-then-
+    minimum order.  ``minimum`` must be a non-bool positive ``int``.  A
+    wrong container or entry type raises ``TypeError``; any other
+    contract violation, or a non-finite or overflowing derived value,
+    raises ``ValueError``.
+
+    For every scale (in scale order) and minimum (in minimum order),
+    the rows across all regions are collected: ``n`` is the number of
+    rows whose threshold-wise ``delta`` and ``u`` hold no ``None``.
+    When ``n`` is smaller than ``minimum``, the row's ``mean`` and ``u``
+    are ``None`` lists as long as ``thresholds`` and ``ranges`` is an
+    equal-length list of ``[None, None]`` lists.  Otherwise, for each
+    threshold, ``mean`` is ``fsum(delta) / n`` over the selected rows,
+    ``u`` is ``hypot`` of the selected rows' uncertainties divided by
+    ``n`` and ``ranges`` is the two-item list ``[min(delta),
+    max(delta)]``.
+
+    The returned mapping uses the key order ``schema, reference,
+    regions, scales, minimums, thresholds, data``; ``schema`` is
+    ``climate-grid/prd-summary-v1``, ``reference`` and ``thresholds``
+    echo the delta input and ``regions``, ``scales`` and ``minimums``
+    list the axis values in first-appearance order.  ``data`` follows
+    scale order then minimum order; each row uses the key order
+    ``scale, minimum, count, mean, ranges, u`` where ``count`` is ``n``
+    as an int and ``mean``, ``ranges`` and ``u`` follow threshold
+    order.  Every derived float is ``round(x, 12)`` with negative zero
+    normalized to ``0.0``; every output list is newly constructed and
+    the input is not modified.
+    """
+    reference, regions, scales, minimums, thresholds, data = (
+        _validate_panel_region_delta_result(result, where="result")
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    n_regions = len(regions)
+    n_scales = len(scales)
+    n_minimums = len(minimums)
+    n_thresholds = len(thresholds)
+
+    summary_rows: list[dict] = []
+    for scale_index, scale in enumerate(scales):
+        for minimum_index, minimum_value in enumerate(minimums):
+            rows = [
+                data[
+                    region_index * (n_scales * n_minimums)
+                    + scale_index * n_minimums
+                    + minimum_index
+                ]
+                for region_index in range(n_regions)
+            ]
+            selected = [
+                row
+                for row in rows
+                if all(value is not None for value in row["delta"])
+                and all(value is not None for value in row["u"])
+            ]
+            n = len(selected)
+
+            if n < minimum:
+                summary_rows.append(
+                    {
+                        "scale": scale,
+                        "minimum": minimum_value,
+                        "count": n,
+                        "mean": [None for _threshold in thresholds],
+                        "ranges": [
+                            [None, None] for _threshold in thresholds
+                        ],
+                        "u": [None for _threshold in thresholds],
+                    }
+                )
+                continue
+
+            mean_values: list = []
+            range_values: list[list] = []
+            u_values: list = []
+            for threshold_index in range(n_thresholds):
+                deltas = [
+                    _as_finite_float(row["delta"][threshold_index])
+                    for row in selected
+                ]
+                uncertainties = [
+                    _as_finite_float(row["u"][threshold_index])
+                    for row in selected
+                ]
+
+                mean = math.fsum(deltas) / n
+                u = math.hypot(*uncertainties) / n
+                if not _is_finite(mean) or not _is_finite(u):
+                    raise ValueError("derived statistics must be finite")
+                mean_values.append(_round_output(mean))
+                range_values.append(
+                    [
+                        _round_output(min(deltas)),
+                        _round_output(max(deltas)),
+                    ]
+                )
+                u_values.append(_round_output(u))
+
+            summary_rows.append(
+                {
+                    "scale": scale,
+                    "minimum": minimum_value,
+                    "count": n,
+                    "mean": mean_values,
+                    "ranges": range_values,
+                    "u": u_values,
+                }
+            )
+
+    return {
+        "schema": _PANEL_REGION_SUMMARY_SCHEMA,
+        "reference": reference,
+        "regions": list(regions),
+        "scales": list(scales),
+        "minimums": list(minimums),
+        "thresholds": list(thresholds),
+        "data": summary_rows,
     }
