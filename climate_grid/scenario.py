@@ -32623,9 +32623,10 @@ def _validate_profile_summary_result(
     axes, one data row per minimum and each row's key order
     ``minimum, count, mean_abs, std, ranges, peak, peak_std,
     peak_range``.  ``count`` equals the number of names, the per-
-    threshold statistics each hold one finite value rounded to 12
-    digits per threshold, every range holds two ordered such values and
-    the peak statistics mirror the threshold ones.
+    threshold statistics each hold one finite non-negative value
+    rounded to 12 digits per threshold, every range holds two ordered
+    non-negative such values and the peak statistics mirror the
+    threshold ones.
     """
     if not isinstance(result, dict):
         raise TypeError(f"{where} must be a dict")
@@ -32712,6 +32713,8 @@ def _validate_profile_summary_result(
                     )
                 if not _is_finite(value):
                     raise ValueError(f"{value_where} must be finite")
+                if value < 0:
+                    raise ValueError(f"{value_where} must be non-negative")
                 if isinstance(value, float) and value != _round_output(value):
                     raise ValueError(
                         f"{value_where} must be rounded to 12 digits"
@@ -32739,6 +32742,8 @@ def _validate_profile_summary_result(
                     )
                 if not _is_finite(bound):
                     raise ValueError(f"{bound_where} must be finite")
+                if bound < 0:
+                    raise ValueError(f"{bound_where} must be non-negative")
                 if isinstance(bound, float) and bound != _round_output(bound):
                     raise ValueError(
                         f"{bound_where} must be rounded to 12 digits"
@@ -32755,6 +32760,8 @@ def _validate_profile_summary_result(
             )
         if not _is_finite(peak):
             raise ValueError(f"{row_where}.peak must be finite")
+        if peak < 0:
+            raise ValueError(f"{row_where}.peak must be non-negative")
         if isinstance(peak, float) and peak != _round_output(peak):
             raise ValueError(f"{row_where}.peak must be rounded to 12 digits")
 
@@ -32768,6 +32775,8 @@ def _validate_profile_summary_result(
             )
         if not _is_finite(peak_std):
             raise ValueError(f"{row_where}.peak_std must be finite")
+        if peak_std < 0:
+            raise ValueError(f"{row_where}.peak_std must be non-negative")
         if isinstance(peak_std, float) and peak_std != _round_output(peak_std):
             raise ValueError(
                 f"{row_where}.peak_std must be rounded to 12 digits"
@@ -32789,6 +32798,8 @@ def _validate_profile_summary_result(
                 )
             if not _is_finite(bound):
                 raise ValueError(f"{bound_where} must be finite")
+            if bound < 0:
+                raise ValueError(f"{bound_where} must be non-negative")
             if isinstance(bound, float) and bound != _round_output(bound):
                 raise ValueError(
                     f"{bound_where} must be rounded to 12 digits"
@@ -32938,5 +32949,179 @@ def compare_profiles(left, right, *, factor: float = 1) -> dict:
         "factor": _round_output(factor),
         "minimums": list(minimums),
         "thresholds": list(thresholds),
+        "data": data,
+    }
+
+
+_PROFILE_SET_SCHEMA = "climate-grid/psd-set-v1"
+_PROFILE_SET_OUTPUT_KEYS = (
+    "schema",
+    "factor",
+    "minimums",
+    "thresholds",
+    "data",
+)
+_PROFILE_SET_ROW_KEYS = (
+    "minimum",
+    "count",
+    "d",
+    "u",
+    "band",
+    "pd",
+    "pu",
+    "pband",
+)
+
+
+def profile_set(summaries, *, factor: float = 1) -> dict:
+    """Aggregate :func:`compare_profiles` comparisons against a reference.
+
+    ``summaries`` must be a list of at least two complete
+    :func:`profile_summary` results (schema
+    ``climate-grid/ps-summary-v1``); every entry is validated against
+    that contract, including the non-negativity of the means, standard
+    deviations, peaks and range endpoints.  All summaries must share
+    the same ``scales``, ``minimums``, ``thresholds`` and ``panels``
+    axes in the same order; the axes are taken from the first summary,
+    which serves as the reference.  ``factor`` must be a finite
+    non-bool positive ``int`` or ``float``.  A wrong container or entry
+    type raises ``TypeError``; any other contract violation, or a
+    non-finite or overflowing derived value, raises ``ValueError``.
+
+    :func:`compare_profiles` is called once per later summary as
+    ``compare_profiles(summaries[0], summaries[i], factor=factor)``,
+    giving ``k = len(summaries) - 1`` comparisons.  For each minimum
+    (in minimum order) and threshold (in threshold order), ``d`` is
+    ``fsum`` of the comparisons' ``d`` values divided by ``k``, ``u``
+    is ``hypot`` of the comparisons' ``u`` values divided by ``k`` and
+    ``band`` is the two-item list ``[d - factor * u, d + factor * u]``;
+    the comparisons' peak statistics use the same formulas, giving
+    ``pd``, ``pu`` and ``pband``.
+
+    The returned mapping uses the key order ``schema, factor,
+    minimums, thresholds, data``; ``schema`` is
+    ``climate-grid/psd-set-v1``, ``factor`` echoes the argument rounded
+    to 12 digits and the axes are fresh copies taken from the first
+    summary.  ``data`` follows minimum order; each row uses the key
+    order ``minimum, count, d, u, band, pd, pu, pband`` where ``count``
+    is ``k``, ``d``, ``u`` and ``band`` follow threshold order and each
+    ``band`` entry and ``pband`` are two-item lists.  Every derived
+    float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0``; every output list is newly constructed and the inputs are
+    not modified.
+    """
+    if not isinstance(summaries, list):
+        raise TypeError("summaries must be a list")
+    if len(summaries) < 2:
+        raise ValueError("summaries must contain at least two items")
+
+    reference_axes: tuple | None = None
+    for index, summary in enumerate(summaries):
+        scales, minimums, thresholds, panels, _rows = (
+            _validate_profile_summary_result(
+                summary, where=f"summaries[{index}]"
+            )
+        )
+        axes = (scales, minimums, thresholds, panels)
+        if reference_axes is None:
+            reference_axes = axes
+            continue
+        for axis, reference_axis, label in zip(
+            axes, reference_axes, ("scales", "minimums", "thresholds", "panels")
+        ):
+            if axis != reference_axis:
+                raise ValueError(
+                    f"all summaries must share the same {label} in the same "
+                    "order, taken from the first summary"
+                )
+
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool):
+        raise TypeError("factor must be a finite non-bool int or float")
+    if not _is_finite(factor) or factor <= 0:
+        raise ValueError("factor must be finite and positive")
+
+    comparisons = [
+        compare_profiles(summaries[0], summaries[index], factor=factor)
+        for index in range(1, len(summaries))
+    ]
+    k = len(comparisons)
+    minimums = reference_axes[1]
+
+    def _band(center: float, spread: float) -> list[float]:
+        try:
+            lower = center - factor * spread
+            upper = center + factor * spread
+        except OverflowError:
+            # Huge int factors overflow float arithmetic.
+            raise ValueError("derived statistics must be finite") from None
+        if not all(_is_finite(value) for value in (lower, upper)):
+            raise ValueError("derived statistics must be finite")
+        return [_round_output(lower), _round_output(upper)]
+
+    data: list[dict] = []
+    for minimum_index, minimum in enumerate(minimums):
+        d_values: list[float] = []
+        u_values: list[float] = []
+        band_values: list[list[float]] = []
+        for threshold_index in range(len(reference_axes[2])):
+            d_parts = [
+                _as_finite_float(
+                    comparisons[comparison_index]["data"][minimum_index]["d"][
+                        threshold_index
+                    ]
+                )
+                for comparison_index in range(k)
+            ]
+            u_parts = [
+                _as_finite_float(
+                    comparisons[comparison_index]["data"][minimum_index]["u"][
+                        threshold_index
+                    ]
+                )
+                for comparison_index in range(k)
+            ]
+            d = math.fsum(d_parts) / k
+            u = math.hypot(*u_parts) / k
+            if not all(_is_finite(value) for value in (d, u)):
+                raise ValueError("derived statistics must be finite")
+            d_values.append(_round_output(d))
+            u_values.append(_round_output(u))
+            band_values.append(_band(d, u))
+
+        pd_parts = [
+            _as_finite_float(
+                comparisons[comparison_index]["data"][minimum_index]["pd"]
+            )
+            for comparison_index in range(k)
+        ]
+        pu_parts = [
+            _as_finite_float(
+                comparisons[comparison_index]["data"][minimum_index]["pu"]
+            )
+            for comparison_index in range(k)
+        ]
+        pd_value = math.fsum(pd_parts) / k
+        pu_value = math.hypot(*pu_parts) / k
+        if not all(_is_finite(value) for value in (pd_value, pu_value)):
+            raise ValueError("derived statistics must be finite")
+
+        data.append(
+            {
+                "minimum": minimum,
+                "count": k,
+                "d": d_values,
+                "u": u_values,
+                "band": band_values,
+                "pd": _round_output(pd_value),
+                "pu": _round_output(pu_value),
+                "pband": _band(pd_value, pu_value),
+            }
+        )
+
+    return {
+        "schema": _PROFILE_SET_SCHEMA,
+        "factor": _round_output(factor),
+        "minimums": list(minimums),
+        "thresholds": list(reference_axes[2]),
         "data": data,
     }
