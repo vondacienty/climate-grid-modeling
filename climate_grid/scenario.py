@@ -31305,3 +31305,334 @@ def minimum_profile(items, configs, thresholds, minimums) -> dict:
         "panels": panels,
         "data": data_rows,
     }
+
+
+_SCALE_PROFILE_SCHEMA = "climate-grid/ps-scale-profile-v1"
+_SCALE_PROFILE_ITEM_KEYS = ("scale", "result")
+_SCALE_PROFILE_RESULT_KEYS = (
+    "schema",
+    "minimums",
+    "thresholds",
+    "panels",
+    "data",
+)
+_SCALE_PROFILE_ROW_KEYS = (
+    "minimum",
+    "first_counts",
+    "never",
+    "stable_counts",
+    "rates",
+    "deltas",
+)
+
+
+def _validate_minimum_profile_result(
+    result: Any, *, where: str = "result"
+) -> tuple[list, list, list[str], list[dict]]:
+    """Validate a complete :func:`minimum_profile` result.
+
+    Returns the ``minimums``, ``thresholds`` and ``panels`` axes and
+    the data rows (in minimums order), checking the
+    ``climate-grid/ps-minimum-profile-v1`` contract: key order, the
+    schema, the axes and the one-row-per-minimum order.  Each row uses
+    the key order ``minimum, first_counts, never, stable_counts,
+    rates, deltas``; ``minimum`` matches its position in ``minimums``,
+    ``first_counts`` and ``stable_counts`` are threshold-length lists
+    of non-negative non-bool ints, ``never`` is a non-negative
+    non-bool int, ``rates`` is a threshold-length list of finite
+    numbers between 0 and 1 rounded to 12 digits and ``deltas`` is a
+    threshold-length list that is all ``None`` for the first row and
+    otherwise holds finite numbers between -1 and 1 rounded to 12
+    digits.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} must be a dict")
+    if tuple(result.keys()) != _SCALE_PROFILE_RESULT_KEYS:
+        raise ValueError(
+            f"{where} must have exactly the keys schema, minimums, "
+            "thresholds, panels, data in order"
+        )
+
+    schema = result["schema"]
+    if not isinstance(schema, str):
+        raise TypeError(f"{where}.schema must be a str")
+    if schema != _PANEL_STABILITY_MINIMUM_PROFILE_SCHEMA:
+        raise ValueError(
+            f"{where}.schema must be "
+            f"{_PANEL_STABILITY_MINIMUM_PROFILE_SCHEMA!r}"
+        )
+
+    minimums = _validate_profile_minimums(result["minimums"])
+    thresholds = _validate_profile_thresholds(result["thresholds"])
+    panels = _validate_string_list(result["panels"], f"{where}.panels")
+
+    data = result["data"]
+    if not isinstance(data, list):
+        raise TypeError(f"{where}.data must be a list")
+    if len(data) != len(minimums):
+        raise ValueError(
+            f"{where}.data must contain exactly one row per minimum"
+        )
+
+    n_thresholds = len(thresholds)
+    out_rows: list[dict] = []
+    for row_index, row in enumerate(data):
+        row_where = f"{where}.data[{row_index}]"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be a dict")
+        if tuple(row.keys()) != _SCALE_PROFILE_ROW_KEYS:
+            raise ValueError(
+                f"{row_where} must have exactly the keys minimum, "
+                "first_counts, never, stable_counts, rates, deltas "
+                "in order"
+            )
+
+        minimum = row["minimum"]
+        if not isinstance(minimum, int) or isinstance(minimum, bool):
+            raise TypeError(f"{row_where}.minimum must be a non-bool int")
+        if minimum != minimums[row_index]:
+            raise ValueError(
+                f"{row_where}.minimum must be {minimums[row_index]!r} "
+                "for its position"
+            )
+
+        for key in ("first_counts", "stable_counts"):
+            counts = row[key]
+            if not isinstance(counts, list):
+                raise TypeError(f"{row_where}.{key} must be a list")
+            if len(counts) != n_thresholds:
+                raise ValueError(
+                    f"{row_where}.{key} must contain exactly one entry "
+                    "per threshold"
+                )
+            for count_index, count in enumerate(counts):
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(
+                        f"{row_where}.{key}[{count_index}] must be a "
+                        "non-bool int"
+                    )
+                if count < 0:
+                    raise ValueError(
+                        f"{row_where}.{key}[{count_index}] must be "
+                        "non-negative"
+                    )
+
+        never = row["never"]
+        if not isinstance(never, int) or isinstance(never, bool):
+            raise TypeError(f"{row_where}.never must be a non-bool int")
+        if never < 0:
+            raise ValueError(f"{row_where}.never must be non-negative")
+
+        rates = row["rates"]
+        if not isinstance(rates, list):
+            raise TypeError(f"{row_where}.rates must be a list")
+        if len(rates) != n_thresholds:
+            raise ValueError(
+                f"{row_where}.rates must contain exactly one entry per "
+                "threshold"
+            )
+        for rate_index, rate in enumerate(rates):
+            _validate_number(
+                rate, f"{row_where}.rates[{rate_index}]", nullable=False
+            )
+            if rate != _round_output(rate):
+                raise ValueError(
+                    f"{row_where}.rates[{rate_index}] must be rounded "
+                    "to 12 digits"
+                )
+            if not 0 <= rate <= 1:
+                raise ValueError(
+                    f"{row_where}.rates[{rate_index}] must be between "
+                    "0 and 1"
+                )
+
+        deltas = row["deltas"]
+        if not isinstance(deltas, list):
+            raise TypeError(f"{row_where}.deltas must be a list")
+        if len(deltas) != n_thresholds:
+            raise ValueError(
+                f"{row_where}.deltas must contain exactly one entry per "
+                "threshold"
+            )
+        for delta_index, delta in enumerate(deltas):
+            delta_where = f"{row_where}.deltas[{delta_index}]"
+            if row_index == 0:
+                if delta is not None:
+                    raise ValueError(
+                        f"{delta_where} must be None for the first row"
+                    )
+                continue
+            _validate_number(delta, delta_where, nullable=False)
+            if delta != _round_output(delta):
+                raise ValueError(
+                    f"{delta_where} must be rounded to 12 digits"
+                )
+            if not -1 <= delta <= 1:
+                raise ValueError(
+                    f"{delta_where} must be between -1 and 1"
+                )
+
+        out_rows.append(row)
+
+    return minimums, thresholds, panels, out_rows
+
+
+def compare_minimum_profiles(items) -> dict:
+    """Compare :func:`minimum_profile` results across named scales.
+
+    ``items`` must be a list of at least two mappings, each with
+    exactly the keys ``scale, result`` in that order.  ``scale`` is a
+    unique non-empty str and ``result`` is a complete
+    :func:`minimum_profile` result (schema
+    ``climate-grid/ps-minimum-profile-v1``); every result must share
+    the same ``minimums``, ``thresholds`` and ``panels`` axes in the
+    same order, taken from the first item's result.  A wrong
+    container/item type raises ``TypeError`` and any other contract
+    violation raises ``ValueError``.
+
+    The returned mapping uses the key order ``schema, scales,
+    minimums, thresholds, panels, data, changes``; ``schema`` is
+    ``climate-grid/ps-scale-profile-v1``, ``scales`` lists the item
+    scales in item order and ``minimums``, ``thresholds`` and
+    ``panels`` echo the first item's result axes.
+
+    ``data`` is flattened by scale, then minimum; each row uses the
+    key order ``scale, minimum, first_counts, never, stable_counts,
+    rates, deltas`` where the last six values are copied from the
+    scale's own result row.
+
+    ``changes`` is flattened by adjacent scale pair, then minimum;
+    each row uses the key order ``left, right, minimum, first_counts,
+    never, stable_counts, rates`` where ``left`` and ``right`` are the
+    two scales and each remaining value is the right row's value minus
+    the left row's, element-wise for the three lists.  The count
+    differences are ints and the rate differences are floats; every
+    derived float is ``round(x, 12)`` with negative zero normalized to
+    ``0.0`` and a non-finite derived value raises ``ValueError``.  The
+    inputs are not modified.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 items")
+
+    scales: list[str] = []
+    seen_scales: set[str] = set()
+    validated: list[list[dict]] = []
+    minimums: list = []
+    thresholds: list = []
+    panels: list[str] = []
+    for index, item in enumerate(items):
+        where = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(item.keys()) != _SCALE_PROFILE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys scale, result "
+                "in order"
+            )
+
+        scale = item["scale"]
+        if not isinstance(scale, str):
+            raise TypeError(f"{where}.scale must be a str")
+        if scale == "":
+            raise ValueError(f"{where}.scale must be non-empty")
+        if scale in seen_scales:
+            raise ValueError(f"duplicate item scale: {scale!r}")
+        seen_scales.add(scale)
+
+        item_minimums, item_thresholds, item_panels, rows = (
+            _validate_minimum_profile_result(
+                item["result"], where=f"{where}.result"
+            )
+        )
+        if not validated:
+            minimums = item_minimums
+            thresholds = item_thresholds
+            panels = item_panels
+        else:
+            if item_minimums != minimums:
+                raise ValueError(
+                    "all items must share the same result minimums in "
+                    "the same order, taken from the first item"
+                )
+            if item_thresholds != thresholds:
+                raise ValueError(
+                    "all items must share the same result thresholds in "
+                    "the same order, taken from the first item"
+                )
+            if item_panels != panels:
+                raise ValueError(
+                    "all items must share the same result panels in "
+                    "the same order, taken from the first item"
+                )
+
+        scales.append(scale)
+        validated.append(rows)
+
+    data_rows: list[dict] = []
+    for scale, rows in zip(scales, validated):
+        for row in rows:
+            data_rows.append(
+                {
+                    "scale": scale,
+                    "minimum": row["minimum"],
+                    "first_counts": list(row["first_counts"]),
+                    "never": row["never"],
+                    "stable_counts": list(row["stable_counts"]),
+                    "rates": list(row["rates"]),
+                    "deltas": list(row["deltas"]),
+                }
+            )
+
+    change_rows: list[dict] = []
+    for left_index in range(len(items) - 1):
+        left_rows = validated[left_index]
+        right_rows = validated[left_index + 1]
+        for minimum, left_row, right_row in zip(
+            minimums, left_rows, right_rows
+        ):
+            rate_deltas: list[float] = []
+            for left_rate, right_rate in zip(
+                left_row["rates"], right_row["rates"]
+            ):
+                delta = _round_output(float(right_rate) - float(left_rate))
+                if not _is_finite(delta):
+                    raise ValueError(
+                        "changes derived statistics must be finite"
+                    )
+                rate_deltas.append(delta)
+
+            change_rows.append(
+                {
+                    "left": scales[left_index],
+                    "right": scales[left_index + 1],
+                    "minimum": minimum,
+                    "first_counts": [
+                        right_count - left_count
+                        for left_count, right_count in zip(
+                            left_row["first_counts"],
+                            right_row["first_counts"],
+                        )
+                    ],
+                    "never": right_row["never"] - left_row["never"],
+                    "stable_counts": [
+                        right_count - left_count
+                        for left_count, right_count in zip(
+                            left_row["stable_counts"],
+                            right_row["stable_counts"],
+                        )
+                    ],
+                    "rates": rate_deltas,
+                }
+            )
+
+    return {
+        "schema": _SCALE_PROFILE_SCHEMA,
+        "scales": scales,
+        "minimums": list(minimums),
+        "thresholds": list(thresholds),
+        "panels": list(panels),
+        "data": data_rows,
+        "changes": change_rows,
+    }
