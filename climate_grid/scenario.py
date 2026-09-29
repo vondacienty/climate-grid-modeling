@@ -30688,3 +30688,173 @@ def decompose(result, weights, *, minimum: int = 1) -> dict:
         "weights": list(weights),
         "data": result_rows,
     }
+
+_SENSITIVITY_SCHEMA = "climate-grid/mpws-v1"
+_SENSITIVITY_CONFIG_KEYS = ("name", "weights")
+_SENSITIVITY_ROW_KEYS = ("config",) + _DECOMPOSE_ROW_KEYS
+_SENSITIVITY_SUMMARY_KEYS = (
+    "pair",
+    "group",
+    "name",
+    "valid",
+    "rank_range",
+    "sign_flips",
+    "max_change",
+)
+
+
+def _validate_sensitivity_configs(configs: Any) -> list[str]:
+    if not isinstance(configs, list):
+        raise TypeError("configs must be a list")
+    if len(configs) < 2:
+        raise ValueError("configs must contain at least 2 entries")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for index, config in enumerate(configs):
+        where = f"configs[{index}]"
+        if not isinstance(config, dict):
+            raise TypeError(f"{where} must be a dict")
+        if tuple(config.keys()) != _SENSITIVITY_CONFIG_KEYS:
+            raise ValueError(
+                f"{where} must have exactly the keys name, weights in order"
+            )
+
+        name = config["name"]
+        if not isinstance(name, str):
+            raise TypeError(f"{where}.name must be a str")
+        if name == "":
+            raise ValueError(f"{where}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"duplicate configuration name: {name!r}")
+        seen_names.add(name)
+        names.append(name)
+
+    return names
+
+
+def sensitivity(result, configs, *, minimum: int = 1) -> dict:
+    """Measure how sensitive a :func:`decompose` result is to weight choices.
+
+    ``result``, each configuration's ``weights`` and ``minimum`` are
+    validated exactly as in :func:`decompose` (a complete
+    :func:`reference_panel` result, schema
+    ``climate-grid/mp-reference-v1``), with the same exceptions.
+    ``configs`` must be a list of at least two dicts; each dict must have
+    exactly the keys ``name, weights`` in that order.  ``name`` is a
+    unique non-empty str.  A wrong type raises ``TypeError`` and any
+    other violation, including a non-finite derived value, raises
+    ``ValueError``.
+
+    A decomposition is computed for every configuration as
+    ``decompose(result, weights, minimum=minimum)``.  The returned
+    ``data`` concatenates the configurations' decomposition rows in
+    configuration order; each row is the corresponding decomposition
+    row with a leading ``config`` key holding the configuration name.
+
+    The ``summary`` follows the result's pair, then group, then name
+    order.  For each pair/group/name, the configurations (in
+    configuration order) whose decomposition ``rank`` is not ``None``
+    are collected and ``valid`` is their number.  When ``valid`` is
+    zero, ``rank_range``, ``sign_flips`` and ``max_change`` are all
+    ``None``.  Otherwise ``rank_range`` is ``[minimum rank, maximum
+    rank]``, ``sign_flips`` is the number of adjacent configurations
+    whose ``contribution[1]`` values have a negative product and
+    ``max_change`` is the largest absolute difference between adjacent
+    ``contribution[1]`` values; with a single valid configuration
+    ``sign_flips`` is ``0`` and ``max_change`` is ``0.0``.
+
+    The returned mapping uses the key order ``schema, configs, data,
+    summary``; ``schema`` is ``climate-grid/mpws-v1`` and ``configs``
+    lists the configuration names in input order.  Every computed float
+    is ``round(x, 12)`` with negative zero normalized to ``0.0``.  The
+    inputs are not modified.
+    """
+    _validate_reference_panel_result(result)
+    names = _validate_sensitivity_configs(configs)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError("minimum must be a non-bool int")
+    if minimum < 1:
+        raise ValueError("minimum must be positive")
+
+    decompositions: list[dict] = []
+    for config in configs:
+        decompositions.append(
+            decompose(result, config["weights"], minimum=minimum)
+        )
+
+    first = decompositions[0]
+    pairs = [pair["name"] for pair in first["pairs"]]
+    groups = first["groups"]
+    member_names = first["names"]
+
+    data: list[dict] = []
+    lookups: list[dict[tuple[str, str, str], dict]] = []
+    for name, decomposed in zip(names, decompositions):
+        rows = decomposed["data"]
+        lookups.append(
+            {(row["pair"], row["group"], row["name"]): row for row in rows}
+        )
+        for row in rows:
+            data.append({"config": name, **row})
+
+    summary: list[dict] = []
+    for pair in pairs:
+        for group in groups:
+            for member in member_names:
+                sum_where = (
+                    f"summary row for pair {pair!r}, group {group!r}, "
+                    f"name {member!r}"
+                )
+                ranked: list[tuple] = []
+                for lookup in lookups:
+                    row = lookup[(pair, group, member)]
+                    if row["rank"] is not None:
+                        ranked.append((row["rank"], row["contribution"][1]))
+
+                valid = len(ranked)
+                if valid == 0:
+                    rank_range = None
+                    sign_flips = None
+                    max_change = None
+                elif valid == 1:
+                    rank_range = [ranked[0][0], ranked[0][0]]
+                    sign_flips = 0
+                    max_change = 0.0
+                else:
+                    ranks = [item[0] for item in ranked]
+                    changes = [item[1] for item in ranked]
+                    rank_range = [min(ranks), max(ranks)]
+                    sign_flips = 0
+                    differences: list[float] = []
+                    for previous, current in zip(changes, changes[1:]):
+                        product = previous * current
+                        difference = abs(previous - current)
+                        if not _is_finite(product) or not _is_finite(difference):
+                            raise ValueError(
+                                f"{sum_where} derived statistics must be finite"
+                            )
+                        if product < 0:
+                            sign_flips += 1
+                        differences.append(difference)
+                    max_change = _round_output(float(max(differences)))
+
+                summary.append(
+                    {
+                        "pair": pair,
+                        "group": group,
+                        "name": member,
+                        "valid": valid,
+                        "rank_range": rank_range,
+                        "sign_flips": sign_flips,
+                        "max_change": max_change,
+                    }
+                )
+
+    return {
+        "schema": _SENSITIVITY_SCHEMA,
+        "configs": names,
+        "data": data,
+        "summary": summary,
+    }
